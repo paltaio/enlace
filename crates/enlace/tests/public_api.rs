@@ -1,0 +1,87 @@
+use ed25519_dalek::SigningKey;
+use enlace::{Config, HttpConfig, NameError, Namespace, OpenError, TransportKind};
+use url::Url;
+
+fn seed() -> [u8; 32] {
+    [0x42; 32]
+}
+
+fn http_config() -> Config {
+    Config {
+        http: Some(HttpConfig::new(Url::parse("https://198.51.100.1").unwrap())),
+        ..Config::default()
+    }
+}
+
+#[tokio::test]
+async fn open_rejects_zero_seed() {
+    let Err(err) = Namespace::open(&[0; 32], http_config()).await else {
+        panic!("open should reject zero seed");
+    };
+    assert!(matches!(err, OpenError::InvalidSeed));
+}
+
+#[tokio::test]
+async fn open_rejects_zero_transports() {
+    let Err(err) = Namespace::open(&seed(), Config::default()).await else {
+        panic!("open should reject zero transports");
+    };
+    assert!(matches!(err, OpenError::NoTransport));
+}
+
+#[tokio::test]
+async fn open_rejects_trusted_without_signing() {
+    let mut config = http_config();
+    config
+        .trusted
+        .push(SigningKey::from_bytes(&[7; 32]).verifying_key());
+    let Err(err) = Namespace::open(&seed(), config).await else {
+        panic!("open should reject trusted keys without signing");
+    };
+    assert!(matches!(err, OpenError::TrustedWithoutSigning));
+}
+
+#[tokio::test]
+async fn open_accepts_signing_without_trusted() {
+    let mut config = http_config();
+    config.signing = Some(SigningKey::from_bytes(&[8; 32]));
+    let namespace = Namespace::open(&seed(), config).await.unwrap();
+    assert!(namespace.http().is_none());
+}
+
+#[tokio::test]
+async fn mailbox_and_slot_validate_names() {
+    let namespace = Namespace::open(&seed(), http_config()).await.unwrap();
+    assert!(namespace.mailbox("alpha").is_ok());
+    assert!(namespace.slot("alpha").is_ok());
+    assert_eq!(
+        namespace.mailbox("Alpha").err(),
+        Some(NameError::InvalidChar)
+    );
+    assert_eq!(namespace.slot("").err(), Some(NameError::Empty));
+}
+
+#[tokio::test]
+async fn health_reflects_configured_transports() {
+    let namespace = Namespace::open(&seed(), http_config()).await.unwrap();
+    let health = namespace.health();
+    assert_eq!(health.transports.len(), 1);
+    assert_eq!(health.transports[0].kind, TransportKind::Http);
+}
+
+#[tokio::test]
+async fn mailbox_surface_is_constructible() {
+    let namespace = Namespace::open(&seed(), http_config()).await.unwrap();
+    let mailbox = namespace.mailbox("ops/events").unwrap();
+    assert_eq!(mailbox.name(), "ops/events");
+    assert!(mailbox.try_recv().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn slot_surface_is_constructible() {
+    let namespace = Namespace::open(&seed(), http_config()).await.unwrap();
+    let slot = namespace.slot("state/current").unwrap();
+    assert_eq!(slot.name(), "state/current");
+    assert!(slot.get().await.unwrap().is_none());
+    assert_eq!(slot.watch().name(), "state/current");
+}
