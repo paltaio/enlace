@@ -1,5 +1,4 @@
-//! Persistent endpoint state used by slot writers, the iroh adapter, and the
-//! DHT adapter.
+//! Persistent endpoint state used by slot writers and the iroh adapter.
 //!
 //! Two distinct kinds of slot-version state are tracked:
 //!
@@ -11,13 +10,12 @@
 //!   this endpoint has observed from any source. Used by `Slot::watch` to
 //!   filter out stale updates that arrive over a slower transport.
 //!
-//! Optional iroh keypair and DHT bootstrap-cache slots let those adapters
-//! survive a restart without rediscovering peers.
+//! Optional iroh keypair storage lets that adapter preserve peer identity
+//! across restarts.
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
-use std::net::SocketAddr;
 use std::sync::RwLock;
 
 use zeroize::Zeroizing;
@@ -52,18 +50,7 @@ impl StdError for StateError {
     }
 }
 
-/// DHT bootstrap peers cached from a successful join.
-///
-/// The DHT adapter is responsible for capping the list (currently ~64 peers)
-/// and for treating entries older than ~24h as expired. Implementations may
-/// persist this struct opaquely; round-trip equality is sufficient.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DhtBootstrapCache {
-    pub peers: Vec<SocketAddr>,
-    pub captured_at_unix: u64,
-}
-
-/// Endpoint-local state shared across the slot, iroh, and DHT layers.
+/// Endpoint-local state shared across the slot and iroh layers.
 ///
 /// All methods are synchronous; an implementation that needs to do real I/O
 /// should perform it on its own thread or use a blocking-friendly storage
@@ -97,15 +84,6 @@ pub trait StateStore: Send + Sync {
 
     /// Persist the iroh secret key for reuse on the next adapter open.
     fn store_iroh_keypair(&self, secret: &[u8; 32]) -> Result<(), StateError>;
-
-    /// Load the most recent DHT bootstrap cache, if any.
-    ///
-    /// Returning `Ok(None)` causes the DHT adapter to fall back to its
-    /// configured bootstrap list.
-    fn load_dht_bootstrap_cache(&self) -> Result<Option<DhtBootstrapCache>, StateError>;
-
-    /// Persist a DHT bootstrap cache after a successful join.
-    fn store_dht_bootstrap_cache(&self, cache: &DhtBootstrapCache) -> Result<(), StateError>;
 }
 
 /// In-memory [`StateStore`] used when no persistence is configured.
@@ -122,7 +100,6 @@ struct InMemoryInner {
     local_slot_versions: HashMap<String, u64>,
     last_seen_slot_versions: HashMap<String, u64>,
     iroh_keypair: Option<Zeroizing<[u8; 32]>>,
-    dht_bootstrap: Option<DhtBootstrapCache>,
 }
 
 impl InMemoryStateStore {
@@ -192,30 +169,14 @@ impl StateStore for InMemoryStateStore {
         inner.iroh_keypair = Some(Zeroizing::new(*secret));
         Ok(())
     }
-
-    fn load_dht_bootstrap_cache(&self) -> Result<Option<DhtBootstrapCache>, StateError> {
-        let inner = read_lock(&self.inner);
-        Ok(inner.dht_bootstrap.clone())
-    }
-
-    fn store_dht_bootstrap_cache(&self, cache: &DhtBootstrapCache) -> Result<(), StateError> {
-        let mut inner = write_lock(&self.inner);
-        inner.dht_bootstrap = Some(cache.clone());
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use std::thread;
 
     use super::*;
-
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
-    }
 
     #[test]
     fn next_local_slot_version_starts_at_one() {
@@ -300,39 +261,6 @@ mod tests {
         s.store_iroh_keypair(&[1u8; 32]).unwrap();
         s.store_iroh_keypair(&[2u8; 32]).unwrap();
         assert_eq!(s.iroh_keypair().unwrap(), Some([2u8; 32]));
-    }
-
-    #[test]
-    fn dht_bootstrap_cache_initially_absent() {
-        let s = InMemoryStateStore::new();
-        assert_eq!(s.load_dht_bootstrap_cache().unwrap(), None);
-    }
-
-    #[test]
-    fn dht_bootstrap_cache_round_trips() {
-        let s = InMemoryStateStore::new();
-        let cache = DhtBootstrapCache {
-            peers: vec![addr(7777), addr(8888)],
-            captured_at_unix: 1_700_000_000,
-        };
-        s.store_dht_bootstrap_cache(&cache).unwrap();
-        assert_eq!(s.load_dht_bootstrap_cache().unwrap(), Some(cache));
-    }
-
-    #[test]
-    fn dht_bootstrap_cache_overwrites() {
-        let s = InMemoryStateStore::new();
-        let first = DhtBootstrapCache {
-            peers: vec![addr(1)],
-            captured_at_unix: 1,
-        };
-        let second = DhtBootstrapCache {
-            peers: vec![addr(2), addr(3)],
-            captured_at_unix: 2,
-        };
-        s.store_dht_bootstrap_cache(&first).unwrap();
-        s.store_dht_bootstrap_cache(&second).unwrap();
-        assert_eq!(s.load_dht_bootstrap_cache().unwrap(), Some(second));
     }
 
     #[test]

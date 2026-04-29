@@ -72,6 +72,8 @@ pub enum TransportError {
     BodyTooLarge,
     /// Operation timed out before completion.
     Timeout,
+    /// Transport does not support this operation shape.
+    Unsupported,
     /// Adapter-specific failure carrying the underlying error.
     Other(Box<dyn StdError + Send + Sync>),
 }
@@ -84,6 +86,7 @@ impl fmt::Display for TransportError {
             Self::Stale => f.write_str("slot put rejected: version is not newer"),
             Self::BodyTooLarge => f.write_str("body exceeded configured size cap"),
             Self::Timeout => f.write_str("request timed out"),
+            Self::Unsupported => f.write_str("operation is not supported by this transport"),
             Self::Other(e) => write!(f, "{e}"),
         }
     }
@@ -324,6 +327,10 @@ mod tests {
             "body exceeded configured size cap"
         );
         assert_eq!(TransportError::Timeout.to_string(), "request timed out");
+        assert_eq!(
+            TransportError::Unsupported.to_string(),
+            "operation is not supported by this transport"
+        );
     }
 
     #[test]
@@ -345,6 +352,7 @@ mod tests {
         assert!(StdError::source(&TransportError::Auth).is_none());
         assert!(StdError::source(&TransportError::Stale).is_none());
         assert!(StdError::source(&TransportError::Timeout).is_none());
+        assert!(StdError::source(&TransportError::Unsupported).is_none());
         assert!(StdError::source(&TransportError::Network("x".into())).is_none());
     }
 

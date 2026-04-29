@@ -13,32 +13,38 @@ use crate::transports::{MailboxTransport, SlotTransport, SlotWatchStream};
 
 const MAX_MUTABLE_VALUE_BYTES: usize = 1000;
 const WATCH_BUFFER: usize = 64;
-const WATCH_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct DhtTransport {
     dht: Dht,
     signing_key: SigningKey,
     public_key: [u8; 32],
+    watch_poll_interval: Duration,
 }
 
 impl DhtTransport {
     pub fn new(seed: &[u8; 32], config: &DhtConfig) -> Result<Self, TransportError> {
+        if config.watch_poll_interval.is_zero() {
+            return Err(TransportError::Network(
+                "DHT watch poll interval must be nonzero".to_owned(),
+            ));
+        }
         let mut builder = Dht::builder();
         if !config.bootstrap.is_empty() {
             builder.bootstrap(&config.bootstrap);
         }
         let dht = builder.build().map_err(map_io_error)?;
-        Ok(Self::from_dht(seed, dht))
+        Ok(Self::from_dht(seed, dht, config.watch_poll_interval))
     }
 
-    fn from_dht(seed: &[u8; 32], dht: Dht) -> Self {
+    fn from_dht(seed: &[u8; 32], dht: Dht, watch_poll_interval: Duration) -> Self {
         let signing_key = dht_signing_key(seed);
         let public_key = signing_key.verifying_key().to_bytes();
         Self {
             dht,
             signing_key,
             public_key,
+            watch_poll_interval,
         }
     }
 
@@ -53,28 +59,6 @@ impl DhtTransport {
             }
         }
         best
-    }
-
-    async fn get_mailbox_once(&self, id: &[u8; 16]) -> Result<Option<Vec<u8>>, TransportError> {
-        let transport = self.clone();
-        let id = *id;
-        run_blocking(move || {
-            let Some(current) = transport.get_latest(&id, None) else {
-                return Ok(None);
-            };
-            if current.value().is_empty() {
-                return Ok(None);
-            }
-
-            let clear_seq = next_seq(current.seq())?;
-            let clear = MutableItem::new(transport.signing_key.clone(), &[], clear_seq, Some(&id));
-            transport
-                .dht
-                .put_mutable(clear, Some(current.seq()))
-                .map_err(map_put_error)?;
-            Ok(Some(current.value().to_vec()))
-        })
-        .await
     }
 
     async fn slot_get_since(
@@ -103,43 +87,23 @@ impl fmt::Debug for DhtTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DhtTransport")
             .field("public_key", &self.public_key)
+            .field("watch_poll_interval", &self.watch_poll_interval)
             .finish_non_exhaustive()
     }
 }
 
 #[async_trait]
 impl MailboxTransport for DhtTransport {
-    async fn send(&self, id: &[u8; 16], sealed: &[u8]) -> Result<(), TransportError> {
-        ensure_value_fits(sealed)?;
-        let transport = self.clone();
-        let id = *id;
-        let sealed = sealed.to_vec();
-        run_blocking(move || {
-            let current = transport.get_latest(&id, None);
-            let (seq, cas) = current.as_ref().map_or(Ok((1, None)), |item| {
-                next_seq(item.seq()).map(|seq| (seq, Some(item.seq())))
-            })?;
-            let item = MutableItem::new(transport.signing_key.clone(), &sealed, seq, Some(&id));
-            transport
-                .dht
-                .put_mutable(item, cas)
-                .map(drop)
-                .map_err(map_put_error)
-        })
-        .await
+    async fn send(&self, _id: &[u8; 16], _sealed: &[u8]) -> Result<(), TransportError> {
+        Err(TransportError::Unsupported)
     }
 
-    async fn recv(&self, id: &[u8; 16], wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
-        let start = tokio::time::Instant::now();
-        loop {
-            if let Some(value) = self.get_mailbox_once(id).await? {
-                return Ok(Some(value));
-            }
-            if wait.is_zero() || start.elapsed() >= wait {
-                return Ok(None);
-            }
-            tokio::time::sleep(WATCH_POLL.min(wait.saturating_sub(start.elapsed()))).await;
-        }
+    async fn recv(
+        &self,
+        _id: &[u8; 16],
+        _wait: Duration,
+    ) -> Result<Option<Vec<u8>>, TransportError> {
+        Err(TransportError::Unsupported)
     }
 }
 
@@ -193,7 +157,7 @@ impl SlotTransport for DhtTransport {
                         }
                     }
                 }
-                tokio::time::sleep(WATCH_POLL).await;
+                tokio::time::sleep(transport.watch_poll_interval).await;
             }
         });
 
@@ -221,11 +185,6 @@ fn ensure_value_fits(value: &[u8]) -> Result<(), TransportError> {
         return Err(TransportError::BodyTooLarge);
     }
     Ok(())
-}
-
-fn next_seq(seq: i64) -> Result<i64, TransportError> {
-    seq.checked_add(1)
-        .ok_or_else(|| TransportError::Network("DHT mutable sequence overflow".to_owned()))
 }
 
 fn u64_to_seq(version: u64) -> Result<i64, TransportError> {
@@ -276,5 +235,39 @@ mod tests {
         assert!(mutable_item_is_newer(&newer_seq, &older));
         assert!(mutable_item_is_newer(&newer_value, &newer_seq));
         assert!(!mutable_item_is_newer(&older, &newer_value));
+    }
+
+    #[tokio::test]
+    async fn mailbox_send_is_unsupported() {
+        let transport = DhtTransport::new(&[1; 32], &DhtConfig::default()).unwrap();
+        let err = transport.send(&[2; 16], b"sealed").await.unwrap_err();
+        assert!(matches!(err, TransportError::Unsupported));
+    }
+
+    #[tokio::test]
+    async fn mailbox_recv_is_unsupported() {
+        let transport = DhtTransport::new(&[1; 32], &DhtConfig::default()).unwrap();
+        let err = transport.recv(&[2; 16], Duration::ZERO).await.unwrap_err();
+        assert!(matches!(err, TransportError::Unsupported));
+    }
+
+    #[test]
+    fn watch_poll_interval_comes_from_config() {
+        let config = DhtConfig {
+            watch_poll_interval: Duration::from_secs(42),
+            ..DhtConfig::default()
+        };
+        let transport = DhtTransport::new(&[1; 32], &config).unwrap();
+        assert_eq!(transport.watch_poll_interval, Duration::from_secs(42));
+    }
+
+    #[test]
+    fn watch_poll_interval_rejects_zero() {
+        let config = DhtConfig {
+            watch_poll_interval: Duration::ZERO,
+            ..DhtConfig::default()
+        };
+        let err = DhtTransport::new(&[1; 32], &config).unwrap_err();
+        assert!(matches!(err, TransportError::Network(_)));
     }
 }

@@ -26,7 +26,7 @@ pub use kdf::{NameError, TransportKind};
 pub use mailbox::{Mailbox, RecvMessage, SendReport};
 pub use namespace::Namespace;
 pub use slot::{PutReport, Slot, SlotValue, SlotWatch};
-pub use state::{DhtBootstrapCache, InMemoryStateStore, StateError, StateStore};
+pub use state::{InMemoryStateStore, StateError, StateStore};
 pub use transports::{
     DhtTransport, HealthReport, HttpTransport, IrohTransport, MailboxTransport, PkarrTransport,
     SlotTransport, SlotWatchStream, Transport, TransportHealth,

@@ -1,5 +1,8 @@
 use ed25519_dalek::SigningKey;
-use enlace::{Config, HttpConfig, NameError, Namespace, OpenError, TransportKind};
+use enlace::{
+    Config, DhtConfig, HttpConfig, NameError, Namespace, OpenError, SendError, TransportError,
+    TransportKind,
+};
 use url::Url;
 
 fn seed() -> [u8; 32] {
@@ -82,4 +85,24 @@ async fn slot_surface_is_constructible() {
     let namespace = Namespace::open(&seed(), http_config()).await.unwrap();
     let slot = namespace.slot("state/current").unwrap();
     assert_eq!(slot.name(), "state/current");
+}
+
+#[tokio::test]
+async fn dht_mailbox_send_is_unsupported() {
+    let namespace = Namespace::open(
+        &seed(),
+        Config {
+            dht: Some(DhtConfig::default()),
+            ..Config::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mailbox = namespace.mailbox("ops/events").unwrap();
+    let Err(SendError::AllTransportsFailed(failures)) = mailbox.send(b"event").await else {
+        panic!("DHT mailbox send should fail as unsupported");
+    };
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0, TransportKind::Dht);
+    assert!(matches!(failures[0].1, TransportError::Unsupported));
 }

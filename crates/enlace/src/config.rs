@@ -13,6 +13,7 @@ use crate::transports::Transport;
 pub const DEFAULT_MAX_PLAINTEXT_BYTES: usize = 65_536;
 pub const DEFAULT_LONG_POLL_SECS: u32 = 25;
 pub const DEFAULT_REPUBLISH_INTERVAL: Duration = Duration::from_mins(30);
+pub const DEFAULT_DHT_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(10);
 pub const DEFAULT_IROH_MAX_STREAMS_PER_PEER: u32 = 32;
 pub const DEFAULT_IROH_MAX_CONNS_PER_PEER: u32 = 4;
 
@@ -113,14 +114,14 @@ impl Default for PkarrConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DhtConfig {
     pub bootstrap: Vec<SocketAddr>,
-    pub republish_interval: Duration,
+    pub watch_poll_interval: Duration,
 }
 
 impl Default for DhtConfig {
     fn default() -> Self {
         Self {
             bootstrap: Vec::new(),
-            republish_interval: DEFAULT_REPUBLISH_INTERVAL,
+            watch_poll_interval: DEFAULT_DHT_WATCH_POLL_INTERVAL,
         }
     }
 }

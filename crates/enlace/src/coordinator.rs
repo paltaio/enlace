@@ -124,12 +124,14 @@ impl Coordinator {
                 tasks.spawn(async move { (kind, transport.recv(&id, wait).await) });
             }
 
+            let mut received_transport_response = false;
             while let Some(result) = tasks.join_next().await {
                 let Ok(recv_result) = result else {
                     continue;
                 };
                 match recv_result {
                     (kind, Ok(Some(sealed))) => {
+                        received_transport_response = true;
                         if dedup
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -149,12 +151,18 @@ impl Coordinator {
                             signed_by: opened.signed_by,
                         });
                     }
-                    (_, Ok(None) | Err(_)) => {}
+                    (_, Ok(None)) => {
+                        received_transport_response = true;
+                    }
+                    (_, Err(_)) => {}
                 }
             }
 
             if wait.is_zero() {
                 return Err(RecvError::Closed);
+            }
+            if !received_transport_response {
+                tokio::time::sleep(wait).await;
             }
         }
     }
