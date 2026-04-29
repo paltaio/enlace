@@ -20,6 +20,8 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::RwLock;
 
+use zeroize::Zeroizing;
+
 /// Failure modes for a [`StateStore`] backend.
 ///
 /// The in-memory implementation is infallible in practice; these variants exist
@@ -119,7 +121,7 @@ pub struct InMemoryStateStore {
 struct InMemoryInner {
     local_slot_versions: HashMap<String, u64>,
     last_seen_slot_versions: HashMap<String, u64>,
-    iroh_keypair: Option<[u8; 32]>,
+    iroh_keypair: Option<Zeroizing<[u8; 32]>>,
     dht_bootstrap: Option<DhtBootstrapCache>,
 }
 
@@ -178,12 +180,16 @@ impl StateStore for InMemoryStateStore {
 
     fn iroh_keypair(&self) -> Result<Option<[u8; 32]>, StateError> {
         let inner = read_lock(&self.inner);
-        Ok(inner.iroh_keypair)
+        Ok(inner.iroh_keypair.as_ref().map(|secret| {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&secret[..]);
+            out
+        }))
     }
 
     fn store_iroh_keypair(&self, secret: &[u8; 32]) -> Result<(), StateError> {
         let mut inner = write_lock(&self.inner);
-        inner.iroh_keypair = Some(*secret);
+        inner.iroh_keypair = Some(Zeroizing::new(*secret));
         Ok(())
     }
 
