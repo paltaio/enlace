@@ -8,8 +8,10 @@ use crate::config::Config;
 use crate::error::TransportError;
 use crate::kdf::TransportKind;
 
+mod dht;
 mod http;
 
+pub use dht::DhtTransport;
 pub use http::HttpTransport;
 
 pub type SlotWatchStream =
@@ -34,11 +36,6 @@ impl<T> Transport for T where T: MailboxTransport + SlotTransport {}
 
 #[derive(Debug)]
 pub struct PkarrTransport {
-    _private: (),
-}
-
-#[derive(Debug)]
-pub struct DhtTransport {
     _private: (),
 }
 

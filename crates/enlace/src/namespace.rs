@@ -18,6 +18,7 @@ pub(crate) struct NamespaceInner {
     pub(crate) config: Config,
     pub(crate) coordinator: Arc<Coordinator>,
     pub(crate) http: Option<Arc<HttpTransport>>,
+    pub(crate) dht: Option<Arc<DhtTransport>>,
 }
 
 impl Namespace {
@@ -50,6 +51,19 @@ impl Namespace {
         } else {
             None
         };
+        let dht = if let Some(dht_config) = &config.dht {
+            let dht = Arc::new(DhtTransport::new(seed, dht_config).map_err(|err| {
+                OpenError::TransportInit(crate::TransportKind::Dht, Box::new(err))
+            })?);
+            let transport: Arc<dyn crate::transports::Transport> = dht.clone();
+            transports.push(TransportEndpoint {
+                kind: crate::TransportKind::Dht,
+                transport,
+            });
+            Some(dht)
+        } else {
+            None
+        };
         for configured in &config.transports {
             transports.push(TransportEndpoint {
                 kind: configured.kind,
@@ -71,6 +85,7 @@ impl Namespace {
                 config,
                 coordinator,
                 http,
+                dht,
             }),
         })
     }
@@ -95,7 +110,7 @@ impl Namespace {
 
     #[must_use]
     pub fn dht(&self) -> Option<&DhtTransport> {
-        None
+        self.inner.dht.as_deref()
     }
 
     #[must_use]
