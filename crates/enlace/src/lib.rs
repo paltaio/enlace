@@ -7,5 +7,6 @@
 
 pub mod crypto;
 pub mod dedup;
+pub mod error;
 pub mod kdf;
 pub mod state;

@@ -58,6 +58,22 @@ impl TransportKind {
             TransportKind::Iroh => b"iroh",
         }
     }
+
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TransportKind::Http => "http",
+            TransportKind::Pkarr => "pkarr",
+            TransportKind::Dht => "dht",
+            TransportKind::Iroh => "iroh",
+        }
+    }
+}
+
+impl core::fmt::Display for TransportKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
