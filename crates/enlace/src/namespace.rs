@@ -186,6 +186,7 @@ async fn open_iroh_transport(
 }
 
 #[cfg(not(feature = "iroh"))]
+#[allow(clippy::unused_async)]
 async fn open_iroh_transport(
     config: &Config,
     _state: &dyn crate::state::StateStore,

@@ -10,6 +10,8 @@ pub mod coordinator;
 pub mod crypto;
 pub mod dedup;
 pub mod error;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 pub mod guard;
 pub mod kdf;
 pub mod mailbox;

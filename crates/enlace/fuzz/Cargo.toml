@@ -1,0 +1,21 @@
+[package]
+name = "enlace-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+enlace = { path = "..", default-features = false, features = ["fuzzing"] }
+libfuzzer-sys = "=0.4.12"
+
+[[bin]]
+name = "unseal"
+path = "fuzz_targets/unseal.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

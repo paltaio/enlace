@@ -6,6 +6,7 @@ publish.workspace = true
 
 [features]
 default = ["iroh"]
+fuzzing = []
 iroh = ["dep:iroh", "dep:iroh-gossip"]
 
 [dependencies]

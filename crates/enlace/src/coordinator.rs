@@ -370,6 +370,11 @@ impl Coordinator {
             signed_by,
         })
     }
+
+    #[cfg(feature = "fuzzing")]
+    pub(crate) fn open_for_fuzz(&self, kind: ChannelKind, name: &str, sealed: &[u8]) {
+        let _ = self.open(kind, name, sealed);
+    }
 }
 
 fn verify_inner(
