@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::endpoint::presets;
+use iroh::endpoint::{
+    AfterHandshakeOutcome, ConnectionInfo, EndpointHooks, QuicTransportConfig, VarInt, presets,
+};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, TransportAddr};
 use iroh_gossip::api::{Event, GossipSender};
@@ -37,6 +39,12 @@ struct IrohInner {
     endpoint_id: [u8; 32],
     peers: RwLock<Vec<IrohEndpointAddr>>,
     topics: tokio::sync::Mutex<HashMap<Vec<u8>, Arc<TopicState>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ConnLimitHook {
+    max_conns_per_peer: u32,
+    active: Arc<Mutex<HashMap<EndpointId, u32>>>,
 }
 
 struct TopicState {
@@ -380,10 +388,21 @@ async fn bind_endpoint(
     secret_key: iroh::SecretKey,
     memory_lookup: MemoryLookup,
 ) -> Result<Endpoint, TransportError> {
+    let stream_cap = VarInt::from_u32(config.max_streams_per_peer);
+    let transport_config = QuicTransportConfig::builder()
+        .max_concurrent_bidi_streams(stream_cap)
+        .max_concurrent_uni_streams(stream_cap)
+        .build();
+    let conn_limit = ConnLimitHook {
+        max_conns_per_peer: config.max_conns_per_peer,
+        active: Arc::new(Mutex::new(HashMap::new())),
+    };
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret_key)
         .address_lookup(memory_lookup)
-        .relay_mode(relay_mode(&config.relay_mode));
+        .relay_mode(relay_mode(&config.relay_mode))
+        .transport_config(transport_config)
+        .hooks(conn_limit);
 
     if !config.bind_addrs.is_empty() {
         builder = builder.clear_ip_transports();
@@ -398,6 +417,44 @@ async fn bind_endpoint(
         .bind()
         .await
         .map_err(|err| TransportError::Other(Box::new(err)))
+}
+
+impl EndpointHooks for ConnLimitHook {
+    async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
+        let peer = conn.remote_id();
+        {
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let count = active.entry(peer).or_default();
+            if *count >= self.max_conns_per_peer {
+                return AfterHandshakeOutcome::Reject {
+                    error_code: VarInt::from_u32(0),
+                    reason: b"too many connections".to_vec(),
+                };
+            }
+            *count += 1;
+        }
+
+        let active = Arc::clone(&self.active);
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            let _ = conn.closed().await;
+            let mut active = active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(count) = active.get_mut(&peer) else {
+                return;
+            };
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&peer);
+            }
+        });
+
+        AfterHandshakeOutcome::Accept
+    }
 }
 
 fn relay_mode(mode: &IrohRelayMode) -> RelayMode {
@@ -514,6 +571,52 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert!(peers[0].relay_urls.is_empty());
         assert_eq!(peers[0].direct_addrs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn max_conns_per_peer_rejects_excess_connections() {
+        let server_state = InMemoryStateStore::new();
+        let server_config = IrohConfig {
+            relay_mode: IrohRelayMode::Disabled,
+            bind_addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+            max_conns_per_peer: 1,
+            ..IrohConfig::default()
+        };
+        let server = IrohTransport::new(&server_config, &server_state)
+            .await
+            .unwrap();
+        let client_config = IrohConfig {
+            relay_mode: IrohRelayMode::Disabled,
+            bind_addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+            ..IrohConfig::default()
+        };
+        let client_secret = iroh::SecretKey::generate();
+        let first_client =
+            bind_endpoint(&client_config, client_secret.clone(), MemoryLookup::new())
+                .await
+                .unwrap();
+        let second_client = bind_endpoint(&client_config, client_secret, MemoryLookup::new())
+            .await
+            .unwrap();
+
+        let first_conn = first_client
+            .connect(server.inner.endpoint.addr(), iroh_gossip::ALPN)
+            .await
+            .unwrap();
+
+        let second_conn = second_client
+            .connect(server.inner.endpoint.addr(), iroh_gossip::ALPN)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), second_conn.closed())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), first_conn.closed())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
