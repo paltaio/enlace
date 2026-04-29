@@ -18,6 +18,7 @@ pub(crate) struct NamespaceInner {
     pub(crate) config: Config,
     pub(crate) coordinator: Arc<Coordinator>,
     pub(crate) http: Option<Arc<HttpTransport>>,
+    pub(crate) pkarr: Option<Arc<PkarrTransport>>,
     pub(crate) dht: Option<Arc<DhtTransport>>,
 }
 
@@ -48,6 +49,19 @@ impl Namespace {
                 transport,
             });
             Some(http)
+        } else {
+            None
+        };
+        let pkarr = if let Some(pkarr_config) = &config.pkarr {
+            let pkarr = Arc::new(PkarrTransport::new(seed, pkarr_config).map_err(|err| {
+                OpenError::TransportInit(crate::TransportKind::Pkarr, Box::new(err))
+            })?);
+            let transport: Arc<dyn crate::transports::Transport> = pkarr.clone();
+            transports.push(TransportEndpoint {
+                kind: crate::TransportKind::Pkarr,
+                transport,
+            });
+            Some(pkarr)
         } else {
             None
         };
@@ -85,6 +99,7 @@ impl Namespace {
                 config,
                 coordinator,
                 http,
+                pkarr,
                 dht,
             }),
         })
@@ -105,7 +120,7 @@ impl Namespace {
 
     #[must_use]
     pub fn pkarr(&self) -> Option<&PkarrTransport> {
-        None
+        self.inner.pkarr.as_deref()
     }
 
     #[must_use]

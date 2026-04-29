@@ -10,9 +10,11 @@ use crate::kdf::TransportKind;
 
 mod dht;
 mod http;
+mod pkarr;
 
 pub use dht::DhtTransport;
 pub use http::HttpTransport;
+pub use pkarr::PkarrTransport;
 
 pub type SlotWatchStream =
     Pin<Box<dyn Stream<Item = Result<(u64, Vec<u8>), TransportError>> + Send>>;
@@ -33,11 +35,6 @@ pub trait SlotTransport: Send + Sync {
 pub trait Transport: MailboxTransport + SlotTransport {}
 
 impl<T> Transport for T where T: MailboxTransport + SlotTransport {}
-
-#[derive(Debug)]
-pub struct PkarrTransport {
-    _private: (),
-}
 
 #[derive(Debug)]
 pub struct IrohTransport {

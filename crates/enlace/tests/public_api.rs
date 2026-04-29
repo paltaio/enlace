@@ -1,7 +1,7 @@
 use ed25519_dalek::SigningKey;
 use enlace::{
-    Config, DhtConfig, HttpConfig, NameError, Namespace, OpenError, SendError, TransportError,
-    TransportKind,
+    Config, DhtConfig, HttpConfig, NameError, Namespace, OpenError, PkarrConfig, SendError,
+    TransportError, TransportKind,
 };
 use url::Url;
 
@@ -104,5 +104,27 @@ async fn dht_mailbox_send_is_unsupported() {
     };
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].0, TransportKind::Dht);
+    assert!(matches!(failures[0].1, TransportError::Unsupported));
+}
+
+#[tokio::test]
+async fn pkarr_mailbox_send_is_unsupported() {
+    let namespace = Namespace::open(
+        &seed(),
+        Config {
+            pkarr: Some(PkarrConfig::default()),
+            ..Config::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(namespace.pkarr().is_some());
+
+    let mailbox = namespace.mailbox("ops/events").unwrap();
+    let Err(SendError::AllTransportsFailed(failures)) = mailbox.send(b"event").await else {
+        panic!("pkarr mailbox send should fail as unsupported");
+    };
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0, TransportKind::Pkarr);
     assert!(matches!(failures[0].1, TransportError::Unsupported));
 }
