@@ -17,6 +17,7 @@ pub struct Namespace {
 pub(crate) struct NamespaceInner {
     pub(crate) config: Config,
     pub(crate) coordinator: Arc<Coordinator>,
+    pub(crate) http: Option<Arc<HttpTransport>>,
 }
 
 impl Namespace {
@@ -35,14 +36,26 @@ impl Namespace {
             .state
             .take()
             .unwrap_or_else(|| Arc::new(InMemoryStateStore::new()));
-        let transports = config
-            .transports
-            .iter()
-            .map(|configured| TransportEndpoint {
+        let mut transports = Vec::new();
+        let http = if let Some(http_config) = config.http.clone() {
+            let http = Arc::new(HttpTransport::new(http_config).map_err(|err| {
+                OpenError::TransportInit(crate::TransportKind::Http, Box::new(err))
+            })?);
+            let transport: Arc<dyn crate::transports::Transport> = http.clone();
+            transports.push(TransportEndpoint {
+                kind: crate::TransportKind::Http,
+                transport,
+            });
+            Some(http)
+        } else {
+            None
+        };
+        for configured in &config.transports {
+            transports.push(TransportEndpoint {
                 kind: configured.kind,
                 transport: Arc::clone(&configured.transport),
-            })
-            .collect();
+            });
+        }
         let coordinator = Arc::new(Coordinator::new(
             seed,
             transports,
@@ -57,6 +70,7 @@ impl Namespace {
             inner: Arc::new(NamespaceInner {
                 config,
                 coordinator,
+                http,
             }),
         })
     }
@@ -71,7 +85,7 @@ impl Namespace {
 
     #[must_use]
     pub fn http(&self) -> Option<&HttpTransport> {
-        None
+        self.inner.http.as_deref()
     }
 
     #[must_use]

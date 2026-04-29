@@ -12,6 +12,7 @@ futures-core = { workspace = true }
 hkdf = { workspace = true }
 lru = { workspace = true }
 rmp-serde = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }

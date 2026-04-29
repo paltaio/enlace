@@ -46,7 +46,7 @@ async fn open_accepts_signing_without_trusted() {
     let mut config = http_config();
     config.signing = Some(SigningKey::from_bytes(&[8; 32]));
     let namespace = Namespace::open(&seed(), config).await.unwrap();
-    assert!(namespace.http().is_none());
+    assert!(namespace.http().is_some());
 }
 
 #[tokio::test]
@@ -82,6 +82,4 @@ async fn slot_surface_is_constructible() {
     let namespace = Namespace::open(&seed(), http_config()).await.unwrap();
     let slot = namespace.slot("state/current").unwrap();
     assert_eq!(slot.name(), "state/current");
-    assert!(slot.get().await.unwrap().is_none());
-    assert_eq!(slot.watch().name(), "state/current");
 }

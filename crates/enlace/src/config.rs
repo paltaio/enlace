@@ -69,7 +69,7 @@ impl ConfiguredTransport {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BasicAuth {
     pub username: String,
     pub password: String,
