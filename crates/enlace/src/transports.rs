@@ -10,28 +10,36 @@ use crate::kdf::TransportKind;
 
 mod dht;
 mod http;
+#[cfg(feature = "iroh")]
 mod iroh;
 mod pkarr;
 
 pub use dht::DhtTransport;
 pub use http::HttpTransport;
+#[cfg(feature = "iroh")]
+pub(crate) use iroh::IrohInitError;
+#[cfg(feature = "iroh")]
 pub use iroh::IrohTransport;
 pub use pkarr::PkarrTransport;
+
+#[cfg(not(feature = "iroh"))]
+#[derive(Debug)]
+pub struct IrohTransport;
 
 pub type SlotWatchStream =
     Pin<Box<dyn Stream<Item = Result<(u64, Vec<u8>), TransportError>> + Send>>;
 
 #[async_trait]
 pub trait MailboxTransport: Send + Sync {
-    async fn send(&self, id: &[u8; 16], sealed: &[u8]) -> Result<(), TransportError>;
-    async fn recv(&self, id: &[u8; 16], wait: Duration) -> Result<Option<Vec<u8>>, TransportError>;
+    async fn send(&self, id: &[u8], sealed: &[u8]) -> Result<(), TransportError>;
+    async fn recv(&self, id: &[u8], wait: Duration) -> Result<Option<Vec<u8>>, TransportError>;
 }
 
 #[async_trait]
 pub trait SlotTransport: Send + Sync {
-    async fn put(&self, id: &[u8; 16], version: u64, sealed: &[u8]) -> Result<(), TransportError>;
-    async fn get(&self, id: &[u8; 16]) -> Result<Option<(u64, Vec<u8>)>, TransportError>;
-    fn watch(&self, id: &[u8; 16], since: u64) -> SlotWatchStream;
+    async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError>;
+    async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError>;
+    fn watch(&self, id: &[u8], since: u64) -> SlotWatchStream;
 }
 
 pub trait Transport: MailboxTransport + SlotTransport {}

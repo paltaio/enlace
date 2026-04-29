@@ -94,25 +94,21 @@ impl fmt::Debug for DhtTransport {
 
 #[async_trait]
 impl MailboxTransport for DhtTransport {
-    async fn send(&self, _id: &[u8; 16], _sealed: &[u8]) -> Result<(), TransportError> {
+    async fn send(&self, _id: &[u8], _sealed: &[u8]) -> Result<(), TransportError> {
         Err(TransportError::Unsupported)
     }
 
-    async fn recv(
-        &self,
-        _id: &[u8; 16],
-        _wait: Duration,
-    ) -> Result<Option<Vec<u8>>, TransportError> {
+    async fn recv(&self, _id: &[u8], _wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
         Err(TransportError::Unsupported)
     }
 }
 
 #[async_trait]
 impl SlotTransport for DhtTransport {
-    async fn put(&self, id: &[u8; 16], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
+    async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
+        let id = dht_channel_id(id)?;
         ensure_value_fits(sealed)?;
         let transport = self.clone();
-        let id = *id;
         let sealed = sealed.to_vec();
         let seq = u64_to_seq(version)?;
         run_blocking(move || {
@@ -131,13 +127,18 @@ impl SlotTransport for DhtTransport {
         .await
     }
 
-    async fn get(&self, id: &[u8; 16]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
-        self.slot_get_since(id, 0).await
+    async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
+        let id = dht_channel_id(id)?;
+        self.slot_get_since(&id, 0).await
     }
 
-    fn watch(&self, id: &[u8; 16], since: u64) -> SlotWatchStream {
+    fn watch(&self, id: &[u8], since: u64) -> SlotWatchStream {
+        let Ok(id) = dht_channel_id(id) else {
+            return Box::pin(tokio_stream::iter([Err(TransportError::Network(
+                "DHT channel id must be 16 bytes".to_owned(),
+            ))]));
+        };
         let transport = self.clone();
-        let id = *id;
         let (tx, rx) = mpsc::channel(WATCH_BUFFER);
 
         tokio::spawn(async move {
@@ -178,6 +179,11 @@ where
 fn dht_signing_key(seed: &[u8; 32]) -> SigningKey {
     let key = derive_key32(seed, b"enlace/v1/key/dht-id");
     SigningKey::from_bytes(&key)
+}
+
+fn dht_channel_id(id: &[u8]) -> Result<[u8; 16], TransportError> {
+    id.try_into()
+        .map_err(|_| TransportError::Network("DHT channel id must be 16 bytes".to_owned()))
 }
 
 fn ensure_value_fits(value: &[u8]) -> Result<(), TransportError> {

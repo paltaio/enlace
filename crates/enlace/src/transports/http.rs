@@ -94,11 +94,12 @@ impl HttpTransport {
 
 #[async_trait]
 impl MailboxTransport for HttpTransport {
-    async fn send(&self, id: &[u8; 16], sealed: &[u8]) -> Result<(), TransportError> {
+    async fn send(&self, id: &[u8], sealed: &[u8]) -> Result<(), TransportError> {
+        let id = http_channel_id(id)?;
         let response = self
             .request(
                 self.client
-                    .post(self.mailbox_url(id))
+                    .post(self.mailbox_url(&id))
                     .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                     .body(sealed.to_vec()),
             )
@@ -112,8 +113,9 @@ impl MailboxTransport for HttpTransport {
         }
     }
 
-    async fn recv(&self, id: &[u8; 16], wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
-        let mut url = self.mailbox_url(id);
+    async fn recv(&self, id: &[u8], wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
+        let id = http_channel_id(id)?;
+        let mut url = self.mailbox_url(&id);
         url.query_pairs_mut()
             .append_pair("wait", &wait.as_secs().to_string());
         let response = self
@@ -136,11 +138,12 @@ impl MailboxTransport for HttpTransport {
 
 #[async_trait]
 impl SlotTransport for HttpTransport {
-    async fn put(&self, id: &[u8; 16], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
+    async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
+        let id = http_channel_id(id)?;
         let response = self
             .request(
                 self.client
-                    .put(self.slot_url(id))
+                    .put(self.slot_url(&id))
                     .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                     .header(VERSION_HEADER, version.to_string())
                     .body(sealed.to_vec()),
@@ -155,13 +158,18 @@ impl SlotTransport for HttpTransport {
         }
     }
 
-    async fn get(&self, id: &[u8; 16]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
-        self.slot_get_since(id, 0, Duration::ZERO).await
+    async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
+        let id = http_channel_id(id)?;
+        self.slot_get_since(&id, 0, Duration::ZERO).await
     }
 
-    fn watch(&self, id: &[u8; 16], since: u64) -> SlotWatchStream {
+    fn watch(&self, id: &[u8], since: u64) -> SlotWatchStream {
+        let Ok(id) = http_channel_id(id) else {
+            return Box::pin(tokio_stream::iter([Err(TransportError::Network(
+                "HTTP channel id must be 16 bytes".to_owned(),
+            ))]));
+        };
         let transport = self.clone();
-        let id = *id;
         let (tx, rx) = mpsc::channel(WATCH_BUFFER);
 
         tokio::spawn(async move {
@@ -219,6 +227,11 @@ fn map_reqwest_error(err: reqwest::Error) -> TransportError {
     } else {
         TransportError::Network(message)
     }
+}
+
+fn http_channel_id(id: &[u8]) -> Result<[u8; 16], TransportError> {
+    id.try_into()
+        .map_err(|_| TransportError::Network("HTTP channel id must be 16 bytes".to_owned()))
 }
 
 fn hex_id(id: &[u8; 16]) -> String {

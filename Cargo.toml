@@ -46,6 +46,9 @@ hkdf = { version = "=0.12.4", default-features = false }
 iroh = { version = "=0.98.2", default-features = false, features = [
     "tls-ring",
 ] }
+iroh-gossip = { version = "=0.98.0", default-features = false, features = [
+    "net",
+] }
 lru = { version = "=0.18.0", default-features = false }
 mainline = { version = "=6.1.2" }
 pkarr = { version = "=6.0.0-rc.0" }

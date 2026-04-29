@@ -1,16 +1,94 @@
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
-use crate::config::{IrohConfig, IrohEndpointAddr};
+use async_trait::async_trait;
+use iroh::address_lookup::memory::MemoryLookup;
+use iroh::endpoint::presets;
+use iroh::protocol::Router;
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, TransportAddr};
+use iroh_gossip::api::{Event, GossipSender};
+use iroh_gossip::{Gossip, TopicId};
+use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, timeout_at};
+use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::config::{IrohConfig, IrohEndpointAddr, IrohRelayMode};
+use crate::error::TransportError;
 use crate::state::{StateError, StateStore};
+use crate::transports::{MailboxTransport, SlotTransport, SlotWatchStream};
 
+const WATCH_BUFFER: usize = 64;
+const SLOT_HEADER_LEN: usize = 8;
+
+#[derive(Clone)]
 pub struct IrohTransport {
+    inner: Arc<IrohInner>,
+}
+
+struct IrohInner {
+    endpoint: Endpoint,
+    gossip: Gossip,
+    _router: Router,
+    memory_lookup: MemoryLookup,
     endpoint_id: [u8; 32],
     peers: RwLock<Vec<IrohEndpointAddr>>,
+    topics: tokio::sync::Mutex<HashMap<Vec<u8>, Arc<TopicState>>>,
+}
+
+struct TopicState {
+    sender: GossipSender,
+    mailbox: Mutex<VecDeque<Vec<u8>>>,
+    mailbox_notify: Notify,
+    slot: RwLock<Option<(u64, Vec<u8>)>>,
+    slot_updates: broadcast::Sender<(u64, Vec<u8>)>,
+    task: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+pub(crate) enum IrohInitError {
+    State(StateError),
+    Transport(TransportError),
+}
+
+impl fmt::Display for IrohInitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::State(err) => write!(f, "{err}"),
+            Self::Transport(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for IrohInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::State(err) => Some(err),
+            Self::Transport(err) => Some(err),
+        }
+    }
+}
+
+impl From<StateError> for IrohInitError {
+    fn from(err: StateError) -> Self {
+        Self::State(err)
+    }
+}
+
+impl From<TransportError> for IrohInitError {
+    fn from(err: TransportError) -> Self {
+        Self::Transport(err)
+    }
 }
 
 impl IrohTransport {
-    pub(crate) fn new(config: &IrohConfig, state: &dyn StateStore) -> Result<Self, StateError> {
+    pub(crate) async fn new(
+        config: &IrohConfig,
+        state: &dyn StateStore,
+    ) -> Result<Self, IrohInitError> {
         let secret_key = if let Some(secret) = state.iroh_keypair()? {
             iroh::SecretKey::from_bytes(&secret)
         } else {
@@ -19,37 +97,58 @@ impl IrohTransport {
             secret_key
         };
         let endpoint_id = *secret_key.public().as_bytes();
+        let memory_lookup = MemoryLookup::new();
+        for peer in &config.peers {
+            memory_lookup.add_endpoint_info(endpoint_addr(peer)?);
+        }
+
+        let endpoint = bind_endpoint(config, secret_key, memory_lookup.clone()).await?;
+        let gossip = Gossip::builder()
+            .max_message_size(config.max_message_bytes)
+            .spawn(endpoint.clone());
+        let router = Router::builder(endpoint.clone())
+            .accept(iroh_gossip::ALPN, gossip.clone())
+            .spawn();
 
         Ok(Self {
-            endpoint_id,
-            peers: RwLock::new(config.peers.clone()),
+            inner: Arc::new(IrohInner {
+                endpoint,
+                gossip,
+                _router: router,
+                memory_lookup,
+                endpoint_id,
+                peers: RwLock::new(config.peers.clone()),
+                topics: tokio::sync::Mutex::new(HashMap::new()),
+            }),
         })
     }
 
     #[must_use]
     pub fn endpoint_id(&self) -> [u8; 32] {
-        self.endpoint_id
+        self.inner.endpoint_id
     }
 
     #[must_use]
     pub fn endpoint_addr(&self) -> IrohEndpointAddr {
-        IrohEndpointAddr {
-            endpoint_id: self.endpoint_id,
-            relay_urls: Vec::new(),
-            direct_addrs: Vec::new(),
-        }
+        endpoint_addr_to_config(&self.inner.endpoint.addr())
     }
 
     #[must_use]
     pub fn peers(&self) -> Vec<IrohEndpointAddr> {
-        self.peers
+        self.inner
+            .peers
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
     pub fn add_peer(&self, peer: IrohEndpointAddr) {
+        if let Ok(addr) = endpoint_addr(&peer) {
+            self.inner.memory_lookup.add_endpoint_info(addr);
+        }
+
         let mut peers = self
+            .inner
             .peers
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -62,15 +161,304 @@ impl IrohTransport {
             peers.push(peer);
         }
     }
+
+    async fn ensure_topic(&self, id: &[u8]) -> Result<Arc<TopicState>, TransportError> {
+        if let Some(topic) = self.inner.topics.lock().await.get(id).cloned() {
+            return Ok(topic);
+        }
+
+        let topic_id = topic_id(id)?;
+        let bootstrap = self.bootstrap_peers();
+        let topic = if bootstrap.is_empty() {
+            self.inner
+                .gossip
+                .subscribe(topic_id, bootstrap)
+                .await
+                .map_err(map_gossip_error)?
+        } else {
+            self.inner
+                .gossip
+                .subscribe_and_join(topic_id, bootstrap)
+                .await
+                .map_err(map_gossip_error)?
+        };
+        let (sender, mut receiver) = topic.split();
+        let (slot_updates, _) = broadcast::channel(WATCH_BUFFER);
+        let state = Arc::new_cyclic(|weak: &std::sync::Weak<TopicState>| {
+            let weak = weak.clone();
+            let task = tokio::spawn(async move {
+                while let Some(event) = receiver.next().await {
+                    let Ok(Event::Received(message)) = event else {
+                        continue;
+                    };
+                    if let Some(state) = weak.upgrade() {
+                        state.record_mailbox(message.content.to_vec());
+                        if let Some((version, sealed)) = decode_slot_frame(&message.content) {
+                            state.record_slot(version, sealed);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            });
+            TopicState {
+                sender,
+                mailbox: Mutex::new(VecDeque::new()),
+                mailbox_notify: Notify::new(),
+                slot: RwLock::new(None),
+                slot_updates,
+                task,
+            }
+        });
+
+        let mut topics = self.inner.topics.lock().await;
+        Ok(topics.entry(id.to_vec()).or_insert(state).clone())
+    }
+
+    fn bootstrap_peers(&self) -> Vec<EndpointId> {
+        self.peers()
+            .into_iter()
+            .filter_map(|peer| EndpointId::from_bytes(&peer.endpoint_id).ok())
+            .collect()
+    }
 }
 
 impl fmt::Debug for IrohTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IrohTransport")
-            .field("endpoint_id", &self.endpoint_id)
+            .field("endpoint_id", &self.endpoint_id())
+            .field("endpoint_addr", &self.endpoint_addr())
             .field("peers", &self.peers())
-            .finish()
+            .finish_non_exhaustive()
     }
+}
+
+impl Drop for TopicState {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl TopicState {
+    async fn recv_mailbox(&self, wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
+        let deadline = Instant::now() + wait;
+        loop {
+            let notified = self.mailbox_notify.notified();
+            {
+                let mut mailbox = self
+                    .mailbox
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(sealed) = mailbox.pop_front() {
+                    return Ok(Some(sealed));
+                }
+            }
+
+            if wait.is_zero() {
+                return Ok(None);
+            }
+            if timeout_at(deadline, notified).await.is_err() {
+                return Ok(None);
+            }
+        }
+    }
+
+    fn record_mailbox(&self, sealed: Vec<u8>) {
+        self.mailbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(sealed);
+        self.mailbox_notify.notify_waiters();
+    }
+
+    fn record_slot(&self, version: u64, sealed: Vec<u8>) {
+        let mut slot = self
+            .slot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot
+            .as_ref()
+            .is_some_and(|(current_version, current_sealed)| {
+                (version, sealed.as_slice()) <= (*current_version, current_sealed.as_slice())
+            })
+        {
+            return;
+        }
+        *slot = Some((version, sealed.clone()));
+        drop(slot);
+        let _ = self.slot_updates.send((version, sealed));
+    }
+
+    fn current_slot(&self) -> Option<(u64, Vec<u8>)> {
+        self.slot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl MailboxTransport for IrohTransport {
+    async fn send(&self, id: &[u8], sealed: &[u8]) -> Result<(), TransportError> {
+        let topic = self.ensure_topic(id).await?;
+        topic
+            .sender
+            .broadcast(sealed.to_vec().into())
+            .await
+            .map_err(map_gossip_error)
+    }
+
+    async fn recv(&self, id: &[u8], wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
+        let topic = self.ensure_topic(id).await?;
+        topic.recv_mailbox(wait).await
+    }
+}
+
+#[async_trait]
+impl SlotTransport for IrohTransport {
+    async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
+        let topic = self.ensure_topic(id).await?;
+        let frame = encode_slot_frame(version, sealed);
+        topic.record_slot(version, sealed.to_vec());
+        topic
+            .sender
+            .broadcast(frame.into())
+            .await
+            .map_err(map_gossip_error)
+    }
+
+    async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
+        let topic = self.ensure_topic(id).await?;
+        Ok(topic.current_slot())
+    }
+
+    fn watch(&self, id: &[u8], since: u64) -> SlotWatchStream {
+        let transport = self.clone();
+        let id = id.to_vec();
+        let (tx, rx) = mpsc::channel(WATCH_BUFFER);
+
+        tokio::spawn(async move {
+            let topic = match transport.ensure_topic(&id).await {
+                Ok(topic) => topic,
+                Err(err) => {
+                    let _ = tx.send(Err(err)).await;
+                    return;
+                }
+            };
+
+            let mut since = since;
+            if let Some((version, sealed)) = topic.current_slot()
+                && version > since
+            {
+                since = version;
+                if tx.send(Ok((version, sealed))).await.is_err() {
+                    return;
+                }
+            }
+
+            let mut updates = topic.slot_updates.subscribe();
+            loop {
+                match updates.recv().await {
+                    Ok((version, sealed)) if version > since => {
+                        since = version;
+                        if tx.send(Ok((version, sealed))).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        Box::pin(ReceiverStream::new(rx))
+    }
+}
+
+async fn bind_endpoint(
+    config: &IrohConfig,
+    secret_key: iroh::SecretKey,
+    memory_lookup: MemoryLookup,
+) -> Result<Endpoint, TransportError> {
+    let mut builder = Endpoint::builder(presets::Minimal)
+        .secret_key(secret_key)
+        .address_lookup(memory_lookup)
+        .relay_mode(relay_mode(&config.relay_mode));
+
+    if !config.bind_addrs.is_empty() {
+        builder = builder.clear_ip_transports();
+        for addr in &config.bind_addrs {
+            builder = builder
+                .bind_addr(*addr)
+                .map_err(|err| TransportError::Other(Box::new(err)))?;
+        }
+    }
+
+    builder
+        .bind()
+        .await
+        .map_err(|err| TransportError::Other(Box::new(err)))
+}
+
+fn relay_mode(mode: &IrohRelayMode) -> RelayMode {
+    match mode {
+        IrohRelayMode::Default => RelayMode::Default,
+        IrohRelayMode::Custom(urls) => RelayMode::custom(urls.iter().cloned().map(RelayUrl::from)),
+        IrohRelayMode::Disabled => RelayMode::Disabled,
+    }
+}
+
+fn topic_id(id: &[u8]) -> Result<TopicId, TransportError> {
+    let id: [u8; 32] = id
+        .try_into()
+        .map_err(|_| TransportError::Network("iroh topic id must be 32 bytes".to_owned()))?;
+    Ok(TopicId::from_bytes(id))
+}
+
+fn endpoint_id(id: &[u8; 32]) -> Result<EndpointId, TransportError> {
+    EndpointId::from_bytes(id)
+        .map_err(|_| TransportError::Network("invalid iroh endpoint id".to_owned()))
+}
+
+fn endpoint_addr(peer: &IrohEndpointAddr) -> Result<EndpointAddr, TransportError> {
+    let id = endpoint_id(&peer.endpoint_id)?;
+    let addrs = peer
+        .relay_urls
+        .iter()
+        .cloned()
+        .map(RelayUrl::from)
+        .map(TransportAddr::Relay)
+        .chain(peer.direct_addrs.iter().copied().map(TransportAddr::Ip));
+    Ok(EndpointAddr::from_parts(id, addrs))
+}
+
+fn endpoint_addr_to_config(addr: &EndpointAddr) -> IrohEndpointAddr {
+    IrohEndpointAddr {
+        endpoint_id: *addr.id.as_bytes(),
+        relay_urls: addr
+            .relay_urls()
+            .cloned()
+            .map(url::Url::from)
+            .collect::<Vec<_>>(),
+        direct_addrs: addr.ip_addrs().copied().collect(),
+    }
+}
+
+fn encode_slot_frame(version: u64, sealed: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(SLOT_HEADER_LEN + sealed.len());
+    frame.extend_from_slice(&version.to_be_bytes());
+    frame.extend_from_slice(sealed);
+    frame
+}
+
+fn decode_slot_frame(frame: &[u8]) -> Option<(u64, Vec<u8>)> {
+    let (version, sealed) = frame.split_at_checked(SLOT_HEADER_LEN)?;
+    let version = u64::from_be_bytes(version.try_into().ok()?);
+    Some((version, sealed.to_vec()))
+}
+
+fn map_gossip_error(err: iroh_gossip::api::ApiError) -> TransportError {
+    TransportError::Other(Box::new(err))
 }
 
 #[cfg(test)]
@@ -79,39 +467,40 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use url::Url;
-
-    use crate::config::IrohRelayMode;
     use crate::state::InMemoryStateStore;
 
-    #[test]
-    fn endpoint_id_comes_from_persisted_keypair() {
+    #[tokio::test]
+    async fn endpoint_id_comes_from_persisted_keypair() {
         let state = InMemoryStateStore::new();
-        let first = IrohTransport::new(&IrohConfig::default(), &state).unwrap();
-        let second = IrohTransport::new(&IrohConfig::default(), &state).unwrap();
+        let first = IrohTransport::new(&IrohConfig::default(), &state)
+            .await
+            .unwrap();
+        let second = IrohTransport::new(&IrohConfig::default(), &state)
+            .await
+            .unwrap();
 
         assert_eq!(first.endpoint_id(), second.endpoint_id());
         assert_eq!(first.endpoint_addr().endpoint_id, first.endpoint_id());
     }
 
-    #[test]
-    fn peers_can_be_seeded_and_replaced() {
-        let peer_id = [7; 32];
+    #[tokio::test]
+    async fn peers_can_be_seeded_and_replaced() {
+        let peer_id = *iroh::SecretKey::generate().public().as_bytes();
         let original = IrohEndpointAddr {
             endpoint_id: peer_id,
-            relay_urls: vec![Url::parse("https://relay.example").unwrap()],
+            relay_urls: vec![url::Url::parse("https://relay.example").unwrap()],
             direct_addrs: Vec::new(),
         };
         let state = InMemoryStateStore::new();
         let config = IrohConfig {
             relay_mode: IrohRelayMode::Disabled,
-            bind_addrs: Vec::new(),
+            bind_addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
             peers: vec![original],
             max_message_bytes: 1024,
             max_streams_per_peer: 2,
             max_conns_per_peer: 1,
         };
-        let transport = IrohTransport::new(&config, &state).unwrap();
+        let transport = IrohTransport::new(&config, &state).await.unwrap();
 
         assert_eq!(transport.peers().len(), 1);
 
@@ -125,5 +514,24 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert!(peers[0].relay_urls.is_empty());
         assert_eq!(peers[0].direct_addrs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_slot_round_trips_through_transport() {
+        let state = InMemoryStateStore::new();
+        let config = IrohConfig {
+            relay_mode: IrohRelayMode::Disabled,
+            bind_addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+            ..IrohConfig::default()
+        };
+        let transport = IrohTransport::new(&config, &state).await.unwrap();
+        let topic = [9u8; 32];
+
+        transport.put(&topic, 7, b"sealed").await.unwrap();
+
+        assert_eq!(
+            transport.get(&topic).await.unwrap(),
+            Some((7, b"sealed".to_vec()))
+        );
     }
 }

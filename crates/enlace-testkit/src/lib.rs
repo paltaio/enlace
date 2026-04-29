@@ -30,13 +30,13 @@ struct InMemoryInner {
 
 #[derive(Default)]
 struct TransportState {
-    mailboxes: HashMap<[u8; 16], VecDeque<Vec<u8>>>,
-    slots: HashMap<[u8; 16], (u64, Vec<u8>)>,
+    mailboxes: HashMap<Vec<u8>, VecDeque<Vec<u8>>>,
+    slots: HashMap<Vec<u8>, (u64, Vec<u8>)>,
 }
 
 #[derive(Clone)]
 struct SlotUpdate {
-    id: [u8; 16],
+    id: Vec<u8>,
     version: u64,
     sealed: Vec<u8>,
 }
@@ -62,11 +62,11 @@ impl Default for InMemoryTransport {
 
 #[async_trait]
 impl MailboxTransport for InMemoryTransport {
-    async fn send(&self, id: &[u8; 16], sealed: &[u8]) -> Result<(), TransportError> {
+    async fn send(&self, id: &[u8], sealed: &[u8]) -> Result<(), TransportError> {
         let mut state = self.inner.state.lock().await;
         state
             .mailboxes
-            .entry(*id)
+            .entry(id.to_vec())
             .or_default()
             .push_back(sealed.to_vec());
         drop(state);
@@ -74,7 +74,7 @@ impl MailboxTransport for InMemoryTransport {
         Ok(())
     }
 
-    async fn recv(&self, id: &[u8; 16], wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
+    async fn recv(&self, id: &[u8], wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
         loop {
             let notified = self.inner.mailbox_notify.notified();
             {
@@ -99,7 +99,7 @@ impl MailboxTransport for InMemoryTransport {
 
 #[async_trait]
 impl SlotTransport for InMemoryTransport {
-    async fn put(&self, id: &[u8; 16], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
+    async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
         let mut state = self.inner.state.lock().await;
         if state
             .slots
@@ -108,24 +108,24 @@ impl SlotTransport for InMemoryTransport {
         {
             return Err(TransportError::Stale);
         }
-        state.slots.insert(*id, (version, sealed.to_vec()));
+        state.slots.insert(id.to_vec(), (version, sealed.to_vec()));
         drop(state);
 
         let _ = self.inner.slot_updates.send(SlotUpdate {
-            id: *id,
+            id: id.to_vec(),
             version,
             sealed: sealed.to_vec(),
         });
         Ok(())
     }
 
-    async fn get(&self, id: &[u8; 16]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
+    async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
         let state = self.inner.state.lock().await;
         Ok(state.slots.get(id).cloned())
     }
 
-    fn watch(&self, id: &[u8; 16], since: u64) -> SlotWatchStream {
-        let id = *id;
+    fn watch(&self, id: &[u8], since: u64) -> SlotWatchStream {
+        let id = id.to_vec();
         let mut updates = self.inner.slot_updates.subscribe();
         let (tx, rx) = mpsc::channel(WATCH_BUFFER);
 
@@ -193,14 +193,14 @@ impl<T> MailboxTransport for LossyTransport<T>
 where
     T: MailboxTransport + Send + Sync,
 {
-    async fn send(&self, id: &[u8; 16], sealed: &[u8]) -> Result<(), TransportError> {
+    async fn send(&self, id: &[u8], sealed: &[u8]) -> Result<(), TransportError> {
         if self.should_drop() {
             return Ok(());
         }
         self.inner.send(id, sealed).await
     }
 
-    async fn recv(&self, id: &[u8; 16], wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
+    async fn recv(&self, id: &[u8], wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
         self.inner.recv(id, wait).await
     }
 }
@@ -210,18 +210,18 @@ impl<T> SlotTransport for LossyTransport<T>
 where
     T: SlotTransport + Send + Sync,
 {
-    async fn put(&self, id: &[u8; 16], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
+    async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
         if self.should_drop() {
             return Ok(());
         }
         self.inner.put(id, version, sealed).await
     }
 
-    async fn get(&self, id: &[u8; 16]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
+    async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
         self.inner.get(id).await
     }
 
-    fn watch(&self, id: &[u8; 16], since: u64) -> SlotWatchStream {
+    fn watch(&self, id: &[u8], since: u64) -> SlotWatchStream {
         self.inner.watch(id, since)
     }
 }
@@ -277,12 +277,12 @@ impl<T> MailboxTransport for DelayingTransport<T>
 where
     T: MailboxTransport + Send + Sync,
 {
-    async fn send(&self, id: &[u8; 16], sealed: &[u8]) -> Result<(), TransportError> {
+    async fn send(&self, id: &[u8], sealed: &[u8]) -> Result<(), TransportError> {
         self.delay().await;
         self.inner.send(id, sealed).await
     }
 
-    async fn recv(&self, id: &[u8; 16], wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
+    async fn recv(&self, id: &[u8], wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
         self.delay().await;
         self.inner.recv(id, wait).await
     }
@@ -293,17 +293,17 @@ impl<T> SlotTransport for DelayingTransport<T>
 where
     T: SlotTransport + Send + Sync,
 {
-    async fn put(&self, id: &[u8; 16], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
+    async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
         self.delay().await;
         self.inner.put(id, version, sealed).await
     }
 
-    async fn get(&self, id: &[u8; 16]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
+    async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
         self.delay().await;
         self.inner.get(id).await
     }
 
-    fn watch(&self, id: &[u8; 16], since: u64) -> SlotWatchStream {
+    fn watch(&self, id: &[u8], since: u64) -> SlotWatchStream {
         self.inner.watch(id, since)
     }
 }

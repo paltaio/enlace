@@ -79,11 +79,7 @@ impl Namespace {
         } else {
             None
         };
-        let iroh = if let Some(iroh_config) = &config.iroh {
-            Some(Arc::new(IrohTransport::new(iroh_config, state.as_ref())?))
-        } else {
-            None
-        };
+        let iroh = open_iroh_transport(&config, state.as_ref(), &mut transports).await?;
         for configured in &config.transports {
             transports.push(TransportEndpoint {
                 kind: configured.kind,
@@ -162,6 +158,61 @@ fn validate_config(config: &Config) -> Result<(), OpenError> {
     }
     Ok(())
 }
+
+#[cfg(feature = "iroh")]
+async fn open_iroh_transport(
+    config: &Config,
+    state: &dyn crate::state::StateStore,
+    transports: &mut Vec<TransportEndpoint>,
+) -> Result<Option<Arc<IrohTransport>>, OpenError> {
+    if let Some(iroh_config) = &config.iroh {
+        let iroh = Arc::new(IrohTransport::new(iroh_config, state).await.map_err(
+            |err| match err {
+                crate::transports::IrohInitError::State(err) => OpenError::State(err),
+                crate::transports::IrohInitError::Transport(err) => {
+                    OpenError::TransportInit(crate::TransportKind::Iroh, Box::new(err))
+                }
+            },
+        )?);
+        let transport: Arc<dyn crate::transports::Transport> = iroh.clone();
+        transports.push(TransportEndpoint {
+            kind: crate::TransportKind::Iroh,
+            transport,
+        });
+        Ok(Some(iroh))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(not(feature = "iroh"))]
+async fn open_iroh_transport(
+    config: &Config,
+    _state: &dyn crate::state::StateStore,
+    _transports: &mut Vec<TransportEndpoint>,
+) -> Result<Option<Arc<IrohTransport>>, OpenError> {
+    if config.iroh.is_some() {
+        return Err(OpenError::TransportInit(
+            crate::TransportKind::Iroh,
+            Box::new(IrohFeatureDisabled),
+        ));
+    }
+    Ok(None)
+}
+
+#[cfg(not(feature = "iroh"))]
+#[derive(Debug)]
+struct IrohFeatureDisabled;
+
+#[cfg(not(feature = "iroh"))]
+impl std::fmt::Display for IrohFeatureDisabled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("iroh feature is not enabled")
+    }
+}
+
+#[cfg(not(feature = "iroh"))]
+impl std::error::Error for IrohFeatureDisabled {}
 
 #[cfg(test)]
 mod tests {

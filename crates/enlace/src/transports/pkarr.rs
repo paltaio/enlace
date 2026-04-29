@@ -83,26 +83,23 @@ impl fmt::Debug for PkarrTransport {
 
 #[async_trait]
 impl MailboxTransport for PkarrTransport {
-    async fn send(&self, _id: &[u8; 16], _sealed: &[u8]) -> Result<(), TransportError> {
+    async fn send(&self, _id: &[u8], _sealed: &[u8]) -> Result<(), TransportError> {
         Err(TransportError::Unsupported)
     }
 
-    async fn recv(
-        &self,
-        _id: &[u8; 16],
-        _wait: Duration,
-    ) -> Result<Option<Vec<u8>>, TransportError> {
+    async fn recv(&self, _id: &[u8], _wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
         Err(TransportError::Unsupported)
     }
 }
 
 #[async_trait]
 impl SlotTransport for PkarrTransport {
-    async fn put(&self, id: &[u8; 16], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
+    async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
+        let id = pkarr_channel_id(id)?;
         let current = self.resolve_packet().await;
         if current
             .as_ref()
-            .and_then(|packet| slot_record(packet, id).transpose())
+            .and_then(|packet| slot_record(packet, &id).transpose())
             .transpose()?
             .is_some_and(|(current_version, _)| current_version >= version)
         {
@@ -113,7 +110,7 @@ impl SlotTransport for PkarrTransport {
             &self.keypair,
             &self.public_key,
             current.as_ref(),
-            id,
+            &id,
             version,
             sealed,
             self.record_ttl,
@@ -125,13 +122,18 @@ impl SlotTransport for PkarrTransport {
             .map_err(map_publish_error)
     }
 
-    async fn get(&self, id: &[u8; 16]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
-        self.slot_get_since(id, 0).await
+    async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
+        let id = pkarr_channel_id(id)?;
+        self.slot_get_since(&id, 0).await
     }
 
-    fn watch(&self, id: &[u8; 16], since: u64) -> SlotWatchStream {
+    fn watch(&self, id: &[u8], since: u64) -> SlotWatchStream {
+        let Ok(id) = pkarr_channel_id(id) else {
+            return Box::pin(tokio_stream::iter([Err(TransportError::Network(
+                "pkarr channel id must be 16 bytes".to_owned(),
+            ))]));
+        };
         let transport = self.clone();
-        let id = *id;
         let (tx, rx) = mpsc::channel(WATCH_BUFFER);
 
         tokio::spawn(async move {
@@ -281,6 +283,11 @@ fn poll_interval(interval: Duration) -> Duration {
 fn pkarr_keypair(seed: &[u8; 32]) -> Keypair {
     let key = derive_key32(seed, b"enlace/v1/key/pkarr-id");
     Keypair::from_secret_key(&key)
+}
+
+fn pkarr_channel_id(id: &[u8]) -> Result<[u8; 16], TransportError> {
+    id.try_into()
+        .map_err(|_| TransportError::Network("pkarr channel id must be 16 bytes".to_owned()))
 }
 
 fn map_build_error(err: pkarr::errors::SignedPacketBuildError) -> TransportError {

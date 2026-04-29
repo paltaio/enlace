@@ -11,7 +11,9 @@ use zeroize::Zeroizing;
 use crate::crypto::{self, SIG_LEN};
 use crate::dedup::Dedup;
 use crate::error::{RecvError, SealError, SendError, SlotError};
-use crate::kdf::{ChannelKind, TransportKind, channel_aead_key, channel_id};
+use crate::kdf::{
+    ChannelKind, NameError, TransportKind, channel_aead_key, channel_id, iroh_topic_id,
+};
 use crate::mailbox::{RecvMessage, SendReport};
 use crate::slot::{PutReport, SlotValue, SlotWatch};
 use crate::state::StateStore;
@@ -84,7 +86,7 @@ impl Coordinator {
 
         for endpoint in &self.transports {
             let transport = Arc::clone(&endpoint.transport);
-            let id = channel_id(&self.seed, endpoint.kind, ChannelKind::Mailbox, name)
+            let id = transport_channel_id(&self.seed, endpoint.kind, ChannelKind::Mailbox, name)
                 .map_err(|_| SealError::MsgpackFailed)?;
             let sealed = sealed.clone();
             let kind = endpoint.kind;
@@ -118,8 +120,9 @@ impl Coordinator {
             let mut tasks = JoinSet::new();
             for endpoint in &self.transports {
                 let transport = Arc::clone(&endpoint.transport);
-                let id = channel_id(&self.seed, endpoint.kind, ChannelKind::Mailbox, name)
-                    .map_err(|_| RecvError::Closed)?;
+                let id =
+                    transport_channel_id(&self.seed, endpoint.kind, ChannelKind::Mailbox, name)
+                        .map_err(|_| RecvError::Closed)?;
                 let kind = endpoint.kind;
                 tasks.spawn(async move { (kind, transport.recv(&id, wait).await) });
             }
@@ -178,7 +181,7 @@ impl Coordinator {
 
         for endpoint in &self.transports {
             let transport = Arc::clone(&endpoint.transport);
-            let id = channel_id(&self.seed, endpoint.kind, ChannelKind::Slot, name)
+            let id = transport_channel_id(&self.seed, endpoint.kind, ChannelKind::Slot, name)
                 .map_err(|_| SealError::MsgpackFailed)?;
             let sealed = sealed.clone();
             let kind = endpoint.kind;
@@ -210,7 +213,7 @@ impl Coordinator {
         let mut tasks = JoinSet::new();
         for endpoint in &self.transports {
             let transport = Arc::clone(&endpoint.transport);
-            let id = channel_id(&self.seed, endpoint.kind, ChannelKind::Slot, name)
+            let id = transport_channel_id(&self.seed, endpoint.kind, ChannelKind::Slot, name)
                 .map_err(|_| SealError::MsgpackFailed)?;
             let kind = endpoint.kind;
             tasks.spawn(async move { (kind, transport.get(&id).await) });
@@ -262,7 +265,8 @@ impl Coordinator {
         let dedup = Arc::new(Mutex::new(Dedup::new(self.dedup_buffer)));
 
         for endpoint in &self.transports {
-            let Ok(id) = channel_id(&self.seed, endpoint.kind, ChannelKind::Slot, &name) else {
+            let Ok(id) = transport_channel_id(&self.seed, endpoint.kind, ChannelKind::Slot, &name)
+            else {
                 continue;
             };
             let mut stream = endpoint.transport.watch(&id, 0);
@@ -438,6 +442,19 @@ fn signature_preimage(
 
 fn slot_pair_is_newer(version: u64, sealed: &[u8], best_version: u64, best_sealed: &[u8]) -> bool {
     (version, sealed) > (best_version, best_sealed)
+}
+
+fn transport_channel_id(
+    seed: &[u8; 32],
+    transport: TransportKind,
+    kind: ChannelKind,
+    name: &str,
+) -> Result<Vec<u8>, NameError> {
+    if transport == TransportKind::Iroh {
+        iroh_topic_id(seed, kind, name).map(Vec::from)
+    } else {
+        channel_id(seed, transport, kind, name).map(Vec::from)
+    }
 }
 
 #[cfg(test)]
