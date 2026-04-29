@@ -5,12 +5,12 @@
 //!
 //! - a 32-byte AEAD subkey (per kind, per name) — used by `crypto::seal/unseal`
 //! - a 16-byte transport-level channel id (per transport, per kind, per name)
+//! - a 32-byte iroh gossip topic id (per kind, per name)
 //!
-//! The HKDF info-string prefixes used for these two derivations
-//! (`enlace/v1/key/aead/...` and `enlace/v1/id/...`) are deliberately disjoint
-//! so the AEAD subkey for a channel can never collide with the transport-level
-//! id of any channel: domain separation is enforced at the HKDF info layer,
-//! not by trimming output bits.
+//! The HKDF info-string prefixes used for these derivations are deliberately
+//! disjoint so a key, transport id, and gossip topic for the same channel cannot
+//! collide: domain separation is enforced at the HKDF info layer, not by
+//! trimming output bits.
 //!
 //! Names are restricted to a narrow ASCII subset so that two endpoints that
 //! pass byte-equal names derive byte-equal keys/ids without any Unicode
@@ -20,6 +20,9 @@ use crate::crypto::{AeadKeyBytes, derive_key32, hkdf_sha256};
 
 /// Channel id length in bytes.
 pub const CHANNEL_ID_LEN: usize = 16;
+
+/// Iroh gossip topic id length in bytes.
+pub const IROH_TOPIC_ID_LEN: usize = 32;
 
 /// Channel name length cap in bytes.
 pub const MAX_NAME_LEN: usize = 64;
@@ -174,6 +177,29 @@ pub fn channel_id(
     info.push(b'/');
     info.extend_from_slice(name_bytes);
     let mut out = [0u8; CHANNEL_ID_LEN];
+    hkdf_sha256(seed, b"", &info, &mut out);
+    Ok(out)
+}
+
+/// Derive the iroh gossip topic id.
+///
+/// `info = b"enlace/v1/id/iroh-topic/" || kind || b"/" || name`
+pub fn iroh_topic_id(
+    seed: &[u8; 32],
+    kind: ChannelKind,
+    name: &str,
+) -> Result<[u8; IROH_TOPIC_ID_LEN], NameError> {
+    validate_name(name)?;
+    let kind_bytes = kind.as_bytes();
+    let name_bytes = name.as_bytes();
+    let mut info = Vec::with_capacity(
+        b"enlace/v1/id/iroh-topic/".len() + kind_bytes.len() + 1 + name_bytes.len(),
+    );
+    info.extend_from_slice(b"enlace/v1/id/iroh-topic/");
+    info.extend_from_slice(kind_bytes);
+    info.push(b'/');
+    info.extend_from_slice(name_bytes);
+    let mut out = [0u8; IROH_TOPIC_ID_LEN];
     hkdf_sha256(seed, b"", &info, &mut out);
     Ok(out)
 }
@@ -370,6 +396,53 @@ mod tests {
         );
     }
 
+    // -- iroh topic id -------------------------------------------------------
+
+    #[test]
+    fn iroh_topic_id_deterministic_and_sized() {
+        let id1 = iroh_topic_id(&SEED_A, ChannelKind::Mailbox, "alpha").unwrap();
+        let id2 = iroh_topic_id(&SEED_A, ChannelKind::Mailbox, "alpha").unwrap();
+
+        assert_eq!(id1, id2);
+        assert_eq!(id1.len(), IROH_TOPIC_ID_LEN);
+    }
+
+    #[test]
+    fn iroh_topic_id_diverges_by_kind() {
+        let mailbox = iroh_topic_id(&SEED_A, ChannelKind::Mailbox, "alpha").unwrap();
+        let slot = iroh_topic_id(&SEED_A, ChannelKind::Slot, "alpha").unwrap();
+
+        assert_ne!(mailbox, slot);
+    }
+
+    #[test]
+    fn iroh_topic_id_diverges_by_name() {
+        let a = iroh_topic_id(&SEED_A, ChannelKind::Mailbox, "alpha").unwrap();
+        let b = iroh_topic_id(&SEED_A, ChannelKind::Mailbox, "beta").unwrap();
+
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn iroh_topic_id_diverges_by_seed() {
+        let a = iroh_topic_id(&SEED_A, ChannelKind::Mailbox, "alpha").unwrap();
+        let b = iroh_topic_id(&SEED_B, ChannelKind::Mailbox, "alpha").unwrap();
+
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn iroh_topic_id_rejects_invalid_name() {
+        assert_eq!(
+            iroh_topic_id(&SEED_A, ChannelKind::Mailbox, "").err(),
+            Some(NameError::Empty)
+        );
+        assert_eq!(
+            iroh_topic_id(&SEED_A, ChannelKind::Mailbox, "Bad").err(),
+            Some(NameError::InvalidChar)
+        );
+    }
+
     // -- cross-domain separation -------------------------------------------
 
     #[test]
@@ -382,6 +455,14 @@ mod tests {
         assert_ne!(&key.as_ref()[..CHANNEL_ID_LEN], &id[..]);
     }
 
+    #[test]
+    fn iroh_topic_id_and_channel_id_share_no_prefix() {
+        let topic = iroh_topic_id(&SEED_A, ChannelKind::Mailbox, "alpha").unwrap();
+        let id = channel_id(&SEED_A, TransportKind::Iroh, ChannelKind::Mailbox, "alpha").unwrap();
+
+        assert_ne!(&topic[..CHANNEL_ID_LEN], &id[..]);
+    }
+
     proptest! {
         #[test]
         fn valid_names_derive_deterministic_keys_and_ids(name in "[a-z0-9_./-]{1,64}") {
@@ -392,6 +473,10 @@ mod tests {
             let id_a = channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, &name).unwrap();
             let id_b = channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, &name).unwrap();
             prop_assert_eq!(id_a, id_b);
+
+            let topic_a = iroh_topic_id(&SEED_A, ChannelKind::Mailbox, &name).unwrap();
+            let topic_b = iroh_topic_id(&SEED_A, ChannelKind::Mailbox, &name).unwrap();
+            prop_assert_eq!(topic_a, topic_b);
         }
 
         #[test]

@@ -32,10 +32,9 @@ pub struct PkarrTransport {
 impl PkarrTransport {
     pub fn new(seed: &[u8; 32], config: &PkarrConfig) -> Result<Self, TransportError> {
         let mut builder = Client::builder();
-        if !config.resolvers.is_empty() {
-            builder.no_default_network();
-            builder.relays(&config.resolvers).map_err(map_other_error)?;
-        }
+        let relays = config.effective_resolvers();
+        builder.no_default_network();
+        builder.relays(&relays).map_err(map_other_error)?;
         let client = builder.build().map_err(map_other_error)?;
         let keypair = pkarr_keypair(seed);
         let public_key = keypair.public_key();

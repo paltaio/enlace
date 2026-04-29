@@ -14,6 +14,12 @@ pub const DEFAULT_MAX_PLAINTEXT_BYTES: usize = 65_536;
 pub const DEFAULT_LONG_POLL_SECS: u32 = 25;
 pub const DEFAULT_REPUBLISH_INTERVAL: Duration = Duration::from_mins(30);
 pub const DEFAULT_DHT_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(10);
+pub const DEFAULT_PKARR_RELAYS: &[&str] = &[
+    "https://relay.pkarr.org",
+    "https://pkarr.pubky.org",
+    "https://pkarr.pubky.app",
+];
+pub const DEFAULT_IROH_MAX_MESSAGE_BYTES: usize = DEFAULT_MAX_PLAINTEXT_BYTES + 4096;
 pub const DEFAULT_IROH_MAX_STREAMS_PER_PEER: u32 = 32;
 pub const DEFAULT_IROH_MAX_CONNS_PER_PEER: u32 = 4;
 
@@ -105,9 +111,83 @@ pub struct PkarrConfig {
 impl Default for PkarrConfig {
     fn default() -> Self {
         Self {
-            resolvers: Vec::new(),
+            resolvers: DEFAULT_PKARR_RELAYS
+                .iter()
+                .map(|url| (*url).to_owned())
+                .collect(),
             republish_interval: DEFAULT_REPUBLISH_INTERVAL,
         }
+    }
+}
+
+impl PkarrConfig {
+    #[must_use]
+    pub fn effective_resolvers(&self) -> Vec<String> {
+        if self.resolvers.is_empty() {
+            DEFAULT_PKARR_RELAYS
+                .iter()
+                .map(|url| (*url).to_owned())
+                .collect()
+        } else {
+            self.resolvers.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pkarr_default_resolvers_are_public_relays() {
+        let config = PkarrConfig::default();
+
+        assert_eq!(config.resolvers, config.effective_resolvers());
+        assert_eq!(config.resolvers.len(), DEFAULT_PKARR_RELAYS.len());
+        for resolver in config.resolvers {
+            assert!(resolver.starts_with("https://"));
+        }
+    }
+
+    #[test]
+    fn pkarr_empty_resolvers_fall_back_to_defaults() {
+        let config = PkarrConfig {
+            resolvers: Vec::new(),
+            ..PkarrConfig::default()
+        };
+
+        assert_eq!(
+            config.effective_resolvers(),
+            DEFAULT_PKARR_RELAYS
+                .iter()
+                .map(|url| (*url).to_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pkarr_configured_resolvers_are_preserved() {
+        let config = PkarrConfig {
+            resolvers: vec!["http://127.0.0.1:8080".to_owned()],
+            ..PkarrConfig::default()
+        };
+
+        assert_eq!(config.effective_resolvers(), config.resolvers);
+    }
+
+    #[test]
+    fn iroh_defaults_match_realtime_transport_shape() {
+        let config = IrohConfig::default();
+
+        assert_eq!(config.relay_mode, IrohRelayMode::Default);
+        assert!(config.bind_addrs.is_empty());
+        assert!(config.peers.is_empty());
+        assert_eq!(config.max_message_bytes, DEFAULT_IROH_MAX_MESSAGE_BYTES);
+        assert_eq!(
+            config.max_streams_per_peer,
+            DEFAULT_IROH_MAX_STREAMS_PER_PEER
+        );
+        assert_eq!(config.max_conns_per_peer, DEFAULT_IROH_MAX_CONNS_PER_PEER);
     }
 }
 
@@ -128,7 +208,10 @@ impl Default for DhtConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IrohConfig {
-    pub relays: Vec<Url>,
+    pub relay_mode: IrohRelayMode,
+    pub bind_addrs: Vec<SocketAddr>,
+    pub peers: Vec<IrohEndpointAddr>,
+    pub max_message_bytes: usize,
     pub max_streams_per_peer: u32,
     pub max_conns_per_peer: u32,
 }
@@ -136,9 +219,26 @@ pub struct IrohConfig {
 impl Default for IrohConfig {
     fn default() -> Self {
         Self {
-            relays: Vec::new(),
+            relay_mode: IrohRelayMode::Default,
+            bind_addrs: Vec::new(),
+            peers: Vec::new(),
+            max_message_bytes: DEFAULT_IROH_MAX_MESSAGE_BYTES,
             max_streams_per_peer: DEFAULT_IROH_MAX_STREAMS_PER_PEER,
             max_conns_per_peer: DEFAULT_IROH_MAX_CONNS_PER_PEER,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IrohRelayMode {
+    Default,
+    Custom(Vec<Url>),
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrohEndpointAddr {
+    pub endpoint_id: [u8; 32],
+    pub relay_urls: Vec<Url>,
+    pub direct_addrs: Vec<SocketAddr>,
 }
