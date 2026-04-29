@@ -11,6 +11,7 @@ chacha20poly1305 = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures-core = { workspace = true }
 hkdf = { workspace = true }
+iroh = { workspace = true }
 lru = { workspace = true }
 mainline = { workspace = true }
 pkarr = { workspace = true }

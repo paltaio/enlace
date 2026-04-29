@@ -20,6 +20,7 @@ pub(crate) struct NamespaceInner {
     pub(crate) http: Option<Arc<HttpTransport>>,
     pub(crate) pkarr: Option<Arc<PkarrTransport>>,
     pub(crate) dht: Option<Arc<DhtTransport>>,
+    pub(crate) iroh: Option<Arc<IrohTransport>>,
 }
 
 impl Namespace {
@@ -78,6 +79,11 @@ impl Namespace {
         } else {
             None
         };
+        let iroh = if let Some(iroh_config) = &config.iroh {
+            Some(Arc::new(IrohTransport::new(iroh_config, state.as_ref())?))
+        } else {
+            None
+        };
         for configured in &config.transports {
             transports.push(TransportEndpoint {
                 kind: configured.kind,
@@ -101,6 +107,7 @@ impl Namespace {
                 http,
                 pkarr,
                 dht,
+                iroh,
             }),
         })
     }
@@ -130,7 +137,7 @@ impl Namespace {
 
     #[must_use]
     pub fn iroh(&self) -> Option<&IrohTransport> {
-        None
+        self.inner.iroh.as_deref()
     }
 
     #[must_use]
@@ -154,4 +161,26 @@ fn validate_config(config: &Config) -> Result<(), OpenError> {
         return Err(OpenError::TrustedWithoutSigning);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::config::IrohConfig;
+
+    #[tokio::test]
+    async fn iroh_config_exposes_transport_handle() {
+        let namespace = Namespace::open(
+            &[1; 32],
+            Config {
+                iroh: Some(IrohConfig::default()),
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(namespace.iroh().is_some());
+    }
 }

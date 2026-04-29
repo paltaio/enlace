@@ -10,10 +10,12 @@ use crate::kdf::TransportKind;
 
 mod dht;
 mod http;
+mod iroh;
 mod pkarr;
 
 pub use dht::DhtTransport;
 pub use http::HttpTransport;
+pub use iroh::IrohTransport;
 pub use pkarr::PkarrTransport;
 
 pub type SlotWatchStream =
@@ -35,11 +37,6 @@ pub trait SlotTransport: Send + Sync {
 pub trait Transport: MailboxTransport + SlotTransport {}
 
 impl<T> Transport for T where T: MailboxTransport + SlotTransport {}
-
-#[derive(Debug)]
-pub struct IrohTransport {
-    _private: (),
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthReport {
