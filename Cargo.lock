@@ -557,8 +557,11 @@ name = "enlace-testkit"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum-server",
  "enlace",
+ "enlace-relay",
  "rand 0.10.1",
+ "reqwest",
  "tokio",
  "tokio-stream",
 ]

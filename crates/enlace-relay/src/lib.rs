@@ -78,6 +78,21 @@ pub struct RelayConfig {
 }
 
 impl RelayConfig {
+    pub fn new(listen: SocketAddr) -> Self {
+        Self {
+            listen,
+            auth: None,
+            cert: None,
+            key: None,
+            persist: None,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_wait: Duration::from_secs(DEFAULT_MAX_WAIT_SECONDS),
+            mailbox_capacity: DEFAULT_MAILBOX_CAPACITY,
+            mailbox_ttl: Duration::from_secs(DEFAULT_MAILBOX_TTL_SECONDS),
+            slot_ttl: Duration::from_secs(DEFAULT_SLOT_TTL_SECONDS),
+        }
+    }
+
     pub fn from_cli(cli: Cli) -> Result<Self> {
         let auth = cli
             .auth
@@ -101,6 +116,41 @@ impl RelayConfig {
             mailbox_ttl: Duration::from_secs(cli.mailbox_ttl_seconds),
             slot_ttl: Duration::from_secs(cli.slot_ttl_seconds),
         })
+    }
+
+    pub fn with_auth(mut self, auth: impl Into<String>) -> Result<Self> {
+        self.auth = Some(auth_header(auth.into())?);
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_wait(mut self, max_wait: Duration) -> Self {
+        self.max_wait = max_wait;
+        self
+    }
+
+    #[must_use]
+    pub fn with_mailbox_capacity(mut self, mailbox_capacity: usize) -> Self {
+        self.mailbox_capacity = mailbox_capacity.max(1);
+        self
+    }
+
+    #[must_use]
+    pub fn with_mailbox_ttl(mut self, mailbox_ttl: Duration) -> Self {
+        self.mailbox_ttl = mailbox_ttl;
+        self
+    }
+
+    #[must_use]
+    pub fn with_slot_ttl(mut self, slot_ttl: Duration) -> Self {
+        self.slot_ttl = slot_ttl;
+        self
     }
 }
 

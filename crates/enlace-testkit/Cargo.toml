@@ -10,3 +10,8 @@ enlace = { path = "../enlace" }
 rand = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+
+[dev-dependencies]
+axum-server = { workspace = true }
+enlace-relay = { path = "../enlace-relay" }
+reqwest = { workspace = true }
