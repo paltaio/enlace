@@ -6,4 +6,5 @@
 #![allow(clippy::missing_panics_doc)]
 
 pub mod crypto;
+pub mod dedup;
 pub mod kdf;
