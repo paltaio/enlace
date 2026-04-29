@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use ed25519_dalek::VerifyingKey;
+use tokio::sync::mpsc;
 
-use crate::error::SlotError;
+use crate::error::{RecvError, SlotError};
 use crate::kdf::{NameError, TransportKind, validate_name};
 use crate::namespace::NamespaceInner;
 
@@ -21,22 +22,17 @@ impl Slot {
         })
     }
 
-    #[allow(clippy::unused_async)]
-    pub async fn put(&self, _payload: &[u8]) -> Result<PutReport, SlotError> {
-        let _version = self.inner.state.next_local_slot_version(&self.name)?;
-        Err(SlotError::AllTransportsFailed(Vec::new()))
+    pub async fn put(&self, payload: &[u8]) -> Result<PutReport, SlotError> {
+        self.inner.coordinator.slot_put(&self.name, payload).await
     }
 
-    #[allow(clippy::unused_async)]
     pub async fn get(&self) -> Result<Option<SlotValue>, SlotError> {
-        Ok(None)
+        self.inner.coordinator.slot_get(&self.name).await
     }
 
     #[must_use]
     pub fn watch(&self) -> SlotWatch {
-        SlotWatch {
-            name: self.name.clone(),
-        }
+        self.inner.coordinator.slot_watch(self.name.clone())
     }
 
     #[must_use]
@@ -60,14 +56,23 @@ pub struct PutReport {
     pub failed: Vec<(TransportKind, crate::TransportError)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct SlotWatch {
     name: String,
+    rx: mpsc::Receiver<SlotValue>,
 }
 
 impl SlotWatch {
+    pub(crate) fn new(name: String, rx: mpsc::Receiver<SlotValue>) -> Self {
+        Self { name, rx }
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub async fn recv(&mut self) -> Result<SlotValue, RecvError> {
+        self.rx.recv().await.ok_or(RecvError::Closed)
     }
 }

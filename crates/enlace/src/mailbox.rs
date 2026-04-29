@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use ed25519_dalek::VerifyingKey;
 
+use crate::config::DEFAULT_LONG_POLL_SECS;
+use crate::dedup::Dedup;
 use crate::error::{RecvError, SendError};
 use crate::kdf::{NameError, TransportKind, validate_name};
 use crate::namespace::NamespaceInner;
@@ -10,26 +12,37 @@ use crate::namespace::NamespaceInner;
 pub struct Mailbox {
     pub(crate) inner: Arc<NamespaceInner>,
     pub(crate) name: String,
+    dedup: Arc<std::sync::Mutex<Dedup>>,
 }
 
 impl Mailbox {
     pub(crate) fn new(inner: Arc<NamespaceInner>, name: &str) -> Result<Self, NameError> {
         validate_name(name)?;
         Ok(Self {
+            dedup: Arc::new(std::sync::Mutex::new(Dedup::new(
+                inner.coordinator.dedup_buffer(),
+            ))),
             inner,
             name: name.to_owned(),
         })
     }
 
-    #[allow(clippy::unused_async)]
-    pub async fn send(&self, _payload: &[u8]) -> Result<SendReport, SendError> {
-        let _configured_transports = self.inner.config.transport_count();
-        Err(SendError::AllTransportsFailed(Vec::new()))
+    pub async fn send(&self, payload: &[u8]) -> Result<SendReport, SendError> {
+        self.inner
+            .coordinator
+            .mailbox_send(&self.name, payload)
+            .await
     }
 
-    #[allow(clippy::unused_async)]
     pub async fn recv(&self) -> Result<RecvMessage, RecvError> {
-        Err(RecvError::Closed)
+        self.inner
+            .coordinator
+            .mailbox_recv(
+                &self.name,
+                std::time::Duration::from_secs(DEFAULT_LONG_POLL_SECS.into()),
+                &self.dedup,
+            )
+            .await
     }
 
     pub fn try_recv(&self) -> Result<Option<RecvMessage>, RecvError> {

@@ -1,6 +1,11 @@
 use std::time::Duration;
 
-use enlace::{MailboxTransport, SlotTransport, TransportError};
+use std::sync::Arc;
+
+use enlace::{
+    Config, ConfiguredTransport, MailboxTransport, Namespace, SlotTransport, TransportError,
+    TransportKind,
+};
 use enlace_testkit::{DelayingTransport, InMemoryTransport, LossyTransport};
 use tokio_stream::StreamExt;
 
@@ -123,4 +128,106 @@ async fn lossy_and_delaying_wrappers_compose() {
         transport.recv(&id, Duration::ZERO).await.unwrap(),
         Some(b"mail".to_vec())
     );
+}
+
+fn namespace_config<T>(transport: T) -> Config
+where
+    T: enlace::Transport + 'static,
+{
+    Config {
+        transports: vec![ConfiguredTransport::new(
+            TransportKind::Http,
+            Arc::new(transport),
+        )],
+        ..Config::default()
+    }
+}
+
+#[tokio::test]
+async fn namespaces_exchange_mailbox_through_in_memory_transport() {
+    let transport = InMemoryTransport::new();
+    let sender = Namespace::open(&[9; 32], namespace_config(transport.clone()))
+        .await
+        .unwrap();
+    let receiver = Namespace::open(&[9; 32], namespace_config(transport))
+        .await
+        .unwrap();
+
+    sender
+        .mailbox("events")
+        .unwrap()
+        .send(b"hello")
+        .await
+        .unwrap();
+    let message = receiver.mailbox("events").unwrap().recv().await.unwrap();
+
+    assert_eq!(message.payload, b"hello");
+    assert_eq!(message.via, TransportKind::Http);
+}
+
+#[tokio::test]
+async fn namespaces_exchange_slot_through_in_memory_transport() {
+    let transport = InMemoryTransport::new();
+    let writer = Namespace::open(&[10; 32], namespace_config(transport.clone()))
+        .await
+        .unwrap();
+    let reader = Namespace::open(&[10; 32], namespace_config(transport))
+        .await
+        .unwrap();
+
+    let report = writer.slot("current").unwrap().put(b"value").await.unwrap();
+    assert_eq!(report.version, 1);
+
+    let value = reader
+        .slot("current")
+        .unwrap()
+        .get()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value.version, 1);
+    assert_eq!(value.payload, b"value");
+}
+
+#[tokio::test]
+async fn mailbox_fanout_duplicate_is_delivered_once() {
+    let first = InMemoryTransport::new();
+    let second = InMemoryTransport::new();
+    let seed = [11; 32];
+    let sender = Namespace::open(
+        &seed,
+        Config {
+            transports: vec![
+                ConfiguredTransport::new(TransportKind::Http, Arc::new(first.clone())),
+                ConfiguredTransport::new(TransportKind::Dht, Arc::new(second.clone())),
+            ],
+            ..Config::default()
+        },
+    )
+    .await
+    .unwrap();
+    let receiver = Namespace::open(
+        &seed,
+        Config {
+            transports: vec![
+                ConfiguredTransport::new(TransportKind::Http, Arc::new(first)),
+                ConfiguredTransport::new(TransportKind::Dht, Arc::new(second)),
+            ],
+            ..Config::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mailbox = receiver.mailbox("events").unwrap();
+
+    sender
+        .mailbox("events")
+        .unwrap()
+        .send(b"dedup")
+        .await
+        .unwrap();
+    assert_eq!(mailbox.recv().await.unwrap().payload, b"dedup");
+
+    let duplicate = tokio::time::timeout(Duration::from_millis(50), mailbox.recv()).await;
+    assert!(duplicate.is_err());
 }

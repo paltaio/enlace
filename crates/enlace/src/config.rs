@@ -5,8 +5,10 @@ use std::time::Duration;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use url::Url;
 
+use crate::TransportKind;
 use crate::dedup;
 use crate::state::StateStore;
+use crate::transports::Transport;
 
 pub const DEFAULT_MAX_PLAINTEXT_BYTES: usize = 65_536;
 pub const DEFAULT_LONG_POLL_SECS: u32 = 25;
@@ -24,6 +26,7 @@ pub struct Config {
     pub dedup_buffer: usize,
     pub max_plaintext_bytes: usize,
     pub state: Option<Arc<dyn StateStore>>,
+    pub transports: Vec<ConfiguredTransport>,
 }
 
 impl Default for Config {
@@ -38,6 +41,7 @@ impl Default for Config {
             dedup_buffer: dedup::DEFAULT_CAPACITY,
             max_plaintext_bytes: DEFAULT_MAX_PLAINTEXT_BYTES,
             state: None,
+            transports: Vec::new(),
         }
     }
 }
@@ -48,6 +52,20 @@ impl Config {
             + usize::from(self.pkarr.is_some())
             + usize::from(self.dht.is_some())
             + usize::from(self.iroh.is_some())
+            + self.transports.len()
+    }
+}
+
+#[derive(Clone)]
+pub struct ConfiguredTransport {
+    pub kind: TransportKind,
+    pub transport: Arc<dyn Transport>,
+}
+
+impl ConfiguredTransport {
+    #[must_use]
+    pub fn new(kind: TransportKind, transport: Arc<dyn Transport>) -> Self {
+        Self { kind, transport }
     }
 }
 

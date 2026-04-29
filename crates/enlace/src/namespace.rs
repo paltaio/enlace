@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use crate::config::Config;
+use crate::coordinator::{Coordinator, TransportEndpoint};
 use crate::error::OpenError;
 use crate::kdf::NameError;
 use crate::mailbox::Mailbox;
 use crate::slot::Slot;
-use crate::state::{InMemoryStateStore, StateStore};
+use crate::state::InMemoryStateStore;
 use crate::transports::{DhtTransport, HealthReport, HttpTransport, IrohTransport, PkarrTransport};
 
 #[derive(Clone)]
@@ -15,7 +16,7 @@ pub struct Namespace {
 
 pub(crate) struct NamespaceInner {
     pub(crate) config: Config,
-    pub(crate) state: Arc<dyn StateStore>,
+    pub(crate) coordinator: Arc<Coordinator>,
 }
 
 impl Namespace {
@@ -34,9 +35,29 @@ impl Namespace {
             .state
             .take()
             .unwrap_or_else(|| Arc::new(InMemoryStateStore::new()));
+        let transports = config
+            .transports
+            .iter()
+            .map(|configured| TransportEndpoint {
+                kind: configured.kind,
+                transport: Arc::clone(&configured.transport),
+            })
+            .collect();
+        let coordinator = Arc::new(Coordinator::new(
+            seed,
+            transports,
+            config.signing.clone(),
+            config.trusted.clone(),
+            config.dedup_buffer,
+            config.max_plaintext_bytes,
+            state,
+        ));
 
         Ok(Self {
-            inner: Arc::new(NamespaceInner { config, state }),
+            inner: Arc::new(NamespaceInner {
+                config,
+                coordinator,
+            }),
         })
     }
 

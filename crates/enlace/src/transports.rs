@@ -24,6 +24,10 @@ pub trait SlotTransport: Send + Sync {
     fn watch(&self, id: &[u8; 16], since: u64) -> SlotWatchStream;
 }
 
+pub trait Transport: MailboxTransport + SlotTransport {}
+
+impl<T> Transport for T where T: MailboxTransport + SlotTransport {}
+
 #[derive(Debug)]
 pub struct HttpTransport {
     _private: (),
@@ -63,6 +67,9 @@ impl HealthReport {
         }
         if config.iroh.is_some() {
             transports.push(TransportHealth::configured(TransportKind::Iroh));
+        }
+        for transport in &config.transports {
+            transports.push(TransportHealth::configured(transport.kind));
         }
         Self { transports }
     }
