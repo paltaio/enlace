@@ -231,3 +231,74 @@ async fn mailbox_fanout_duplicate_is_delivered_once() {
     let duplicate = tokio::time::timeout(Duration::from_millis(50), mailbox.recv()).await;
     assert!(duplicate.is_err());
 }
+
+#[tokio::test]
+async fn lossy_and_delaying_namespace_combo_delivers_each_message_once() {
+    let dropped = InMemoryTransport::new();
+    let delayed = InMemoryTransport::new();
+    let duplicated = InMemoryTransport::new();
+    let seed = [12; 32];
+    let sender = Namespace::open(
+        &seed,
+        Config {
+            transports: vec![
+                ConfiguredTransport::new(
+                    TransportKind::Http,
+                    Arc::new(LossyTransport::with_inner(dropped.clone()).with_drop_percent(100)),
+                ),
+                ConfiguredTransport::new(
+                    TransportKind::Dht,
+                    Arc::new(
+                        DelayingTransport::with_inner(delayed.clone())
+                            .with_max_delay(Duration::from_millis(2)),
+                    ),
+                ),
+                ConfiguredTransport::new(TransportKind::Pkarr, Arc::new(duplicated.clone())),
+            ],
+            ..Config::default()
+        },
+    )
+    .await
+    .unwrap();
+    let receiver = Namespace::open(
+        &seed,
+        Config {
+            transports: vec![
+                ConfiguredTransport::new(
+                    TransportKind::Http,
+                    Arc::new(LossyTransport::with_inner(dropped).with_drop_percent(100)),
+                ),
+                ConfiguredTransport::new(
+                    TransportKind::Dht,
+                    Arc::new(
+                        DelayingTransport::with_inner(delayed)
+                            .with_max_delay(Duration::from_millis(2)),
+                    ),
+                ),
+                ConfiguredTransport::new(TransportKind::Pkarr, Arc::new(duplicated)),
+            ],
+            ..Config::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mailbox = receiver.mailbox("combo").unwrap();
+
+    for i in 0u8..5 {
+        sender.mailbox("combo").unwrap().send(&[i]).await.unwrap();
+    }
+
+    let mut received = Vec::new();
+    for _ in 0..5 {
+        let message = tokio::time::timeout(Duration::from_secs(1), mailbox.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        received.push(message.payload);
+    }
+    received.sort();
+    assert_eq!(received, vec![vec![0], vec![1], vec![2], vec![3], vec![4]]);
+
+    let duplicate = tokio::time::timeout(Duration::from_millis(50), mailbox.recv()).await;
+    assert!(duplicate.is_err());
+}
