@@ -35,26 +35,27 @@ impl ChannelKind {
     }
 }
 
-/// Transport identifier used in the channel-id HKDF context.
+/// One of the four transport adapters.
 ///
-/// The same channel name on the same seed produces a distinct 16-byte id per
-/// transport so that addresses do not collide across transports.
+/// Used both as the discriminator in the channel-id HKDF context (so the same
+/// channel name on the same seed yields a distinct 16-byte id per transport)
+/// and as the runtime identifier surfaced on received messages and errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TransportId {
+pub enum TransportKind {
     Http,
     Pkarr,
     Dht,
     Iroh,
 }
 
-impl TransportId {
+impl TransportKind {
     #[inline]
     pub const fn as_bytes(self) -> &'static [u8] {
         match self {
-            TransportId::Http => b"http",
-            TransportId::Pkarr => b"pkarr",
-            TransportId::Dht => b"dht",
-            TransportId::Iroh => b"iroh",
+            TransportKind::Http => b"http",
+            TransportKind::Pkarr => b"pkarr",
+            TransportKind::Dht => b"dht",
+            TransportKind::Iroh => b"iroh",
         }
     }
 }
@@ -112,7 +113,8 @@ pub fn channel_aead_key(
     validate_name(name)?;
     let kind_bytes = kind.as_bytes();
     let name_bytes = name.as_bytes();
-    let mut info = Vec::with_capacity(b"enlace/v1/key/aead/".len() + kind_bytes.len() + 1 + name_bytes.len());
+    let mut info =
+        Vec::with_capacity(b"enlace/v1/key/aead/".len() + kind_bytes.len() + 1 + name_bytes.len());
     info.extend_from_slice(b"enlace/v1/key/aead/");
     info.extend_from_slice(kind_bytes);
     info.push(b'/');
@@ -127,7 +129,7 @@ pub fn channel_aead_key(
 /// HKDF output is truncated to `CHANNEL_ID_LEN` (16 bytes).
 pub fn channel_id(
     seed: &[u8; 32],
-    transport: TransportId,
+    transport: TransportKind,
     kind: ChannelKind,
     name: &str,
 ) -> Result<[u8; CHANNEL_ID_LEN], NameError> {
@@ -281,18 +283,19 @@ mod tests {
 
     #[test]
     fn channel_id_deterministic_and_sized() {
-        let id1 = channel_id(&SEED_A, TransportId::Http, ChannelKind::Mailbox, "alpha").unwrap();
-        let id2 = channel_id(&SEED_A, TransportId::Http, ChannelKind::Mailbox, "alpha").unwrap();
+        let id1 = channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, "alpha").unwrap();
+        let id2 = channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, "alpha").unwrap();
         assert_eq!(id1, id2);
         assert_eq!(id1.len(), CHANNEL_ID_LEN);
     }
 
     #[test]
     fn channel_id_diverges_by_transport() {
-        let http = channel_id(&SEED_A, TransportId::Http, ChannelKind::Mailbox, "alpha").unwrap();
-        let pkarr = channel_id(&SEED_A, TransportId::Pkarr, ChannelKind::Mailbox, "alpha").unwrap();
-        let dht = channel_id(&SEED_A, TransportId::Dht, ChannelKind::Mailbox, "alpha").unwrap();
-        let iroh = channel_id(&SEED_A, TransportId::Iroh, ChannelKind::Mailbox, "alpha").unwrap();
+        let http = channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, "alpha").unwrap();
+        let pkarr =
+            channel_id(&SEED_A, TransportKind::Pkarr, ChannelKind::Mailbox, "alpha").unwrap();
+        let dht = channel_id(&SEED_A, TransportKind::Dht, ChannelKind::Mailbox, "alpha").unwrap();
+        let iroh = channel_id(&SEED_A, TransportKind::Iroh, ChannelKind::Mailbox, "alpha").unwrap();
         // All four must be pairwise distinct.
         let all = [http, pkarr, dht, iroh];
         for i in 0..all.len() {
@@ -305,34 +308,40 @@ mod tests {
     #[test]
     fn channel_id_diverges_by_kind() {
         let mailbox =
-            channel_id(&SEED_A, TransportId::Http, ChannelKind::Mailbox, "alpha").unwrap();
-        let slot = channel_id(&SEED_A, TransportId::Http, ChannelKind::Slot, "alpha").unwrap();
+            channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, "alpha").unwrap();
+        let slot = channel_id(&SEED_A, TransportKind::Http, ChannelKind::Slot, "alpha").unwrap();
         assert_ne!(mailbox, slot);
     }
 
     #[test]
     fn channel_id_diverges_by_name() {
-        let a = channel_id(&SEED_A, TransportId::Http, ChannelKind::Mailbox, "alpha").unwrap();
-        let b = channel_id(&SEED_A, TransportId::Http, ChannelKind::Mailbox, "beta").unwrap();
+        let a = channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, "alpha").unwrap();
+        let b = channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, "beta").unwrap();
         assert_ne!(a, b);
     }
 
     #[test]
     fn channel_id_diverges_by_seed() {
-        let a = channel_id(&SEED_A, TransportId::Http, ChannelKind::Mailbox, "alpha").unwrap();
-        let b = channel_id(&SEED_B, TransportId::Http, ChannelKind::Mailbox, "alpha").unwrap();
+        let a = channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, "alpha").unwrap();
+        let b = channel_id(&SEED_B, TransportKind::Http, ChannelKind::Mailbox, "alpha").unwrap();
         assert_ne!(a, b);
     }
 
     #[test]
     fn channel_id_rejects_invalid_name() {
         assert_eq!(
-            channel_id(&SEED_A, TransportId::Http, ChannelKind::Mailbox, "").err(),
+            channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, "").err(),
             Some(NameError::Empty)
         );
         let too_long = "a".repeat(MAX_NAME_LEN + 1);
         assert_eq!(
-            channel_id(&SEED_A, TransportId::Http, ChannelKind::Mailbox, &too_long).err(),
+            channel_id(
+                &SEED_A,
+                TransportKind::Http,
+                ChannelKind::Mailbox,
+                &too_long
+            )
+            .err(),
             Some(NameError::TooLong)
         );
     }
@@ -345,8 +354,7 @@ mod tests {
         // (`enlace/v1/id/...`) are disjoint by construction; a sanity check
         // that they don't collide on their first 16 bytes either.
         let key = channel_aead_key(&SEED_A, ChannelKind::Mailbox, "alpha").unwrap();
-        let id = channel_id(&SEED_A, TransportId::Http, ChannelKind::Mailbox, "alpha").unwrap();
+        let id = channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, "alpha").unwrap();
         assert_ne!(&key.as_ref()[..CHANNEL_ID_LEN], &id[..]);
     }
-
 }
