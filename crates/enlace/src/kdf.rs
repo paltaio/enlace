@@ -6,6 +6,12 @@
 //! - a 32-byte AEAD subkey (per kind, per name) — used by `crypto::seal/unseal`
 //! - a 16-byte transport-level channel id (per transport, per kind, per name)
 //!
+//! The HKDF info-string prefixes used for these two derivations
+//! (`enlace/v1/key/aead/...` and `enlace/v1/id/...`) are deliberately disjoint
+//! so the AEAD subkey for a channel can never collide with the transport-level
+//! id of any channel: domain separation is enforced at the HKDF info layer,
+//! not by trimming output bits.
+//!
 //! Names are restricted to a narrow ASCII subset so that two endpoints that
 //! pass byte-equal names derive byte-equal keys/ids without any Unicode
 //! normalization step.
