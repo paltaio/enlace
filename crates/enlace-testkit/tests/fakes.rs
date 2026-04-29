@@ -1,0 +1,126 @@
+use std::time::Duration;
+
+use enlace::{MailboxTransport, SlotTransport, TransportError};
+use enlace_testkit::{DelayingTransport, InMemoryTransport, LossyTransport};
+use tokio_stream::StreamExt;
+
+fn channel_id(byte: u8) -> [u8; 16] {
+    [byte; 16]
+}
+
+#[tokio::test]
+async fn in_memory_mailbox_is_fifo_and_consuming() {
+    let transport = InMemoryTransport::new();
+    let id = channel_id(1);
+
+    transport.send(&id, b"first").await.unwrap();
+    transport.send(&id, b"second").await.unwrap();
+
+    assert_eq!(
+        transport.recv(&id, Duration::ZERO).await.unwrap(),
+        Some(b"first".to_vec())
+    );
+    assert_eq!(
+        transport.recv(&id, Duration::ZERO).await.unwrap(),
+        Some(b"second".to_vec())
+    );
+    assert_eq!(transport.recv(&id, Duration::ZERO).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn in_memory_mailbox_long_poll_waits_for_send() {
+    let transport = InMemoryTransport::new();
+    let id = channel_id(2);
+    let sender = transport.clone();
+
+    let recv = tokio::spawn(async move {
+        sender
+            .recv(&id, Duration::from_secs(1))
+            .await
+            .expect("recv should not fail")
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    transport.send(&id, b"late").await.unwrap();
+
+    assert_eq!(recv.await.unwrap(), Some(b"late".to_vec()));
+}
+
+#[tokio::test]
+async fn in_memory_slot_rejects_stale_versions() {
+    let transport = InMemoryTransport::new();
+    let id = channel_id(3);
+
+    transport.put(&id, 2, b"new").await.unwrap();
+    let err = transport.put(&id, 2, b"stale").await.unwrap_err();
+    assert!(matches!(err, TransportError::Stale));
+    assert_eq!(
+        transport.get(&id).await.unwrap(),
+        Some((2, b"new".to_vec()))
+    );
+}
+
+#[tokio::test]
+async fn in_memory_slot_watch_filters_by_id_and_version() {
+    let transport = InMemoryTransport::new();
+    let id = channel_id(4);
+    let other = channel_id(5);
+    let mut watch = transport.watch(&id, 1);
+
+    transport.put(&other, 2, b"other").await.unwrap();
+    transport.put(&id, 1, b"old").await.unwrap();
+    transport.put(&id, 2, b"new").await.unwrap();
+
+    let next = tokio::time::timeout(Duration::from_secs(1), watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(next, (2, b"new".to_vec()));
+}
+
+#[tokio::test]
+async fn lossy_transport_can_drop_every_send() {
+    let transport = LossyTransport::with_inner(InMemoryTransport::new()).with_drop_percent(100);
+    let id = channel_id(6);
+
+    transport.send(&id, b"drop").await.unwrap();
+    assert_eq!(transport.recv(&id, Duration::ZERO).await.unwrap(), None);
+
+    transport.put(&id, 1, b"drop").await.unwrap();
+    assert_eq!(transport.get(&id).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn delaying_transport_delegates_operations() {
+    let transport = DelayingTransport::with_inner(InMemoryTransport::new())
+        .with_max_delay(Duration::from_millis(1));
+    let id = channel_id(7);
+
+    transport.send(&id, b"mail").await.unwrap();
+    assert_eq!(
+        transport.recv(&id, Duration::ZERO).await.unwrap(),
+        Some(b"mail".to_vec())
+    );
+
+    transport.put(&id, 1, b"slot").await.unwrap();
+    assert_eq!(
+        transport.get(&id).await.unwrap(),
+        Some((1, b"slot".to_vec()))
+    );
+}
+
+#[tokio::test]
+async fn lossy_and_delaying_wrappers_compose() {
+    let transport = DelayingTransport::with_inner(
+        LossyTransport::with_inner(InMemoryTransport::new()).with_drop_percent(0),
+    )
+    .with_max_delay(Duration::from_millis(1));
+    let id = channel_id(8);
+
+    transport.send(&id, b"mail").await.unwrap();
+    assert_eq!(
+        transport.recv(&id, Duration::ZERO).await.unwrap(),
+        Some(b"mail".to_vec())
+    );
+}

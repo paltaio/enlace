@@ -25,5 +25,6 @@ pub use namespace::Namespace;
 pub use slot::{PutReport, Slot, SlotValue, SlotWatch};
 pub use state::{DhtBootstrapCache, InMemoryStateStore, StateError, StateStore};
 pub use transports::{
-    DhtTransport, HealthReport, HttpTransport, IrohTransport, PkarrTransport, TransportHealth,
+    DhtTransport, HealthReport, HttpTransport, IrohTransport, MailboxTransport, PkarrTransport,
+    SlotTransport, SlotWatchStream, TransportHealth,
 };

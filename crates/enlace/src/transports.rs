@@ -1,5 +1,28 @@
+use std::pin::Pin;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures_core::Stream;
+
 use crate::config::Config;
+use crate::error::TransportError;
 use crate::kdf::TransportKind;
+
+pub type SlotWatchStream =
+    Pin<Box<dyn Stream<Item = Result<(u64, Vec<u8>), TransportError>> + Send>>;
+
+#[async_trait]
+pub trait MailboxTransport: Send + Sync {
+    async fn send(&self, id: &[u8; 16], sealed: &[u8]) -> Result<(), TransportError>;
+    async fn recv(&self, id: &[u8; 16], wait: Duration) -> Result<Option<Vec<u8>>, TransportError>;
+}
+
+#[async_trait]
+pub trait SlotTransport: Send + Sync {
+    async fn put(&self, id: &[u8; 16], version: u64, sealed: &[u8]) -> Result<(), TransportError>;
+    async fn get(&self, id: &[u8; 16]) -> Result<Option<(u64, Vec<u8>)>, TransportError>;
+    fn watch(&self, id: &[u8; 16], since: u64) -> SlotWatchStream;
+}
 
 #[derive(Debug)]
 pub struct HttpTransport {
