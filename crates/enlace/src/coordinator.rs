@@ -94,9 +94,11 @@ impl Coordinator {
         let mut delivered = Vec::new();
         let mut failed = Vec::new();
         while let Some(result) = tasks.join_next().await {
-            match result.expect("transport send task should not panic") {
-                (kind, Ok(())) => delivered.push(kind),
-                (kind, Err(err)) => failed.push((kind, err)),
+            if let Ok((kind, send_result)) = result {
+                match send_result {
+                    Ok(()) => delivered.push(kind),
+                    Err(err) => failed.push((kind, err)),
+                }
             }
         }
 
@@ -123,7 +125,10 @@ impl Coordinator {
             }
 
             while let Some(result) = tasks.join_next().await {
-                match result.expect("transport recv task should not panic") {
+                let Ok(recv_result) = result else {
+                    continue;
+                };
+                match recv_result {
                     (kind, Ok(Some(sealed))) => {
                         if dedup
                             .lock()
@@ -175,9 +180,11 @@ impl Coordinator {
         let mut stored = Vec::new();
         let mut failed = Vec::new();
         while let Some(result) = tasks.join_next().await {
-            match result.expect("transport put task should not panic") {
-                (kind, Ok(())) => stored.push(kind),
-                (kind, Err(err)) => failed.push((kind, err)),
+            if let Ok((kind, put_result)) = result {
+                match put_result {
+                    Ok(()) => stored.push(kind),
+                    Err(err) => failed.push((kind, err)),
+                }
             }
         }
 
@@ -206,7 +213,10 @@ impl Coordinator {
         let mut best: Option<(u64, Vec<u8>, SlotValue)> = None;
 
         while let Some(result) = tasks.join_next().await {
-            match result.expect("transport get task should not panic") {
+            let Ok(get_result) = result else {
+                continue;
+            };
+            match get_result {
                 (_, Ok(None)) => ok_count += 1,
                 (kind, Ok(Some((_server_version, sealed)))) => {
                     ok_count += 1;
@@ -223,7 +233,7 @@ impl Coordinator {
                         signed_by: opened.signed_by,
                     };
                     if best.as_ref().is_none_or(|(best_version, best_sealed, _)| {
-                        (version, sealed.as_slice()) > (*best_version, best_sealed.as_slice())
+                        slot_pair_is_newer(version, &sealed, *best_version, best_sealed)
                     }) {
                         best = Some((version, sealed, value));
                     }
@@ -272,7 +282,7 @@ impl Coordinator {
 
                     let mut best = best.lock().await;
                     if best.as_ref().is_some_and(|(best_version, best_sealed)| {
-                        (version, sealed.as_slice()) <= (*best_version, best_sealed.as_slice())
+                        !slot_pair_is_newer(version, &sealed, *best_version, best_sealed)
                     }) {
                         continue;
                     }
@@ -416,4 +426,41 @@ fn signature_preimage(
     }
     preimage.extend_from_slice(payload);
     preimage
+}
+
+fn slot_pair_is_newer(version: u64, sealed: &[u8], best_version: u64, best_sealed: &[u8]) -> bool {
+    (version, sealed) > (best_version, best_sealed)
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn slot_ordering_matches_version_then_sealed_lexicographic(
+            version in any::<u64>(),
+            best_version in any::<u64>(),
+            sealed in proptest::collection::vec(any::<u8>(), 0..128),
+            best_sealed in proptest::collection::vec(any::<u8>(), 0..128),
+        ) {
+            prop_assert_eq!(
+                slot_pair_is_newer(version, &sealed, best_version, &best_sealed),
+                (version, sealed.as_slice()) > (best_version, best_sealed.as_slice()),
+            );
+        }
+
+        #[test]
+        fn signature_preimage_is_deterministic(
+            name in "[a-z0-9_./-]{1,64}",
+            payload in proptest::collection::vec(any::<u8>(), 0..512),
+            version in proptest::option::of(any::<u64>()),
+        ) {
+            let a = signature_preimage(ChannelKind::Slot, &name, &payload, version);
+            let b = signature_preimage(ChannelKind::Slot, &name, &payload, version);
+            prop_assert_eq!(a, b);
+        }
+    }
 }

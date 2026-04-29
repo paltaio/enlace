@@ -115,6 +115,8 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     #[test]
@@ -280,5 +282,28 @@ mod tests {
     #[test]
     fn ct_eq_empty() {
         assert!(ct_eq(b"", b""));
+    }
+
+    proptest! {
+        #[test]
+        fn aead_round_trip_for_arbitrary_payloads(
+            payload in proptest::collection::vec(any::<u8>(), 0..4096),
+            aad in proptest::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let key = [0x42u8; AEAD_KEY_LEN];
+            let sealed = seal(&key, &aad, &payload);
+            let opened = unseal(&key, &aad, &sealed).expect("sealed payload should reopen");
+            prop_assert_eq!(opened, payload);
+        }
+
+        #[test]
+        fn ed25519_round_trip_for_arbitrary_messages(
+            message in proptest::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let sk = SigningKey::from_bytes(&[0xABu8; 32]);
+            let vk = sk.verifying_key();
+            let sig = sign(&sk, &message);
+            prop_assert!(verify(&vk, &message, &sig));
+        }
     }
 }

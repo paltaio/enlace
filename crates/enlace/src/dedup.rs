@@ -90,6 +90,8 @@ fn digest(sealed: &[u8]) -> [u8; DIGEST_LEN] {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     #[test]
@@ -212,5 +214,22 @@ mod tests {
             0x78, 0x52, 0xb8, 0x55,
         ];
         assert_eq!(digest(b""), want);
+    }
+
+    proptest! {
+        #[test]
+        fn repeated_payload_is_duplicate(payload in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let mut d = Dedup::new(32);
+            prop_assert!(!d.observe(&payload));
+            prop_assert!(d.observe(&payload));
+        }
+
+        #[test]
+        fn disabled_buffer_never_reports_duplicate(payload in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let mut d = Dedup::new(0);
+            prop_assert!(!d.observe(&payload));
+            prop_assert!(!d.observe(&payload));
+            prop_assert_eq!(d.len(), 0);
+        }
     }
 }

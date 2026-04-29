@@ -180,6 +180,8 @@ pub fn channel_id(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     const SEED_A: [u8; 32] = [0xA1u8; 32];
@@ -378,5 +380,24 @@ mod tests {
         let key = channel_aead_key(&SEED_A, ChannelKind::Mailbox, "alpha").unwrap();
         let id = channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, "alpha").unwrap();
         assert_ne!(&key.as_ref()[..CHANNEL_ID_LEN], &id[..]);
+    }
+
+    proptest! {
+        #[test]
+        fn valid_names_derive_deterministic_keys_and_ids(name in "[a-z0-9_./-]{1,64}") {
+            let key_a = channel_aead_key(&SEED_A, ChannelKind::Mailbox, &name).unwrap();
+            let key_b = channel_aead_key(&SEED_A, ChannelKind::Mailbox, &name).unwrap();
+            prop_assert_eq!(key_a.as_ref(), key_b.as_ref());
+
+            let id_a = channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, &name).unwrap();
+            let id_b = channel_id(&SEED_A, TransportKind::Http, ChannelKind::Mailbox, &name).unwrap();
+            prop_assert_eq!(id_a, id_b);
+        }
+
+        #[test]
+        fn names_outside_allowed_charset_are_rejected(name in ".{1,64}") {
+            prop_assume!(name.as_bytes().iter().any(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'z' | b'-' | b'_' | b'/' | b'.')));
+            prop_assert!(validate_name(&name).is_err());
+        }
     }
 }
