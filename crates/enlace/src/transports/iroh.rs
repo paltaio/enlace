@@ -14,7 +14,7 @@ use iroh_gossip::api::{Event, GossipSender};
 use iroh_gossip::{Gossip, TopicId};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -25,6 +25,7 @@ use crate::transports::{MailboxTransport, SlotTransport, SlotWatchStream};
 
 const WATCH_BUFFER: usize = 64;
 const SLOT_HEADER_LEN: usize = 8;
+const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct IrohTransport {
@@ -170,26 +171,30 @@ impl IrohTransport {
         }
     }
 
-    async fn ensure_topic(&self, id: &[u8]) -> Result<Arc<TopicState>, TransportError> {
+    async fn ensure_topic(
+        &self,
+        id: &[u8],
+        wait_for_join: bool,
+    ) -> Result<Arc<TopicState>, TransportError> {
         if let Some(topic) = self.inner.topics.lock().await.get(id).cloned() {
             return Ok(topic);
         }
 
         let topic_id = topic_id(id)?;
         let bootstrap = self.bootstrap_peers();
-        let topic = if bootstrap.is_empty() {
-            self.inner
-                .gossip
-                .subscribe(topic_id, bootstrap)
+        let has_bootstrap = !bootstrap.is_empty();
+        let mut topic = self
+            .inner
+            .gossip
+            .subscribe(topic_id, bootstrap)
+            .await
+            .map_err(map_gossip_error)?;
+        if wait_for_join && has_bootstrap {
+            timeout(JOIN_TIMEOUT, topic.joined())
                 .await
-                .map_err(map_gossip_error)?
-        } else {
-            self.inner
-                .gossip
-                .subscribe_and_join(topic_id, bootstrap)
-                .await
-                .map_err(map_gossip_error)?
-        };
+                .map_err(|_| TransportError::Timeout)?
+                .map_err(map_gossip_error)?;
+        }
         let (sender, mut receiver) = topic.split();
         let (slot_updates, _) = broadcast::channel(WATCH_BUFFER);
         let state = Arc::new_cyclic(|weak: &std::sync::Weak<TopicState>| {
@@ -308,7 +313,7 @@ impl TopicState {
 #[async_trait]
 impl MailboxTransport for IrohTransport {
     async fn send(&self, id: &[u8], sealed: &[u8]) -> Result<(), TransportError> {
-        let topic = self.ensure_topic(id).await?;
+        let topic = self.ensure_topic(id, true).await?;
         topic
             .sender
             .broadcast(sealed.to_vec().into())
@@ -317,7 +322,7 @@ impl MailboxTransport for IrohTransport {
     }
 
     async fn recv(&self, id: &[u8], wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
-        let topic = self.ensure_topic(id).await?;
+        let topic = self.ensure_topic(id, false).await?;
         topic.recv_mailbox(wait).await
     }
 }
@@ -325,7 +330,7 @@ impl MailboxTransport for IrohTransport {
 #[async_trait]
 impl SlotTransport for IrohTransport {
     async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
-        let topic = self.ensure_topic(id).await?;
+        let topic = self.ensure_topic(id, true).await?;
         let frame = encode_slot_frame(version, sealed);
         topic.record_slot(version, sealed.to_vec());
         topic
@@ -336,7 +341,7 @@ impl SlotTransport for IrohTransport {
     }
 
     async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
-        let topic = self.ensure_topic(id).await?;
+        let topic = self.ensure_topic(id, false).await?;
         Ok(topic.current_slot())
     }
 
@@ -346,7 +351,7 @@ impl SlotTransport for IrohTransport {
         let (tx, rx) = mpsc::channel(WATCH_BUFFER);
 
         tokio::spawn(async move {
-            let topic = match transport.ensure_topic(&id).await {
+            let topic = match transport.ensure_topic(&id, false).await {
                 Ok(topic) => topic,
                 Err(err) => {
                     let _ = tx.send(Err(err)).await;
