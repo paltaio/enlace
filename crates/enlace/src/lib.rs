@@ -21,8 +21,8 @@ pub mod state;
 pub mod transports;
 
 pub use config::{
-    BasicAuth, Config, ConfiguredTransport, DhtConfig, HttpConfig, IrohConfig, IrohEndpointAddr,
-    IrohRelayMode, PkarrConfig,
+    BasicAuth, Config, ConfiguredTransport, DhtBootstrapCacheConfig, DhtConfig, HttpConfig,
+    IrohConfig, IrohEndpointAddr, IrohRelayMode, PkarrConfig,
 };
 pub use error::{OpenError, RecvError, SealError, SendError, SlotError, TransportError};
 pub use kdf::{NameError, TransportKind};

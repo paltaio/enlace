@@ -1,18 +1,24 @@
 use std::fmt;
-use std::time::Duration;
+use std::fs;
+use std::io;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use mainline::{Dht, MutableItem, SigningKey};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::config::DhtConfig;
+use crate::config::{DhtBootstrapCacheConfig, DhtConfig};
 use crate::crypto::derive_key32;
 use crate::error::TransportError;
 use crate::transports::{MailboxTransport, SlotTransport, SlotWatchStream};
 
 const MAX_MUTABLE_VALUE_BYTES: usize = 1000;
 const WATCH_BUFFER: usize = 64;
+const BOOTSTRAP_CACHE_WRITE_INTERVAL: Duration = Duration::from_mins(5);
 
 #[derive(Clone)]
 pub struct DhtTransport {
@@ -20,6 +26,7 @@ pub struct DhtTransport {
     signing_key: SigningKey,
     public_key: [u8; 32],
     watch_poll_interval: Duration,
+    bootstrap_cache: Option<Arc<BootstrapCache>>,
 }
 
 impl DhtTransport {
@@ -29,15 +36,29 @@ impl DhtTransport {
                 "DHT watch poll interval must be nonzero".to_owned(),
             ));
         }
+        validate_bootstrap_cache(config.bootstrap_cache.as_ref())?;
+
+        let cached_bootstrap = load_bootstrap_cache(config.bootstrap_cache.as_ref())?;
         let mut builder = Dht::builder();
-        if !config.bootstrap.is_empty() {
-            builder.bootstrap(&config.bootstrap);
+        let bootstrap = combined_bootstrap(&config.bootstrap, cached_bootstrap.as_deref());
+        if !bootstrap.is_empty() {
+            builder.bootstrap(&bootstrap);
         }
         let dht = builder.build().map_err(map_io_error)?;
-        Ok(Self::from_dht(seed, dht, config.watch_poll_interval))
+        Ok(Self::from_dht(
+            seed,
+            dht,
+            config.watch_poll_interval,
+            config.bootstrap_cache.clone(),
+        ))
     }
 
-    fn from_dht(seed: &[u8; 32], dht: Dht, watch_poll_interval: Duration) -> Self {
+    fn from_dht(
+        seed: &[u8; 32],
+        dht: Dht,
+        watch_poll_interval: Duration,
+        bootstrap_cache: Option<DhtBootstrapCacheConfig>,
+    ) -> Self {
         let signing_key = dht_signing_key(seed);
         let public_key = signing_key.verifying_key().to_bytes();
         Self {
@@ -45,6 +66,7 @@ impl DhtTransport {
             signing_key,
             public_key,
             watch_poll_interval,
+            bootstrap_cache: bootstrap_cache.map(BootstrapCache::new).map(Arc::new),
         }
     }
 
@@ -58,7 +80,25 @@ impl DhtTransport {
                 best = Some(item);
             }
         }
+        self.maybe_persist_bootstrap_cache();
         best
+    }
+
+    fn maybe_persist_bootstrap_cache(&self) {
+        let Some(cache) = &self.bootstrap_cache else {
+            return;
+        };
+        if !cache.should_write() {
+            return;
+        }
+        let peers: Vec<SocketAddr> = self
+            .dht
+            .to_bootstrap()
+            .into_iter()
+            .filter_map(|peer| peer.parse().ok())
+            .take(cache.config.max_peers)
+            .collect();
+        let _ = persist_bootstrap_cache(&cache.config.path, &peers, now_secs());
     }
 
     async fn slot_get_since(
@@ -88,7 +128,37 @@ impl fmt::Debug for DhtTransport {
         f.debug_struct("DhtTransport")
             .field("public_key", &self.public_key)
             .field("watch_poll_interval", &self.watch_poll_interval)
+            .field("bootstrap_cache", &self.bootstrap_cache.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+struct BootstrapCache {
+    config: DhtBootstrapCacheConfig,
+    last_write: Mutex<Option<Instant>>,
+}
+
+impl BootstrapCache {
+    fn new(config: DhtBootstrapCacheConfig) -> Self {
+        Self {
+            config,
+            last_write: Mutex::new(None),
+        }
+    }
+
+    fn should_write(&self) -> bool {
+        let mut last_write = self
+            .last_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last_write
+            .as_ref()
+            .is_some_and(|last| last.elapsed() < BOOTSTRAP_CACHE_WRITE_INTERVAL)
+        {
+            return false;
+        }
+        *last_write = Some(Instant::now());
+        true
     }
 }
 
@@ -122,7 +192,9 @@ impl SlotTransport for DhtTransport {
                 .dht
                 .put_mutable(item, cas)
                 .map(drop)
-                .map_err(map_put_error)
+                .map_err(map_put_error)?;
+            transport.maybe_persist_bootstrap_cache();
+            Ok(())
         })
         .await
     }
@@ -207,6 +279,103 @@ fn mutable_item_is_newer(candidate: &MutableItem, current: &MutableItem) -> bool
     (candidate.seq(), candidate.value()) > (current.seq(), current.value())
 }
 
+fn combined_bootstrap(configured: &[SocketAddr], cached: Option<&[SocketAddr]>) -> Vec<SocketAddr> {
+    let cached = cached.unwrap_or_default();
+    let mut bootstrap = Vec::with_capacity(configured.len() + cached.len());
+    bootstrap.extend_from_slice(configured);
+    bootstrap.extend_from_slice(cached);
+    bootstrap
+}
+
+fn validate_bootstrap_cache(
+    config: Option<&DhtBootstrapCacheConfig>,
+) -> Result<(), TransportError> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    if config.ttl.is_zero() {
+        return Err(TransportError::Network(
+            "DHT bootstrap cache TTL must be nonzero".to_owned(),
+        ));
+    }
+    if config.max_peers == 0 {
+        return Err(TransportError::Network(
+            "DHT bootstrap cache max peers must be nonzero".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_bootstrap_cache(
+    config: Option<&DhtBootstrapCacheConfig>,
+) -> Result<Option<Vec<SocketAddr>>, TransportError> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let raw = match fs::read_to_string(&config.path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(map_io_error(err)),
+    };
+    Ok(decode_bootstrap_cache(
+        &raw,
+        now_secs(),
+        config.ttl,
+        config.max_peers,
+    ))
+}
+
+fn decode_bootstrap_cache(
+    raw: &str,
+    now_secs: u64,
+    ttl: Duration,
+    max_peers: usize,
+) -> Option<Vec<SocketAddr>> {
+    let mut lines = raw.lines();
+    let timestamp_line = lines.next()?;
+    let timestamp = timestamp_line
+        .strip_prefix("timestamp=")
+        .and_then(|value| value.parse::<u64>().ok())?;
+    if now_secs.saturating_sub(timestamp) > ttl.as_secs() {
+        return None;
+    }
+
+    let peers: Vec<SocketAddr> = lines
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| line.parse().ok())
+        .take(max_peers)
+        .collect();
+    if peers.is_empty() { None } else { Some(peers) }
+}
+
+fn persist_bootstrap_cache(
+    path: &Path,
+    peers: &[SocketAddr],
+    now_secs: u64,
+) -> Result<(), TransportError> {
+    if peers.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(map_io_error)?;
+    }
+    let mut body = format!("timestamp={now_secs}\n");
+    for peer in peers {
+        body.push_str(&peer.to_string());
+        body.push('\n');
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, body).map_err(map_io_error)?;
+    fs::rename(tmp, path).map_err(map_io_error)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 fn map_io_error(err: std::io::Error) -> TransportError {
     TransportError::Other(Box::new(err))
 }
@@ -221,6 +390,18 @@ fn map_put_error(err: mainline::errors::PutMutableError) -> TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn peer(addr: &str) -> SocketAddr {
+        addr.parse().unwrap()
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "enlace-dht-bootstrap-cache-{name}-{}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn value_limit_matches_bep44_cap() {
@@ -241,6 +422,94 @@ mod tests {
         assert!(mutable_item_is_newer(&newer_seq, &older));
         assert!(mutable_item_is_newer(&newer_value, &newer_seq));
         assert!(!mutable_item_is_newer(&older, &newer_value));
+    }
+
+    #[test]
+    fn combines_configured_and_cached_bootstrap() {
+        let configured = [peer("127.0.0.1:1001")];
+        let cached = [peer("127.0.0.1:1002")];
+
+        assert_eq!(
+            combined_bootstrap(&configured, Some(&cached)),
+            vec![configured[0], cached[0]]
+        );
+    }
+
+    #[test]
+    fn decodes_fresh_bootstrap_cache() {
+        let raw = "timestamp=100\n127.0.0.1:1001\nbad\n127.0.0.1:1002\n";
+
+        let peers = decode_bootstrap_cache(raw, 120, Duration::from_mins(1), 2).unwrap();
+
+        assert_eq!(peers, vec![peer("127.0.0.1:1001"), peer("127.0.0.1:1002")]);
+    }
+
+    #[test]
+    fn ignores_stale_bootstrap_cache() {
+        let raw = "timestamp=100\n127.0.0.1:1001\n";
+
+        let peers = decode_bootstrap_cache(raw, 161, Duration::from_mins(1), 64);
+
+        assert_eq!(peers, None);
+    }
+
+    #[test]
+    fn caps_bootstrap_cache_peers() {
+        let raw = "timestamp=100\n127.0.0.1:1001\n127.0.0.1:1002\n127.0.0.1:1003\n";
+
+        let peers = decode_bootstrap_cache(raw, 100, Duration::from_mins(1), 2).unwrap();
+
+        assert_eq!(peers, vec![peer("127.0.0.1:1001"), peer("127.0.0.1:1002")]);
+    }
+
+    #[test]
+    fn persists_bootstrap_cache_atomically() {
+        let path = temp_path("roundtrip").join("dht-bootstrap.txt");
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+        let peers = vec![peer("127.0.0.1:1001"), peer("127.0.0.1:1002")];
+
+        persist_bootstrap_cache(&path, &peers, 100).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        let decoded = decode_bootstrap_cache(&raw, 100, Duration::from_mins(1), 64).unwrap();
+
+        assert_eq!(decoded, peers);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn bootstrap_cache_rejects_zero_ttl() {
+        let config = DhtConfig {
+            bootstrap_cache: Some(DhtBootstrapCacheConfig {
+                path: temp_path("zero-ttl"),
+                ttl: Duration::ZERO,
+                max_peers: 64,
+            }),
+            ..DhtConfig::default()
+        };
+
+        let err = DhtTransport::new(&[1; 32], &config).unwrap_err();
+
+        assert!(matches!(err, TransportError::Network(_)));
+    }
+
+    #[test]
+    fn bootstrap_cache_rejects_zero_max_peers() {
+        let config = DhtConfig {
+            bootstrap_cache: Some(DhtBootstrapCacheConfig {
+                path: temp_path("zero-peers"),
+                ttl: Duration::from_mins(1),
+                max_peers: 0,
+            }),
+            ..DhtConfig::default()
+        };
+
+        let err = DhtTransport::new(&[1; 32], &config).unwrap_err();
+
+        assert!(matches!(err, TransportError::Network(_)));
     }
 
     #[tokio::test]

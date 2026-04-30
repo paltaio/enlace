@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,8 @@ pub const DEFAULT_MAX_PLAINTEXT_BYTES: usize = 65_536;
 pub const DEFAULT_LONG_POLL_SECS: u32 = 25;
 pub const DEFAULT_REPUBLISH_INTERVAL: Duration = Duration::from_mins(30);
 pub const DEFAULT_DHT_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(10);
+pub const DEFAULT_DHT_BOOTSTRAP_CACHE_TTL: Duration = Duration::from_hours(24);
+pub const DEFAULT_DHT_BOOTSTRAP_CACHE_MAX_PEERS: usize = 64;
 pub const DEFAULT_PKARR_RELAYS: &[&str] = &[
     "https://relay.pkarr.org",
     "https://pkarr.pubky.org",
@@ -176,6 +179,14 @@ mod tests {
     }
 
     #[test]
+    fn dht_bootstrap_cache_defaults_are_bounded() {
+        let config = DhtBootstrapCacheConfig::new("bootstrap.txt".into());
+
+        assert_eq!(config.ttl, DEFAULT_DHT_BOOTSTRAP_CACHE_TTL);
+        assert_eq!(config.max_peers, DEFAULT_DHT_BOOTSTRAP_CACHE_MAX_PEERS);
+    }
+
+    #[test]
     fn iroh_defaults_match_realtime_transport_shape() {
         let config = IrohConfig::default();
 
@@ -195,6 +206,7 @@ mod tests {
 pub struct DhtConfig {
     pub bootstrap: Vec<SocketAddr>,
     pub watch_poll_interval: Duration,
+    pub bootstrap_cache: Option<DhtBootstrapCacheConfig>,
 }
 
 impl Default for DhtConfig {
@@ -202,6 +214,25 @@ impl Default for DhtConfig {
         Self {
             bootstrap: Vec::new(),
             watch_poll_interval: DEFAULT_DHT_WATCH_POLL_INTERVAL,
+            bootstrap_cache: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DhtBootstrapCacheConfig {
+    pub path: PathBuf,
+    pub ttl: Duration,
+    pub max_peers: usize,
+}
+
+impl DhtBootstrapCacheConfig {
+    #[must_use]
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            ttl: DEFAULT_DHT_BOOTSTRAP_CACHE_TTL,
+            max_peers: DEFAULT_DHT_BOOTSTRAP_CACHE_MAX_PEERS,
         }
     }
 }

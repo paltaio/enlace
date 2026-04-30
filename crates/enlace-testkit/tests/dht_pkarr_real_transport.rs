@@ -159,6 +159,7 @@ fn dht_config(bootstrap: &[String]) -> Config {
                 .map(|addr| addr.parse().expect("testnet bootstrap addr parses"))
                 .collect(),
             watch_poll_interval: Duration::from_millis(50),
+            ..DhtConfig::default()
         }),
         ..Config::default()
     }
@@ -194,6 +195,7 @@ fn combined_config(http_url: &str, pkarr_url: &str, bootstrap: &[String]) -> Con
                 .map(|addr| addr.parse().expect("testnet bootstrap addr parses"))
                 .collect(),
             watch_poll_interval: Duration::from_millis(50),
+            ..DhtConfig::default()
         }),
         ..Config::default()
     }
