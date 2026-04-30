@@ -110,9 +110,6 @@ pub enum OpenError {
     NoTransport,
     /// Seed bytes failed validation (e.g. all-zero seed).
     InvalidSeed,
-    /// Trusted keys configured without a signing key — every outgoing frame
-    /// would be dropped on the receiver side, so the configuration is rejected.
-    TrustedWithoutSigning,
     /// A transport adapter failed to initialize.
     TransportInit(TransportKind, Box<dyn StdError + Send + Sync>),
     /// State store access failed during open.
@@ -124,9 +121,6 @@ impl fmt::Display for OpenError {
         match self {
             Self::NoTransport => f.write_str("no transport configured"),
             Self::InvalidSeed => f.write_str("seed failed validation"),
-            Self::TrustedWithoutSigning => {
-                f.write_str("trusted keys configured without a signing key")
-            }
             Self::TransportInit(kind, e) => {
                 write!(f, "{kind} transport failed to initialize: {e}")
             }
@@ -365,10 +359,6 @@ mod tests {
             "no transport configured"
         );
         assert_eq!(OpenError::InvalidSeed.to_string(), "seed failed validation");
-        assert_eq!(
-            OpenError::TrustedWithoutSigning.to_string(),
-            "trusted keys configured without a signing key",
-        );
     }
 
     #[test]

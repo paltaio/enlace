@@ -33,15 +33,13 @@ async fn open_rejects_zero_transports() {
 }
 
 #[tokio::test]
-async fn open_rejects_trusted_without_signing() {
+async fn open_accepts_trusted_without_signing() {
     let mut config = http_config();
     config
         .trusted
         .push(SigningKey::from_bytes(&[7; 32]).verifying_key());
-    let Err(err) = Namespace::open(&seed(), config).await else {
-        panic!("open should reject trusted keys without signing");
-    };
-    assert!(matches!(err, OpenError::TrustedWithoutSigning));
+    let namespace = Namespace::open(&seed(), config).await.unwrap();
+    assert!(namespace.http().is_some());
 }
 
 #[tokio::test]

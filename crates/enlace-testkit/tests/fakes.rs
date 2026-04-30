@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
+use ed25519_dalek::SigningKey;
 use enlace::{
     Config, ConfiguredTransport, MailboxTransport, Namespace, SlotTransport, TransportError,
     TransportKind,
@@ -163,6 +164,83 @@ async fn namespaces_exchange_mailbox_through_in_memory_transport() {
 
     assert_eq!(message.payload, b"hello");
     assert_eq!(message.via, TransportKind::Http);
+}
+
+#[tokio::test]
+async fn receive_only_trusted_namespace_requires_signatures() {
+    let transport = InMemoryTransport::new();
+    let seed = [31; 32];
+    let trusted_signer = SigningKey::from_bytes(&[32; 32]);
+    let untrusted_signer = SigningKey::from_bytes(&[33; 32]);
+
+    let unsigned = Namespace::open(&seed, namespace_config(transport.clone()))
+        .await
+        .unwrap();
+    let untrusted = Namespace::open(
+        &seed,
+        Config {
+            signing: Some(untrusted_signer),
+            ..namespace_config(transport.clone())
+        },
+    )
+    .await
+    .unwrap();
+    let trusted = Namespace::open(
+        &seed,
+        Config {
+            signing: Some(trusted_signer.clone()),
+            ..namespace_config(transport.clone())
+        },
+    )
+    .await
+    .unwrap();
+    let receiver = Namespace::open(
+        &seed,
+        Config {
+            trusted: vec![trusted_signer.verifying_key()],
+            ..namespace_config(transport)
+        },
+    )
+    .await
+    .unwrap();
+    let inbox = receiver.mailbox("events").unwrap();
+
+    unsigned
+        .mailbox("events")
+        .unwrap()
+        .send(b"unsigned")
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), inbox.recv())
+            .await
+            .is_err()
+    );
+
+    untrusted
+        .mailbox("events")
+        .unwrap()
+        .send(b"untrusted")
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), inbox.recv())
+            .await
+            .is_err()
+    );
+
+    trusted
+        .mailbox("events")
+        .unwrap()
+        .send(b"trusted")
+        .await
+        .unwrap();
+    let message = tokio::time::timeout(Duration::from_secs(1), inbox.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.payload, b"trusted");
+    assert_eq!(message.signed_by, Some(trusted_signer.verifying_key()));
 }
 
 #[tokio::test]

@@ -1084,6 +1084,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "ed25519-dalek 2.2.0",
  "enlace",
  "enlace-relay",
  "mainline",

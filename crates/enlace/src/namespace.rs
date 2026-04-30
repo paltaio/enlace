@@ -142,9 +142,6 @@ fn validate_config(config: &Config) -> Result<(), OpenError> {
     if config.transport_count() == 0 {
         return Err(OpenError::NoTransport);
     }
-    if !config.trusted.is_empty() && config.signing.is_none() {
-        return Err(OpenError::TrustedWithoutSigning);
-    }
     Ok(())
 }
 
