@@ -1,9 +1,11 @@
 //! Public-key peer identity types.
 
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::error::Error as StdError;
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::RwLock;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -186,6 +188,35 @@ impl From<PeerCardError> for TrustError {
 }
 
 impl From<StateError> for TrustError {
+    fn from(err: StateError) -> Self {
+        Self::State(err)
+    }
+}
+
+/// Failure modes for live group-key mutations.
+#[derive(Debug)]
+pub enum GroupKeyError {
+    /// Group-key storage failed.
+    State(StateError),
+}
+
+impl fmt::Display for GroupKeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::State(err) => write!(f, "state store error: {err}"),
+        }
+    }
+}
+
+impl StdError for GroupKeyError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::State(err) => Some(err),
+        }
+    }
+}
+
+impl From<StateError> for GroupKeyError {
     fn from(err: StateError) -> Self {
         Self::State(err)
     }
@@ -434,6 +465,73 @@ impl fmt::Debug for PeerIdentity {
                 &self.iroh_secret.as_ref().map(|_| "<redacted>"),
             )
             .finish()
+    }
+}
+
+/// Runtime public-key namespace configuration.
+#[derive(Default)]
+pub struct PeerConfig {
+    pub state: State,
+    pub group_keys: Vec<(GroupId, GroupKey)>,
+}
+
+/// Live public-key namespace state.
+pub struct PeerNamespace {
+    identity: PeerIdentity,
+    state: State,
+    group_keys: RwLock<HashMap<(GroupId, GroupKeyId), GroupKey>>,
+}
+
+impl PeerNamespace {
+    pub fn open(identity: PeerIdentity, config: PeerConfig) -> Result<Self, GroupKeyError> {
+        let namespace = Self {
+            identity,
+            state: config.state,
+            group_keys: RwLock::new(HashMap::new()),
+        };
+        for (group, key) in config.group_keys {
+            namespace.add_group_key(group, key)?;
+        }
+        Ok(namespace)
+    }
+
+    #[must_use]
+    pub fn peer_id(&self) -> PeerId {
+        self.identity.peer_id()
+    }
+
+    #[must_use]
+    pub fn card(&self) -> PeerCard {
+        self.identity.card()
+    }
+
+    pub fn add_group_key(&self, group: GroupId, key: GroupKey) -> Result<(), GroupKeyError> {
+        self.state.store_group_key(group, &key)?;
+        let mut keys = write_group_keys(&self.group_keys);
+        keys.insert((group, key.id), key);
+        Ok(())
+    }
+
+    pub fn remove_group_key(
+        &self,
+        group: GroupId,
+        key_id: GroupKeyId,
+    ) -> Result<(), GroupKeyError> {
+        self.state.remove_group_key(group, key_id)?;
+        let mut keys = write_group_keys(&self.group_keys);
+        keys.remove(&(group, key_id));
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn list_group_keys(&self, group: GroupId) -> Vec<GroupKeyId> {
+        let keys = read_group_keys(&self.group_keys);
+        let mut ids: Vec<_> = keys
+            .keys()
+            .filter_map(|&(candidate, key_id)| (candidate == group).then_some(key_id))
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 }
 
@@ -920,6 +1018,16 @@ fn channel_kind_from_code(code: u8) -> Result<ChannelKind, PeerEnvelopeError> {
         1 => Ok(ChannelKind::Slot),
         _ => Err(PeerEnvelopeError::MsgpackFailed),
     }
+}
+
+fn write_group_keys<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn read_group_keys<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn write_endpoint(out: &mut Vec<u8>, endpoint: Option<&IrohEndpointAddr>) {
@@ -1430,6 +1538,70 @@ mod tests {
 
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("55, 55"));
+    }
+
+    #[test]
+    fn peer_namespace_seeds_and_lists_group_keys() {
+        let group = GroupId::from_bytes([1; GROUP_ID_LEN]);
+        let other_group = GroupId::from_bytes([2; GROUP_ID_LEN]);
+        let first = GroupKey::new(GroupKeyId::from_bytes([3; GROUP_KEY_ID_LEN]), [4; 32]);
+        let second = GroupKey::new(GroupKeyId::from_bytes([5; GROUP_KEY_ID_LEN]), [6; 32]);
+        let other = GroupKey::new(GroupKeyId::from_bytes([7; GROUP_KEY_ID_LEN]), [8; 32]);
+
+        let namespace = PeerNamespace::open(
+            identity(80, 81),
+            PeerConfig {
+                group_keys: vec![
+                    (group, second.clone()),
+                    (other_group, other.clone()),
+                    (group, first.clone()),
+                ],
+                ..PeerConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(namespace.peer_id(), identity(80, 81).peer_id());
+        assert_eq!(namespace.card(), identity(80, 81).card());
+        assert_eq!(namespace.list_group_keys(group), vec![first.id, second.id]);
+        assert_eq!(namespace.list_group_keys(other_group), vec![other.id]);
+    }
+
+    #[test]
+    fn peer_namespace_adds_replaces_and_removes_group_keys() {
+        let group = GroupId::from_bytes([9; GROUP_ID_LEN]);
+        let key_id = GroupKeyId::from_bytes([10; GROUP_KEY_ID_LEN]);
+        let first = GroupKey::new(key_id, [11; 32]);
+        let replacement = GroupKey::new(key_id, [12; 32]);
+        let namespace = PeerNamespace::open(identity(82, 83), PeerConfig::default()).unwrap();
+
+        namespace.add_group_key(group, first).unwrap();
+        namespace.add_group_key(group, replacement).unwrap();
+        assert_eq!(namespace.list_group_keys(group), vec![key_id]);
+
+        namespace.remove_group_key(group, key_id).unwrap();
+        assert!(namespace.list_group_keys(group).is_empty());
+    }
+
+    #[test]
+    fn peer_namespace_group_key_mutations_update_state() {
+        let state = State::memory();
+        let group = GroupId::from_bytes([13; GROUP_ID_LEN]);
+        let key = GroupKey::new(GroupKeyId::from_bytes([14; GROUP_KEY_ID_LEN]), [15; 32]);
+        let namespace = PeerNamespace::open(
+            identity(84, 85),
+            PeerConfig {
+                state: state.clone(),
+                group_keys: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        namespace.add_group_key(group, key.clone()).unwrap();
+        assert_eq!(state.group_keys(group).unwrap(), vec![key.clone()]);
+
+        namespace.remove_group_key(group, key.id).unwrap();
+        assert!(state.group_keys(group).unwrap().is_empty());
     }
 
     #[test]
