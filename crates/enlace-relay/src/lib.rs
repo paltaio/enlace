@@ -7,9 +7,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+#[cfg(any(feature = "persist", feature = "tls"))]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "persist")]
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
@@ -45,10 +48,13 @@ pub struct Cli {
     listen: SocketAddr,
     #[arg(long)]
     auth: Option<String>,
+    #[cfg(feature = "tls")]
     #[arg(long)]
     cert: Option<PathBuf>,
+    #[cfg(feature = "tls")]
     #[arg(long)]
     key: Option<PathBuf>,
+    #[cfg(feature = "persist")]
     #[arg(long)]
     persist: Option<PathBuf>,
     #[arg(long, default_value_t = DEFAULT_MAX_BODY_BYTES)]
@@ -67,8 +73,11 @@ pub struct Cli {
 pub struct RelayConfig {
     listen: SocketAddr,
     auth: Option<String>,
+    #[cfg(feature = "tls")]
     cert: Option<PathBuf>,
+    #[cfg(feature = "tls")]
     key: Option<PathBuf>,
+    #[cfg(feature = "persist")]
     persist: Option<PathBuf>,
     max_body_bytes: usize,
     max_wait: Duration,
@@ -82,8 +91,11 @@ impl RelayConfig {
         Self {
             listen,
             auth: None,
+            #[cfg(feature = "tls")]
             cert: None,
+            #[cfg(feature = "tls")]
             key: None,
+            #[cfg(feature = "persist")]
             persist: None,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_wait: Duration::from_secs(DEFAULT_MAX_WAIT_SECONDS),
@@ -100,15 +112,23 @@ impl RelayConfig {
             .map(auth_header)
             .transpose()?;
 
-        if cli.cert.is_some() != cli.key.is_some() {
+        #[cfg(feature = "tls")]
+        let cert = cli.cert;
+        #[cfg(feature = "tls")]
+        let key = cli.key;
+        #[cfg(feature = "tls")]
+        if cert.is_some() != key.is_some() {
             bail!("--cert and --key must be provided together");
         }
 
         Ok(Self {
             listen: cli.listen,
             auth,
-            cert: cli.cert,
-            key: cli.key,
+            #[cfg(feature = "tls")]
+            cert,
+            #[cfg(feature = "tls")]
+            key,
+            #[cfg(feature = "persist")]
             persist: cli.persist,
             max_body_bytes: cli.max_body_bytes,
             max_wait: Duration::from_secs(cli.max_wait_seconds),
@@ -160,6 +180,7 @@ pub struct AppState {
     mailbox_notify: Arc<tokio::sync::Notify>,
     slot_notify: Arc<tokio::sync::Notify>,
     auth: Option<String>,
+    #[cfg(feature = "persist")]
     persist: Option<PersistentSlots>,
     max_body_bytes: usize,
     max_wait: Duration,
@@ -188,6 +209,7 @@ struct SlotEntry {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "persist")]
 struct PersistentSlots {
     db: sled::Db,
 }
@@ -207,10 +229,13 @@ pub async fn run_from_env() -> Result<()> {
 pub async fn run(cli: Cli) -> Result<()> {
     let config = RelayConfig::from_cli(cli)?;
     let listen = config.listen;
+    #[cfg(feature = "tls")]
     let cert = config.cert.clone();
+    #[cfg(feature = "tls")]
     let key = config.key.clone();
     let app = build_router(config).await?;
 
+    #[cfg(feature = "tls")]
     if let (Some(cert), Some(key)) = (cert, key) {
         let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
             .await
@@ -219,17 +244,18 @@ pub async fn run(cli: Cli) -> Result<()> {
             .serve(app.into_make_service())
             .await
             .context("serving TLS relay")?;
-    } else {
-        axum_server::bind(listen)
-            .serve(app.into_make_service())
-            .await
-            .context("serving relay")?;
+        return Ok(());
     }
 
-    Ok(())
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .context("binding relay listener")?;
+    axum::serve(listener, app).await.context("serving relay")
 }
 
+#[cfg_attr(not(feature = "persist"), allow(clippy::unused_async))]
 pub async fn build_router(config: RelayConfig) -> Result<Router> {
+    #[cfg(feature = "persist")]
     let (persist, slots) = match config.persist {
         Some(path) => {
             let (persist, slots) = PersistentSlots::open(path).await?;
@@ -237,6 +263,8 @@ pub async fn build_router(config: RelayConfig) -> Result<Router> {
         }
         None => (None, HashMap::new()),
     };
+    #[cfg(not(feature = "persist"))]
+    let slots = HashMap::new();
 
     let state = AppState {
         tables: Arc::new(Mutex::new(Tables {
@@ -246,6 +274,7 @@ pub async fn build_router(config: RelayConfig) -> Result<Router> {
         mailbox_notify: Arc::new(tokio::sync::Notify::new()),
         slot_notify: Arc::new(tokio::sync::Notify::new()),
         auth: config.auth,
+        #[cfg(feature = "persist")]
         persist,
         max_body_bytes: config.max_body_bytes,
         max_wait: config.max_wait,
@@ -350,14 +379,20 @@ async fn slot_write(
         expires_at: SystemTime::now() + state.slot_ttl,
     };
 
-    match state.put_slot(id.clone(), slot.clone()) {
+    #[cfg(feature = "persist")]
+    let persist_id = id.clone();
+    #[cfg(feature = "persist")]
+    let persist_slot = slot.clone();
+
+    match state.put_slot(id, slot) {
         Ok(PutOutcome::Stored) => {}
         Ok(PutOutcome::Stale) => return text_response(StatusCode::CONFLICT, "stale version"),
         Err(()) => return server_error(),
     }
 
+    #[cfg(feature = "persist")]
     if let Some(persist) = state.persist.as_ref()
-        && persist.insert(id, slot).await.is_err()
+        && persist.insert(persist_id, persist_slot).await.is_err()
     {
         return server_error();
     }
@@ -482,6 +517,7 @@ impl SlotEntry {
     }
 }
 
+#[cfg(feature = "persist")]
 impl PersistentSlots {
     async fn open(path: PathBuf) -> Result<(Self, HashMap<RelayId, SlotEntry>)> {
         tokio::task::spawn_blocking(move || {
@@ -541,6 +577,7 @@ impl RelayId {
         .then(|| Self(raw.to_owned()))
     }
 
+    #[cfg(feature = "persist")]
     fn as_str(&self) -> &str {
         &self.0
     }
@@ -644,6 +681,7 @@ fn finish(mut response: Response<Body>) -> Response<Body> {
     response
 }
 
+#[cfg(feature = "persist")]
 fn encode_slot(slot: &SlotEntry) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(16 + slot.body.len());
     encoded.extend_from_slice(&slot.version.to_be_bytes());
@@ -652,6 +690,7 @@ fn encode_slot(slot: &SlotEntry) -> Vec<u8> {
     encoded
 }
 
+#[cfg(feature = "persist")]
 fn decode_slot(raw: &[u8]) -> Option<SlotEntry> {
     let version = u64::from_be_bytes(raw.get(..8)?.try_into().ok()?);
     let expires_at = u64::from_be_bytes(raw.get(8..16)?.try_into().ok()?);
@@ -663,6 +702,7 @@ fn decode_slot(raw: &[u8]) -> Option<SlotEntry> {
     })
 }
 
+#[cfg(feature = "persist")]
 fn unix_secs(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
@@ -682,8 +722,11 @@ mod tests {
         RelayConfig {
             listen: DEFAULT_LISTEN,
             auth: None,
+            #[cfg(feature = "tls")]
             cert: None,
+            #[cfg(feature = "tls")]
             key: None,
+            #[cfg(feature = "persist")]
             persist: None,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_wait: Duration::from_secs(1),
@@ -831,6 +874,7 @@ mod tests {
         assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], "*");
     }
 
+    #[cfg(feature = "persist")]
     #[tokio::test]
     async fn persisted_slots_load_on_restart() {
         let path = std::env::temp_dir().join(format!(

@@ -30,6 +30,26 @@ jobs:
             exit 1
           fi
 
+      - name: Install UPX
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y upx-ucl || sudo apt-get install -y upx
+
+      - name: Build relay bundle
+        run: |
+          cargo build -p enlace-relay --release --locked --all-features
+          mkdir -p dist
+          cp target/release/enlace-relay dist/enlace-relay-linux-x86_64
+          cp target/release/enlace-relay dist/enlace-relay-linux-x86_64-upx
+          upx --best --lzma dist/enlace-relay-linux-x86_64-upx
+
+      - name: Upload relay bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: enlace-relay-linux-x86_64
+          path: dist/enlace-relay-linux-x86_64*
+          if-no-files-found: error
+
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
