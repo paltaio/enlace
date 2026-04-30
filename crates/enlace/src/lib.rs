@@ -5,6 +5,26 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
 
+//! Encrypted mailbox and latest-value slot transport fan-out.
+//!
+//! `enlace` exposes two namespace modes over the same transport set:
+//!
+//! - [`Namespace`] is shared-seed mode. Use it when every participant can safely
+//!   share one 32-byte secret and should have equal read/write access to the same
+//!   mailbox and slot names. This fits small trusted clusters, local recovery
+//!   slots, and deployments where membership is already controlled outside the
+//!   library. Optional signing keys can authenticate incoming records, but the
+//!   shared seed still grants access to all peers that know it.
+//! - [`PeerNamespace`] is public-key mode. Use it when peers have separate
+//!   long-term identities, pair by exchanging [`PeerCard`] values, and need
+//!   per-peer trust, revocation, pairwise envelopes, caller-managed group keys,
+//!   or iroh endpoint allowlists. Caller code owns identity persistence, card
+//!   exchange, authorization policy, group membership, and group-key rotation.
+//!
+//! HTTP and iroh transports can carry mailbox messages in both modes. HTTP,
+//! DHT, pkarr, and iroh can carry slots; DHT and pkarr are latest-record slot
+//! transports and do not provide mailbox delivery.
+
 pub mod config;
 pub mod coordinator;
 pub mod crypto;
