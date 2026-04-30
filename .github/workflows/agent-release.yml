@@ -85,6 +85,20 @@ jobs:
       - name: Build agent
         run: cargo build -p enlace-agent --release --locked --all-features --target ${{ matrix.target }}
 
+      - name: Install UPX on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y upx-ucl || sudo apt-get install -y upx
+
+      - name: Install UPX on macOS
+        if: runner.os == 'macOS'
+        run: brew install upx
+
+      - name: Compress agent
+        if: runner.os != 'Windows'
+        run: upx --best --lzma target/${{ matrix.target }}/release/${{ matrix.bin }}
+
       - name: Upload agent
         uses: actions/upload-artifact@v4
         with:
