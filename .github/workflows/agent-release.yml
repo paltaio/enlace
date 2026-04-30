@@ -91,13 +91,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y upx-ucl || sudo apt-get install -y upx
 
-      - name: Install UPX on macOS
-        if: runner.os == 'macOS'
-        run: brew install upx
-
-      - name: Compress agent
-        if: runner.os != 'Windows'
+      - name: Compress agent on Linux
+        if: runner.os == 'Linux'
         run: upx --best --lzma target/${{ matrix.target }}/release/${{ matrix.bin }}
+
+      - name: Smoke test compressed agent
+        if: runner.os == 'Linux'
+        run: |
+          set +e
+          target/${{ matrix.target }}/release/${{ matrix.bin }} 2>agent.err
+          status=$?
+          set -e
+          if [ "$status" -ne 1 ]; then
+            cat agent.err
+            exit 1
+          fi
+          grep -q "seed is required" agent.err
 
       - name: Upload agent
         uses: actions/upload-artifact@v4
