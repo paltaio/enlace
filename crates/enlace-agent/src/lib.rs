@@ -1437,12 +1437,7 @@ mod tests {
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
         let state = Arc::new(state([1; 32], Vec::new(), InMemoryTransport::new()).await);
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("enlace-agent-{}-{suffix}.sock", std::process::id()));
+        let path = temp_path_for_test("health.sock");
         let task = tokio::spawn(run_unix(Arc::clone(&state), path.clone()));
 
         let mut stream = connect_unix_for_test(&path).await;
@@ -1476,12 +1471,7 @@ mod tests {
         let bob_card = bob_identity.card();
         let alice = state([1; 32], vec![bob_card.clone()], transport.clone()).await;
         let bob = Arc::new(state([2; 32], vec![alice_card.clone()], transport).await);
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("enlace-agent-{}-{suffix}.sock", std::process::id()));
+        let path = temp_path_for_test("stream.sock");
         let task = tokio::spawn(run_unix(Arc::clone(&bob), path.clone()));
 
         let mut stream = connect_unix_for_test(&path).await;
