@@ -10,7 +10,8 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::put;
 use enlace::{
-    Config, DhtConfig, HttpConfig, Namespace, PkarrConfig, TransportError, TransportKind,
+    Config, DhtConfig, HttpConfig, Namespace, PeerConfig, PeerIdentity, PeerSlot, PeerSlotScope,
+    PeerSlotValue, PkarrConfig, TransportError, TransportKind, TrustedPeer,
 };
 use enlace_relay::{RelayConfig, build_router};
 use tokio::task::JoinHandle;
@@ -175,6 +176,30 @@ fn pkarr_config(base_url: &str) -> Config {
     }
 }
 
+fn peer_dht_config(bootstrap: &[String]) -> PeerConfig {
+    PeerConfig {
+        dht: Some(DhtConfig {
+            bootstrap: bootstrap
+                .iter()
+                .map(|addr| addr.parse().expect("testnet bootstrap addr parses"))
+                .collect(),
+            watch_poll_interval: Duration::from_millis(50),
+            ..DhtConfig::default()
+        }),
+        ..PeerConfig::default()
+    }
+}
+
+fn peer_pkarr_config(base_url: &str) -> PeerConfig {
+    PeerConfig {
+        pkarr: Some(PkarrConfig {
+            resolvers: vec![base_url.to_owned()],
+            republish_interval: Duration::from_millis(50),
+        }),
+        ..PeerConfig::default()
+    }
+}
+
 fn http_config(base_url: &str) -> Config {
     Config {
         http: Some(HttpConfig::new(base_url.parse().expect("relay URL parses"))),
@@ -218,6 +243,16 @@ async fn wait_for_slot(slot: &enlace::Slot) -> enlace::SlotValue {
     panic!("slot value did not arrive");
 }
 
+async fn wait_for_peer_pairwise_slot(slot: &PeerSlot<'_>) -> PeerSlotValue {
+    for _ in 0..10 {
+        if let Some(value) = slot.get_pairwise().await.expect("peer slot get succeeds") {
+            return value;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("peer slot value did not arrive");
+}
+
 #[tokio::test]
 async fn namespaces_exchange_slot_over_isolated_dht_bootstrap() {
     let testnet = build_dht_testnet(5).await;
@@ -241,6 +276,50 @@ async fn namespaces_exchange_slot_over_isolated_dht_bootstrap() {
     assert_eq!(value.payload, b"slot-dht");
     assert_eq!(value.version, put.version);
     assert_eq!(value.via, TransportKind::Dht);
+}
+
+#[tokio::test]
+async fn peer_namespaces_exchange_pairwise_slot_over_isolated_dht_bootstrap() {
+    let testnet = build_dht_testnet(5).await;
+    let alice_identity = PeerIdentity::generate();
+    let bob_identity = PeerIdentity::generate();
+    let alice_card = alice_identity.card();
+    let bob_card = bob_identity.card();
+    let alice = enlace::PeerNamespace::open(
+        alice_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(bob_card.clone()).unwrap()],
+            ..peer_dht_config(&testnet.bootstrap)
+        },
+    )
+    .await
+    .expect("alice opens");
+    let bob = enlace::PeerNamespace::open(
+        bob_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(alice_card.clone()).unwrap()],
+            ..peer_dht_config(&testnet.bootstrap)
+        },
+    )
+    .await
+    .expect("bob opens");
+
+    let put = alice
+        .slot("state/current")
+        .expect("peer slot opens")
+        .put_for_peers(std::slice::from_ref(&bob_card), b"peer-slot-dht")
+        .await
+        .expect("peer slot put succeeds");
+    assert_eq!(put.stored, vec![TransportKind::Dht]);
+
+    let bob_slot = bob.slot("state/current").expect("peer slot opens");
+    let value = wait_for_peer_pairwise_slot(&bob_slot).await;
+    assert_eq!(value.payload, b"peer-slot-dht");
+    assert_eq!(value.version, put.version);
+    assert_eq!(value.sender, alice.peer_id());
+    assert_eq!(value.signed_by, alice_card.signing_key);
+    assert_eq!(value.via, TransportKind::Dht);
+    assert_eq!(value.scope, PeerSlotScope::Pairwise);
 }
 
 #[tokio::test]
@@ -270,6 +349,55 @@ async fn namespaces_exchange_slot_over_pkarr_relay_mock() {
     assert_eq!(value.payload, b"slot-pkarr");
     assert_eq!(value.version, put.version);
     assert_eq!(value.via, TransportKind::Pkarr);
+}
+
+#[tokio::test]
+async fn peer_namespaces_exchange_pairwise_slot_over_pkarr_relay_mock() {
+    let relay = PkarrRelayProcess::spawn().await;
+    let alice_identity = PeerIdentity::generate();
+    let bob_identity = PeerIdentity::generate();
+    let alice_card = alice_identity.card();
+    let bob_card = bob_identity.card();
+    let alice = enlace::PeerNamespace::open(
+        alice_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(bob_card.clone()).unwrap()],
+            ..peer_pkarr_config(&relay.base_url)
+        },
+    )
+    .await
+    .expect("alice opens");
+    let bob = enlace::PeerNamespace::open(
+        bob_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(alice_card.clone()).unwrap()],
+            ..peer_pkarr_config(&relay.base_url)
+        },
+    )
+    .await
+    .expect("bob opens");
+
+    let put = alice
+        .slot("state/current")
+        .expect("peer slot opens")
+        .put_for_peers(std::slice::from_ref(&bob_card), b"peer-slot-pkarr")
+        .await
+        .expect("peer slot put succeeds");
+    assert_eq!(put.stored, vec![TransportKind::Pkarr]);
+
+    let value = bob
+        .slot("state/current")
+        .expect("peer slot opens")
+        .get_pairwise()
+        .await
+        .expect("peer slot get succeeds")
+        .expect("peer slot value exists");
+    assert_eq!(value.payload, b"peer-slot-pkarr");
+    assert_eq!(value.version, put.version);
+    assert_eq!(value.sender, alice.peer_id());
+    assert_eq!(value.signed_by, alice_card.signing_key);
+    assert_eq!(value.via, TransportKind::Pkarr);
+    assert_eq!(value.scope, PeerSlotScope::Pairwise);
 }
 
 #[tokio::test]
