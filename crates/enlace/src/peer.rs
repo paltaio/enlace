@@ -32,6 +32,7 @@ pub const GROUP_KEY_SECRET_LEN: usize = 32;
 const PEER_CARD_EXPORT_PREFIX: &str = "enlace-peer-card-v1:";
 const PEER_CARD_RECORD_VERSION: u8 = 1;
 const PEER_ENVELOPE_RECORD_VERSION: u8 = 1;
+const GROUP_ENVELOPE_RECORD_VERSION: u8 = 1;
 
 /// Failure modes for public-key peer envelopes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +94,67 @@ impl StdError for PeerEnvelopeError {
 }
 
 impl From<NameError> for PeerEnvelopeError {
+    fn from(err: NameError) -> Self {
+        Self::Name(err)
+    }
+}
+
+/// Failure modes for public-key group envelopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupEnvelopeError {
+    /// Channel name failed normal validation.
+    Name(NameError),
+    /// No group keys were available for encryption or decryption.
+    NoGroupKeys,
+    /// Binary envelope failed to decode.
+    MsgpackFailed,
+    /// Envelope version is unsupported.
+    UnsupportedVersion,
+    /// None of the envelope entries matched a live group key.
+    MissingGroupKey,
+    /// Encrypted group payload failed authentication.
+    AeadFailed,
+    /// Envelope signature was malformed or failed verification.
+    SignatureInvalid,
+    /// Sender is absent from the trusted peer set.
+    UntrustedSender,
+    /// Envelope channel did not match the expected channel.
+    WrongChannel,
+}
+
+impl fmt::Display for GroupEnvelopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Name(err) => write!(f, "channel name invalid: {err}"),
+            Self::NoGroupKeys => f.write_str("group envelope has no keys"),
+            Self::MsgpackFailed => f.write_str("group envelope is malformed"),
+            Self::UnsupportedVersion => f.write_str("group envelope version unsupported"),
+            Self::MissingGroupKey => f.write_str("group envelope key is missing"),
+            Self::AeadFailed => f.write_str("group envelope authentication failed"),
+            Self::SignatureInvalid => f.write_str("group envelope signature invalid"),
+            Self::UntrustedSender => f.write_str("group envelope sender is not trusted"),
+            Self::WrongChannel => f.write_str("group envelope channel mismatch"),
+        }
+    }
+}
+
+impl StdError for GroupEnvelopeError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Name(err) => Some(err),
+            Self::NoGroupKeys
+            | Self::MsgpackFailed
+            | Self::UnsupportedVersion
+            | Self::MissingGroupKey
+            | Self::AeadFailed
+            | Self::SignatureInvalid
+            | Self::UntrustedSender
+            | Self::WrongChannel => None,
+        }
+    }
+}
+
+impl From<NameError> for GroupEnvelopeError {
     fn from(err: NameError) -> Self {
         Self::Name(err)
     }
@@ -344,6 +406,16 @@ impl PeerIdentity {
         PeerEnvelope::seal(self, kind, name, payload, recipients)
     }
 
+    pub fn seal_to_groups(
+        &self,
+        kind: ChannelKind,
+        name: &str,
+        payload: &[u8],
+        group_keys: &[(GroupId, GroupKey)],
+    ) -> Result<GroupEnvelope, GroupEnvelopeError> {
+        GroupEnvelope::seal(self, kind, name, payload, group_keys)
+    }
+
     pub fn open_peer_envelope(
         &self,
         envelope: &PeerEnvelope,
@@ -533,6 +605,73 @@ impl PeerNamespace {
         ids.sort_unstable();
         ids
     }
+
+    pub fn seal_group_envelope(
+        &self,
+        kind: ChannelKind,
+        name: &str,
+        payload: &[u8],
+        group_keys: &[(GroupId, GroupKeyId)],
+    ) -> Result<GroupEnvelope, GroupEnvelopeError> {
+        let keys = self.resolve_group_keys(group_keys)?;
+        self.identity.seal_to_groups(kind, name, payload, &keys)
+    }
+
+    pub fn open_group_envelope(
+        &self,
+        envelope: &GroupEnvelope,
+        kind: ChannelKind,
+        name: &str,
+        trusted: &[TrustedPeer],
+    ) -> Result<GroupEnvelopeMessage, GroupEnvelopeError> {
+        let keys = self.group_keys_for_envelope(envelope);
+        envelope.open(kind, name, trusted, &keys)
+    }
+
+    #[must_use]
+    pub fn open_group_envelope_or_drop(
+        &self,
+        bytes: &[u8],
+        kind: ChannelKind,
+        name: &str,
+        trusted: &[TrustedPeer],
+    ) -> Option<GroupEnvelopeMessage> {
+        let envelope = GroupEnvelope::from_bytes(bytes).ok()?;
+        self.open_group_envelope(&envelope, kind, name, trusted)
+            .ok()
+    }
+
+    fn resolve_group_keys(
+        &self,
+        requested: &[(GroupId, GroupKeyId)],
+    ) -> Result<Vec<(GroupId, GroupKey)>, GroupEnvelopeError> {
+        if requested.is_empty() {
+            return Err(GroupEnvelopeError::NoGroupKeys);
+        }
+        let keys = read_group_keys(&self.group_keys);
+        requested
+            .iter()
+            .map(|&(group, key_id)| {
+                keys.get(&(group, key_id))
+                    .cloned()
+                    .map(|key| (group, key))
+                    .ok_or(GroupEnvelopeError::MissingGroupKey)
+            })
+            .collect()
+    }
+
+    fn group_keys_for_envelope(&self, envelope: &GroupEnvelope) -> Vec<(GroupId, GroupKey)> {
+        let keys = read_group_keys(&self.group_keys);
+        envelope
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                keys.get(&(entry.group, entry.key_id))
+                    .cloned()
+                    .map(|key| (entry.group, key))
+            })
+            .collect()
+    }
 }
 
 /// Public card exchanged out of band when pairing peers.
@@ -667,6 +806,272 @@ pub struct PeerEnvelopeMessage {
     pub sender: PeerId,
     pub signed_by: VerifyingKey,
     pub payload: Vec<u8>,
+}
+
+/// One encrypted group-key entry inside a public-key group envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupEnvelopeEntry {
+    pub group: GroupId,
+    pub key_id: GroupKeyId,
+    pub nonce: [u8; NONCE_LEN],
+    pub ciphertext: Vec<u8>,
+}
+
+/// Decrypted public-key group envelope payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupEnvelopeMessage {
+    pub sender: PeerId,
+    pub signed_by: VerifyingKey,
+    pub group: GroupId,
+    pub key_id: GroupKeyId,
+    pub payload: Vec<u8>,
+}
+
+/// Signed group broadcast envelope with one ciphertext per group key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupEnvelope {
+    pub sender: PeerId,
+    pub kind: ChannelKind,
+    pub name: String,
+    pub entries: Vec<GroupEnvelopeEntry>,
+    pub signature: [u8; SIG_LEN],
+}
+
+impl GroupEnvelope {
+    pub fn seal(
+        sender: &PeerIdentity,
+        kind: ChannelKind,
+        name: &str,
+        payload: &[u8],
+        group_keys: &[(GroupId, GroupKey)],
+    ) -> Result<Self, GroupEnvelopeError> {
+        validate_name(name)?;
+        if group_keys.is_empty() {
+            return Err(GroupEnvelopeError::NoGroupKeys);
+        }
+
+        let sender_id = sender.peer_id();
+        let mut entries = Vec::with_capacity(group_keys.len());
+        for &(group, ref key) in group_keys {
+            let mut nonce = [0u8; NONCE_LEN];
+            OsRng.fill_bytes(&mut nonce);
+            let message_key = group_message_key(group, key, kind, name, &nonce);
+            let aad = group_envelope_aad(sender_id, group, key.id, kind, name, &nonce);
+            let ciphertext = group_encrypt(&message_key, &nonce, &aad, payload)?;
+            entries.push(GroupEnvelopeEntry {
+                group,
+                key_id: key.id,
+                nonce,
+                ciphertext,
+            });
+        }
+
+        let mut envelope = Self {
+            sender: sender_id,
+            kind,
+            name: name.to_owned(),
+            entries,
+            signature: [0u8; SIG_LEN],
+        };
+        envelope.signature = crypto::sign(&sender.signing, &envelope.signature_preimage());
+        Ok(envelope)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, GroupEnvelopeError> {
+        rmp_serde::to_vec_named(&self.to_wire()).map_err(|_| GroupEnvelopeError::MsgpackFailed)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, GroupEnvelopeError> {
+        let wire: GroupEnvelopeWire =
+            rmp_serde::from_slice(bytes).map_err(|_| GroupEnvelopeError::MsgpackFailed)?;
+        Self::try_from_wire(wire)
+    }
+
+    pub fn open(
+        &self,
+        kind: ChannelKind,
+        name: &str,
+        trusted: &[TrustedPeer],
+        group_keys: &[(GroupId, GroupKey)],
+    ) -> Result<GroupEnvelopeMessage, GroupEnvelopeError> {
+        validate_name(name)?;
+        if self.kind != kind || self.name != name {
+            return Err(GroupEnvelopeError::WrongChannel);
+        }
+        let sender = trusted
+            .iter()
+            .find(|peer| peer.peer_id() == self.sender)
+            .ok_or(GroupEnvelopeError::UntrustedSender)?;
+        sender
+            .card
+            .validate()
+            .map_err(|_| GroupEnvelopeError::UntrustedSender)?;
+
+        let mut had_matching_key = false;
+        let mut had_aead_failure = false;
+        for entry in &self.entries {
+            for &(group, ref key) in group_keys {
+                if group != entry.group || key.id != entry.key_id {
+                    continue;
+                }
+                had_matching_key = true;
+                let message_key = group_message_key(group, key, kind, name, &entry.nonce);
+                let aad = group_envelope_aad(self.sender, group, key.id, kind, name, &entry.nonce);
+                match group_decrypt(&message_key, &entry.nonce, &aad, &entry.ciphertext) {
+                    Ok(payload) => {
+                        if !crypto::verify(
+                            &sender.card.signing_key,
+                            &self.signature_preimage(),
+                            &self.signature,
+                        ) {
+                            return Err(GroupEnvelopeError::SignatureInvalid);
+                        }
+                        return Ok(GroupEnvelopeMessage {
+                            sender: self.sender,
+                            signed_by: sender.card.signing_key,
+                            group,
+                            key_id: key.id,
+                            payload,
+                        });
+                    }
+                    Err(GroupEnvelopeError::AeadFailed) => {
+                        had_aead_failure = true;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        if had_aead_failure && had_matching_key {
+            Err(GroupEnvelopeError::AeadFailed)
+        } else {
+            Err(GroupEnvelopeError::MissingGroupKey)
+        }
+    }
+
+    #[must_use]
+    pub fn open_or_drop(
+        &self,
+        kind: ChannelKind,
+        name: &str,
+        trusted: &[TrustedPeer],
+        group_keys: &[(GroupId, GroupKey)],
+    ) -> Option<GroupEnvelopeMessage> {
+        self.open(kind, name, trusted, group_keys).ok()
+    }
+
+    pub fn open_bytes(
+        bytes: &[u8],
+        kind: ChannelKind,
+        name: &str,
+        trusted: &[TrustedPeer],
+        group_keys: &[(GroupId, GroupKey)],
+    ) -> Result<GroupEnvelopeMessage, GroupEnvelopeError> {
+        Self::from_bytes(bytes)?.open(kind, name, trusted, group_keys)
+    }
+
+    #[must_use]
+    pub fn open_bytes_or_drop(
+        bytes: &[u8],
+        kind: ChannelKind,
+        name: &str,
+        trusted: &[TrustedPeer],
+        group_keys: &[(GroupId, GroupKey)],
+    ) -> Option<GroupEnvelopeMessage> {
+        Self::open_bytes(bytes, kind, name, trusted, group_keys).ok()
+    }
+
+    fn to_wire(&self) -> GroupEnvelopeWire {
+        GroupEnvelopeWire {
+            version: GROUP_ENVELOPE_RECORD_VERSION,
+            sender_peer_id: self.sender.to_bytes(),
+            channel_kind: channel_kind_code(self.kind),
+            channel_name: self.name.clone(),
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| GroupEnvelopeEntryWire {
+                    group_id: entry.group.to_bytes(),
+                    key_id: entry.key_id.to_bytes(),
+                    nonce: entry.nonce,
+                    ciphertext: entry.ciphertext.clone(),
+                })
+                .collect(),
+            signature: self.signature.to_vec(),
+        }
+    }
+
+    fn try_from_wire(wire: GroupEnvelopeWire) -> Result<Self, GroupEnvelopeError> {
+        if wire.version != GROUP_ENVELOPE_RECORD_VERSION {
+            return Err(GroupEnvelopeError::UnsupportedVersion);
+        }
+        let kind = group_channel_kind_from_code(wire.channel_kind)?;
+        validate_name(&wire.channel_name)?;
+        if wire.entries.is_empty() {
+            return Err(GroupEnvelopeError::NoGroupKeys);
+        }
+        let signature = wire
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| GroupEnvelopeError::SignatureInvalid)?;
+        let entries = wire
+            .entries
+            .into_iter()
+            .map(|entry| GroupEnvelopeEntry {
+                group: GroupId::from_bytes(entry.group_id),
+                key_id: GroupKeyId::from_bytes(entry.key_id),
+                nonce: entry.nonce,
+                ciphertext: entry.ciphertext,
+            })
+            .collect();
+        Ok(Self {
+            sender: PeerId::from_bytes(wire.sender_peer_id),
+            kind,
+            name: wire.channel_name,
+            entries,
+            signature,
+        })
+    }
+
+    fn signature_preimage(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"enlace/v1/pkey/group/sig/");
+        out.push(GROUP_ENVELOPE_RECORD_VERSION);
+        out.extend_from_slice(&self.sender.to_bytes());
+        out.push(channel_kind_code(self.kind));
+        write_len_prefixed(&mut out, self.name.as_bytes());
+        let count =
+            u32::try_from(self.entries.len()).expect("group envelope entry count overflowed u32");
+        out.extend_from_slice(&count.to_be_bytes());
+        for entry in &self.entries {
+            out.extend_from_slice(&entry.group.to_bytes());
+            out.extend_from_slice(&entry.key_id.to_bytes());
+            out.extend_from_slice(&entry.nonce);
+            write_len_prefixed(&mut out, &entry.ciphertext);
+        }
+        out
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct GroupEnvelopeWire {
+    version: u8,
+    sender_peer_id: [u8; PEER_ID_LEN],
+    channel_kind: u8,
+    channel_name: String,
+    entries: Vec<GroupEnvelopeEntryWire>,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct GroupEnvelopeEntryWire {
+    group_id: [u8; GROUP_ID_LEN],
+    key_id: [u8; GROUP_KEY_ID_LEN],
+    nonce: [u8; NONCE_LEN],
+    ciphertext: Vec<u8>,
 }
 
 /// Signed fan-out envelope with one ciphertext per pairwise recipient.
@@ -975,6 +1380,68 @@ fn peer_decrypt(
         .map_err(|_| PeerEnvelopeError::AeadFailed)
 }
 
+fn group_message_key(
+    group: GroupId,
+    key: &GroupKey,
+    kind: ChannelKind,
+    name: &str,
+    nonce: &[u8; NONCE_LEN],
+) -> Zeroizing<[u8; AEAD_KEY_LEN]> {
+    let mut info = Vec::with_capacity(
+        b"enlace/v1/pkey/group".len()
+            + GROUP_ID_LEN
+            + GROUP_KEY_ID_LEN
+            + kind.as_bytes().len()
+            + name.len()
+            + nonce.len(),
+    );
+    info.extend_from_slice(b"enlace/v1/pkey/group");
+    info.extend_from_slice(&group.to_bytes());
+    info.extend_from_slice(&key.id.to_bytes());
+    info.extend_from_slice(kind.as_bytes());
+    info.extend_from_slice(name.as_bytes());
+    info.extend_from_slice(nonce);
+    let mut out = Zeroizing::new([0u8; AEAD_KEY_LEN]);
+    crypto::hkdf_sha256(&key.secret[..], b"", &info, out.as_mut_slice());
+    out
+}
+
+fn group_encrypt(
+    key: &[u8; AEAD_KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, GroupEnvelopeError> {
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    cipher
+        .encrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| GroupEnvelopeError::AeadFailed)
+}
+
+fn group_decrypt(
+    key: &[u8; AEAD_KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, GroupEnvelopeError> {
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| GroupEnvelopeError::AeadFailed)
+}
+
 fn peer_envelope_aad(
     sender: PeerId,
     recipient: PeerId,
@@ -999,8 +1466,35 @@ fn peer_envelope_aad(
     out
 }
 
+fn group_envelope_aad(
+    sender: PeerId,
+    group: GroupId,
+    key_id: GroupKeyId,
+    kind: ChannelKind,
+    name: &str,
+    nonce: &[u8; NONCE_LEN],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        b"enlace/v1/pkey/group/aead/".len()
+            + PEER_ID_LEN
+            + GROUP_ID_LEN
+            + GROUP_KEY_ID_LEN
+            + kind.as_bytes().len()
+            + name.len()
+            + nonce.len(),
+    );
+    out.extend_from_slice(b"enlace/v1/pkey/group/aead/");
+    out.extend_from_slice(&sender.to_bytes());
+    out.extend_from_slice(&group.to_bytes());
+    out.extend_from_slice(&key_id.to_bytes());
+    out.extend_from_slice(kind.as_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(nonce);
+    out
+}
+
 fn write_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
-    let len = u32::try_from(bytes.len()).expect("peer envelope field length overflowed u32");
+    let len = u32::try_from(bytes.len()).expect("envelope field length overflowed u32");
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(bytes);
 }
@@ -1017,6 +1511,14 @@ fn channel_kind_from_code(code: u8) -> Result<ChannelKind, PeerEnvelopeError> {
         0 => Ok(ChannelKind::Mailbox),
         1 => Ok(ChannelKind::Slot),
         _ => Err(PeerEnvelopeError::MsgpackFailed),
+    }
+}
+
+fn group_channel_kind_from_code(code: u8) -> Result<ChannelKind, GroupEnvelopeError> {
+    match code {
+        0 => Ok(ChannelKind::Mailbox),
+        1 => Ok(ChannelKind::Slot),
+        _ => Err(GroupEnvelopeError::MsgpackFailed),
     }
 }
 
@@ -1502,6 +2004,216 @@ mod tests {
             )
             .unwrap_err(),
             PeerEnvelopeError::InvalidRecipient(PeerCardError::EmptyExchangeKey)
+        );
+    }
+
+    #[test]
+    fn group_envelope_round_trips_for_trusted_sender() {
+        let sender = identity(91, 92);
+        let receiver = PeerNamespace::open(identity(93, 94), PeerConfig::default()).unwrap();
+        let trusted = [TrustedPeer::try_from_card(sender.card()).unwrap()];
+        let group = GroupId::from_bytes([1; GROUP_ID_LEN]);
+        let key = GroupKey::new(GroupKeyId::from_bytes([2; GROUP_KEY_ID_LEN]), [3; 32]);
+        receiver.add_group_key(group, key.clone()).unwrap();
+
+        let envelope = sender
+            .seal_to_groups(
+                ChannelKind::Mailbox,
+                "ops/events",
+                b"hello group",
+                &[(group, key.clone())],
+            )
+            .unwrap();
+        let bytes = envelope.to_bytes().unwrap();
+        let decoded = GroupEnvelope::from_bytes(&bytes).unwrap();
+        let message = receiver
+            .open_group_envelope(&decoded, ChannelKind::Mailbox, "ops/events", &trusted)
+            .unwrap();
+
+        assert_eq!(decoded.entries.len(), 1);
+        assert_eq!(decoded.entries[0].group, group);
+        assert_eq!(decoded.entries[0].key_id, key.id);
+        assert_eq!(message.sender, sender.peer_id());
+        assert_eq!(message.signed_by, sender.signing.verifying_key());
+        assert_eq!(message.group, group);
+        assert_eq!(message.key_id, key.id);
+        assert_eq!(message.payload, b"hello group");
+    }
+
+    #[test]
+    fn group_envelope_uses_one_ciphertext_per_group_key() {
+        let sender = identity(95, 96);
+        let trusted = [TrustedPeer::try_from_card(sender.card()).unwrap()];
+        let first_group = GroupId::from_bytes([4; GROUP_ID_LEN]);
+        let second_group = GroupId::from_bytes([5; GROUP_ID_LEN]);
+        let first_key = GroupKey::new(GroupKeyId::from_bytes([6; GROUP_KEY_ID_LEN]), [7; 32]);
+        let second_key = GroupKey::new(GroupKeyId::from_bytes([8; GROUP_KEY_ID_LEN]), [9; 32]);
+
+        let envelope = GroupEnvelope::seal(
+            &sender,
+            ChannelKind::Mailbox,
+            "ops/events",
+            b"broadcast",
+            &[
+                (first_group, first_key.clone()),
+                (second_group, second_key.clone()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(envelope.entries.len(), 2);
+        assert_ne!(envelope.entries[0].nonce, envelope.entries[1].nonce);
+        assert_ne!(
+            envelope.entries[0].ciphertext,
+            envelope.entries[1].ciphertext
+        );
+        assert_eq!(
+            envelope
+                .open(
+                    ChannelKind::Mailbox,
+                    "ops/events",
+                    &trusted,
+                    &[(second_group, second_key.clone())],
+                )
+                .unwrap()
+                .payload,
+            b"broadcast"
+        );
+    }
+
+    #[test]
+    fn group_envelope_ignores_missing_or_removed_keys() {
+        let sender = identity(97, 98);
+        let receiver = PeerNamespace::open(identity(99, 100), PeerConfig::default()).unwrap();
+        let trusted = [TrustedPeer::try_from_card(sender.card()).unwrap()];
+        let group = GroupId::from_bytes([10; GROUP_ID_LEN]);
+        let key = GroupKey::new(GroupKeyId::from_bytes([11; GROUP_KEY_ID_LEN]), [12; 32]);
+        receiver.add_group_key(group, key.clone()).unwrap();
+        let envelope = sender
+            .seal_to_groups(
+                ChannelKind::Mailbox,
+                "ops/events",
+                b"rotated",
+                &[(group, key.clone())],
+            )
+            .unwrap();
+        let bytes = envelope.to_bytes().unwrap();
+
+        receiver.remove_group_key(group, key.id).unwrap();
+
+        assert_eq!(
+            envelope
+                .open(ChannelKind::Mailbox, "ops/events", &trusted, &[])
+                .unwrap_err(),
+            GroupEnvelopeError::MissingGroupKey
+        );
+        assert_eq!(
+            receiver.open_group_envelope_or_drop(
+                &bytes,
+                ChannelKind::Mailbox,
+                "ops/events",
+                &trusted,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn group_envelope_enforces_trusted_sender_and_channel() {
+        let sender = identity(101, 102);
+        let stranger = identity(103, 104);
+        let trusted = [TrustedPeer::try_from_card(stranger.card()).unwrap()];
+        let group = GroupId::from_bytes([13; GROUP_ID_LEN]);
+        let key = GroupKey::new(GroupKeyId::from_bytes([14; GROUP_KEY_ID_LEN]), [15; 32]);
+        let envelope = sender
+            .seal_to_groups(
+                ChannelKind::Mailbox,
+                "ops/events",
+                b"private",
+                &[(group, key.clone())],
+            )
+            .unwrap();
+
+        assert_eq!(
+            envelope
+                .open(
+                    ChannelKind::Mailbox,
+                    "ops/events",
+                    &trusted,
+                    &[(group, key.clone())],
+                )
+                .unwrap_err(),
+            GroupEnvelopeError::UntrustedSender
+        );
+        assert_eq!(
+            envelope
+                .open(
+                    ChannelKind::Slot,
+                    "ops/events",
+                    &[TrustedPeer::try_from_card(sender.card()).unwrap()],
+                    &[(group, key.clone())],
+                )
+                .unwrap_err(),
+            GroupEnvelopeError::WrongChannel
+        );
+    }
+
+    #[test]
+    fn group_envelope_drops_malformed_and_tampered_bytes() {
+        let sender = identity(105, 106);
+        let trusted = [TrustedPeer::try_from_card(sender.card()).unwrap()];
+        let group = GroupId::from_bytes([16; GROUP_ID_LEN]);
+        let key = GroupKey::new(GroupKeyId::from_bytes([17; GROUP_KEY_ID_LEN]), [18; 32]);
+        let envelope = sender
+            .seal_to_groups(
+                ChannelKind::Mailbox,
+                "ops/events",
+                b"payload",
+                &[(group, key.clone())],
+            )
+            .unwrap();
+        let mut bytes = envelope.to_bytes().unwrap();
+
+        assert_eq!(
+            GroupEnvelope::open_bytes_or_drop(
+                b"bad msgpack",
+                ChannelKind::Mailbox,
+                "ops/events",
+                &trusted,
+                &[(group, key.clone())],
+            ),
+            None
+        );
+
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        assert_eq!(
+            GroupEnvelope::open_bytes_or_drop(
+                &bytes,
+                ChannelKind::Mailbox,
+                "ops/events",
+                &trusted,
+                &[(group, key.clone())],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn group_envelope_rejects_invalid_inputs() {
+        let sender = identity(107, 108);
+        let group = GroupId::from_bytes([19; GROUP_ID_LEN]);
+        let key = GroupKey::new(GroupKeyId::from_bytes([20; GROUP_KEY_ID_LEN]), [21; 32]);
+
+        assert_eq!(
+            GroupEnvelope::seal(&sender, ChannelKind::Mailbox, "ops/events", b"x", &[])
+                .unwrap_err(),
+            GroupEnvelopeError::NoGroupKeys
+        );
+        assert_eq!(
+            GroupEnvelope::seal(&sender, ChannelKind::Mailbox, "Bad", b"x", &[(group, key)])
+                .unwrap_err(),
+            GroupEnvelopeError::Name(NameError::InvalidChar)
         );
     }
 

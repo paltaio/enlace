@@ -30,8 +30,9 @@ pub use kdf::{ChannelKind, NameError, TransportKind};
 pub use mailbox::{Mailbox, RecvMessage, SendReport};
 pub use namespace::Namespace;
 pub use peer::{
-    GROUP_ID_LEN, GROUP_KEY_ID_LEN, GROUP_KEY_SECRET_LEN, GroupId, GroupKey, GroupKeyError,
-    GroupKeyId, PEER_ID_LEN, PeerCard, PeerCardError, PeerConfig, PeerEnvelope, PeerEnvelopeError,
+    GROUP_ID_LEN, GROUP_KEY_ID_LEN, GROUP_KEY_SECRET_LEN, GroupEnvelope, GroupEnvelopeEntry,
+    GroupEnvelopeError, GroupEnvelopeMessage, GroupId, GroupKey, GroupKeyError, GroupKeyId,
+    PEER_ID_LEN, PeerCard, PeerCardError, PeerConfig, PeerEnvelope, PeerEnvelopeError,
     PeerEnvelopeMessage, PeerId, PeerIdentity, PeerNamespace, PeerRecipientEnvelope, TrustError,
     TrustedPeer,
 };
