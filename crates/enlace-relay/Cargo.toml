@@ -3,6 +3,7 @@ name = "enlace-relay"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "enlace-relay"

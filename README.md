@@ -137,3 +137,7 @@ ENLACE_RELAY_AUTH=user:pass cargo run -p enlace-relay -- --listen 127.0.0.1:7777
 cargo test --workspace --locked
 cargo run -p enlace-testkit --example two_peers --locked
 ```
+
+## License
+
+MIT

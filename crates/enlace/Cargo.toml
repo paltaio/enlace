@@ -3,6 +3,7 @@ name = "enlace"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [features]
 default = ["iroh"]
