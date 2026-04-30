@@ -284,6 +284,35 @@ mod tests {
         assert!(ct_eq(b"", b""));
     }
 
+    #[test]
+    fn x25519_static_secret_public_key_derivation_fits_peer_mode() {
+        let secret = x25519_dalek::StaticSecret::from([0x11u8; AEAD_KEY_LEN]);
+        let public = x25519_dalek::PublicKey::from(&secret);
+
+        assert_eq!(public.as_bytes().len(), AEAD_KEY_LEN);
+        assert_eq!(
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(
+                [0x11u8; AEAD_KEY_LEN]
+            ))
+            .as_bytes(),
+            public.as_bytes()
+        );
+    }
+
+    #[test]
+    fn x25519_static_secret_diffie_hellman_matches_on_both_sides() {
+        let alice_secret = x25519_dalek::StaticSecret::from([0x21u8; AEAD_KEY_LEN]);
+        let bob_secret = x25519_dalek::StaticSecret::from([0x42u8; AEAD_KEY_LEN]);
+        let alice_public = x25519_dalek::PublicKey::from(&alice_secret);
+        let bob_public = x25519_dalek::PublicKey::from(&bob_secret);
+
+        let alice_shared = alice_secret.diffie_hellman(&bob_public);
+        let bob_shared = bob_secret.diffie_hellman(&alice_public);
+
+        assert_eq!(alice_shared.as_bytes(), bob_shared.as_bytes());
+        assert_ne!(alice_shared.as_bytes(), &[0u8; AEAD_KEY_LEN]);
+    }
+
     proptest! {
         #[test]
         fn aead_round_trip_for_arbitrary_payloads(
