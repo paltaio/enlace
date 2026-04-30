@@ -5,7 +5,6 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
 
-use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -23,11 +22,15 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use clap::{Parser, ValueEnum};
 use ed25519_dalek::SigningKey;
-use enlace::{PeerCard, PeerConfig, PeerIdentity, PeerNamespace, TrustedPeer};
+use enlace::{PeerCard, PeerConfig, PeerId, PeerIdentity, PeerNamespace, TrustedPeer};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq as _;
+#[cfg(all(feature = "unix-socket", unix))]
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+#[cfg(all(feature = "unix-socket", unix))]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use x25519_dalek::StaticSecret;
 
@@ -72,8 +75,9 @@ impl Cli {
         if listen_ws.is_none() && self.listen_unix.is_none() {
             bail!("at least one listener is required");
         }
+        #[cfg(not(all(feature = "unix-socket", unix)))]
         if self.listen_unix.is_some() {
-            bail!("unix socket listener is not implemented yet");
+            bail!("unix socket listener requires unix-socket feature on unix platforms");
         }
         if let Some(addr) = listen_ws
             && !is_loopback(addr)
@@ -86,6 +90,7 @@ impl Cli {
             seed,
             token,
             listen_ws,
+            listen_unix: self.listen_unix,
             peers,
             transports: enabled_transports(&self.transport),
             relay: self.relay,
@@ -100,6 +105,7 @@ struct AgentConfig {
     seed: [u8; 32],
     token: Option<String>,
     listen_ws: Option<SocketAddr>,
+    listen_unix: Option<PathBuf>,
     peers: Vec<PeerCard>,
     transports: Vec<&'static str>,
     relay: Option<String>,
@@ -131,18 +137,55 @@ pub async fn run_from_env() -> anyhow::Result<()> {
 }
 
 async fn run(config: AgentConfig) -> anyhow::Result<()> {
-    if let Some(addr) = config.listen_ws {
-        run_ws(config, addr).await?;
+    let listen_ws = config.listen_ws;
+    let listen_unix = config.listen_unix.clone();
+    let state = Arc::new(AgentState::open(config).await?);
+
+    match (listen_ws, listen_unix) {
+        (Some(addr), Some(path)) => {
+            #[cfg(all(feature = "unix-socket", unix))]
+            {
+                run_ws_and_unix(state, addr, path).await?;
+            }
+            #[cfg(not(all(feature = "unix-socket", unix)))]
+            {
+                let _ = (state, addr, path);
+                bail!("unix socket listener requires unix-socket feature on unix platforms");
+            }
+        }
+        (Some(addr), None) => run_ws(state, addr).await?,
+        (None, Some(path)) => {
+            #[cfg(all(feature = "unix-socket", unix))]
+            {
+                run_unix(state, path).await?;
+            }
+            #[cfg(not(all(feature = "unix-socket", unix)))]
+            {
+                let _ = (state, path);
+                bail!("unix socket listener requires unix-socket feature on unix platforms");
+            }
+        }
+        (None, None) => {}
     }
     Ok(())
 }
 
-async fn run_ws(config: AgentConfig, addr: SocketAddr) -> anyhow::Result<()> {
-    let router = ws_router(Arc::new(AgentState::open(config).await?));
+async fn run_ws(state: Arc<AgentState>, addr: SocketAddr) -> anyhow::Result<()> {
+    let router = ws_router(state);
     axum_server::bind(addr)
         .serve(router.into_make_service())
         .await
         .context("websocket listener failed")
+}
+
+#[cfg(all(feature = "unix-socket", unix))]
+async fn run_ws_and_unix(
+    state: Arc<AgentState>,
+    addr: SocketAddr,
+    path: PathBuf,
+) -> anyhow::Result<()> {
+    tokio::try_join!(run_ws(Arc::clone(&state), addr), run_unix(state, path))?;
+    Ok(())
 }
 
 fn ws_router(state: Arc<AgentState>) -> Router {
@@ -205,29 +248,100 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AgentState>) {
     }
 }
 
+#[cfg(all(feature = "unix-socket", unix))]
+async fn run_unix(state: Arc<AgentState>, path: PathBuf) -> anyhow::Result<()> {
+    prepare_unix_socket_path(path.clone()).await?;
+    let listener =
+        UnixListener::bind(&path).with_context(|| format!("failed to bind {}", path.display()))?;
+
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .with_context(|| format!("failed to accept on {}", path.display()))?;
+        tokio::spawn(handle_unix_stream(stream, Arc::clone(&state)));
+    }
+}
+
+#[cfg(all(feature = "unix-socket", unix))]
+async fn prepare_unix_socket_path(path: PathBuf) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to remove {}", path.display()));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .context("failed to prepare unix socket path")?
+}
+
+#[cfg(all(feature = "unix-socket", unix))]
+async fn handle_unix_stream(stream: UnixStream, state: Arc<AgentState>) {
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(SESSION_BUFFER);
+    let session = Session::new(outbound_tx);
+
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Ok(Some(line)) = line else {
+                    break;
+                };
+                let response = state.handle_text(&line, &session).await;
+                if write_json_line(&mut writer, &response).await.is_err() {
+                    break;
+                }
+            }
+            response = outbound_rx.recv() => {
+                let Some(response) = response else {
+                    break;
+                };
+                if write_json_line(&mut writer, &response).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "unix-socket", unix))]
+async fn write_json_line<W>(writer: &mut W, response: &AgentResponse) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let text = serde_json::to_string(response)?;
+    writer
+        .write_all(text.as_bytes())
+        .await
+        .context("unix socket send failed")?;
+    writer
+        .write_all(b"\n")
+        .await
+        .context("unix socket send failed")?;
+    Ok(())
+}
+
 #[derive(Clone)]
 struct AgentState {
     config: AgentConfig,
     namespace: Arc<PeerNamespace>,
-    peers: Arc<HashMap<String, PeerCard>>,
 }
 
 impl AgentState {
     async fn open(config: AgentConfig) -> anyhow::Result<Self> {
         let namespace = Arc::new(open_namespace(&config).await?);
-        let peers = Arc::new(
-            config
-                .peers
-                .iter()
-                .cloned()
-                .map(|peer| (peer.peer_id.to_string(), peer))
-                .collect(),
-        );
-        Ok(Self {
-            config,
-            namespace,
-            peers,
-        })
+        Ok(Self { config, namespace })
     }
 
     fn authorize(&self, headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)> {
@@ -256,29 +370,14 @@ impl AgentState {
                 id,
                 peers: self.list_peers(),
             }),
+            Ok(AgentRequest::AddPeer { id, card }) => self.handle_add_peer(id, &card),
+            Ok(AgentRequest::RemovePeer { id, peer_id }) => self.handle_remove_peer(id, &peer_id),
             Ok(AgentRequest::Send {
                 id,
                 to,
                 channel,
                 payload,
-            }) => {
-                let Ok(payload) = payload_bytes(&payload) else {
-                    return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
-                };
-                if invalid_name(&to) || invalid_name(&channel) {
-                    return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
-                }
-                let Some(peer) = self.peers.get(&to).cloned() else {
-                    return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
-                };
-                let Ok(mailbox) = self.namespace.mailbox(&channel) else {
-                    return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
-                };
-                match mailbox.send_to_peers(&[peer], &payload).await {
-                    Ok(_) => AgentResponse::Ok(OkResponse { id }),
-                    Err(_) => AgentResponse::error(Some(id), ErrorCode::TransportFailed),
-                }
-            }
+            }) => self.handle_send(id, to, channel, payload).await,
             Ok(AgentRequest::Subscribe { id, channel }) => {
                 if invalid_name(&channel) {
                     AgentResponse::error(Some(id), ErrorCode::InvalidRequest)
@@ -287,49 +386,98 @@ impl AgentState {
                     AgentResponse::Ok(OkResponse { id })
                 }
             }
-            Ok(AgentRequest::GetSlot { id, channel }) => {
-                if invalid_name(&channel) {
-                    AgentResponse::error(Some(id), ErrorCode::InvalidRequest)
-                } else {
-                    let Ok(slot) = self.namespace.slot(&channel) else {
-                        return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
-                    };
-                    match slot.get_pairwise().await {
-                        Ok(value) => AgentResponse::Slot(SlotResponse {
-                            id,
-                            channel,
-                            value: value.map(|value| SlotValueResponse {
-                                from: value.sender.to_string(),
-                                version: value.version,
-                                payload: encode_payload(&value.payload),
-                                via: value.via.to_string(),
-                            }),
-                        }),
-                        Err(_) => AgentResponse::error(Some(id), ErrorCode::TransportFailed),
-                    }
-                }
-            }
+            Ok(AgentRequest::GetSlot { id, channel }) => self.handle_get_slot(id, channel).await,
             Ok(AgentRequest::PutSlot {
                 id,
                 channel,
                 payload,
-            }) => {
-                let Ok(payload) = payload_bytes(&payload) else {
-                    return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
-                };
-                if invalid_name(&channel) || self.peers.is_empty() {
-                    return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
-                }
-                let Ok(slot) = self.namespace.slot(&channel) else {
-                    return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
-                };
-                let recipients = self.peers.values().cloned().collect::<Vec<_>>();
-                match slot.put_for_peers(&recipients, &payload).await {
-                    Ok(_) => AgentResponse::Ok(OkResponse { id }),
-                    Err(_) => AgentResponse::error(Some(id), ErrorCode::TransportFailed),
-                }
-            }
+            }) => self.handle_put_slot(id, channel, payload).await,
             Err(_) => AgentResponse::error(None, ErrorCode::InvalidRequest),
+        }
+    }
+
+    fn handle_add_peer(&self, id: String, card: &str) -> AgentResponse {
+        let Ok(card) = self.add_peer(card) else {
+            return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
+        };
+        AgentResponse::PeerCard(PeerCardResponse {
+            id,
+            peer_id: card.peer_id.to_string(),
+            card: card.export_string(),
+        })
+    }
+
+    fn handle_remove_peer(&self, id: String, peer_id: &str) -> AgentResponse {
+        let Ok(peer_id) = parse_peer_id(peer_id) else {
+            return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
+        };
+        match self.namespace.remove_trusted_peer(peer_id) {
+            Ok(()) => AgentResponse::Ok(OkResponse { id }),
+            Err(_) => AgentResponse::error(Some(id), ErrorCode::InvalidRequest),
+        }
+    }
+
+    async fn handle_send(
+        &self,
+        id: String,
+        to: String,
+        channel: String,
+        payload: String,
+    ) -> AgentResponse {
+        let Ok(payload) = payload_bytes(&payload) else {
+            return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
+        };
+        if invalid_name(&to) || invalid_name(&channel) {
+            return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
+        }
+        let Some(peer) = self.find_peer(&to) else {
+            return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
+        };
+        let Ok(mailbox) = self.namespace.mailbox(&channel) else {
+            return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
+        };
+        match mailbox.send_to_peers(&[peer], &payload).await {
+            Ok(_) => AgentResponse::Ok(OkResponse { id }),
+            Err(_) => AgentResponse::error(Some(id), ErrorCode::TransportFailed),
+        }
+    }
+
+    async fn handle_get_slot(&self, id: String, channel: String) -> AgentResponse {
+        if invalid_name(&channel) {
+            return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
+        }
+        let Ok(slot) = self.namespace.slot(&channel) else {
+            return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
+        };
+        match slot.get_pairwise().await {
+            Ok(value) => AgentResponse::Slot(SlotResponse {
+                id,
+                channel,
+                value: value.map(|value| SlotValueResponse {
+                    from: value.sender.to_string(),
+                    version: value.version,
+                    payload: encode_payload(&value.payload),
+                    via: value.via.to_string(),
+                }),
+            }),
+            Err(_) => AgentResponse::error(Some(id), ErrorCode::TransportFailed),
+        }
+    }
+
+    async fn handle_put_slot(&self, id: String, channel: String, payload: String) -> AgentResponse {
+        let Ok(payload) = payload_bytes(&payload) else {
+            return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
+        };
+        let recipients = self.namespace.trusted_peers();
+        if invalid_name(&channel) || recipients.is_empty() {
+            return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
+        }
+        let Ok(slot) = self.namespace.slot(&channel) else {
+            return AgentResponse::error(Some(id), ErrorCode::InvalidRequest);
+        };
+        match slot.put_for_peers(&recipients, &payload).await {
+            Ok(_) => AgentResponse::Ok(OkResponse { id }),
+            Err(_) => AgentResponse::error(Some(id), ErrorCode::TransportFailed),
         }
     }
 
@@ -386,6 +534,22 @@ impl AgentState {
                 card: peer.export_string(),
             })
             .collect()
+    }
+
+    fn add_peer(&self, card: &str) -> anyhow::Result<PeerCard> {
+        let card = PeerCard::import_string(card.trim()).context("invalid peer card")?;
+        self.namespace
+            .trust_peer(TrustedPeer::try_from_card(card.clone()).context("invalid peer card")?)
+            .context("failed to trust peer")?;
+        Ok(card)
+    }
+
+    fn find_peer(&self, peer_id: &str) -> Option<PeerCard> {
+        let peer_id = parse_peer_id(peer_id).ok()?;
+        self.namespace
+            .trusted_peers()
+            .into_iter()
+            .find(|peer| peer.peer_id == peer_id)
     }
 }
 
@@ -509,6 +673,14 @@ enum AgentRequest {
     },
     ListPeers {
         id: String,
+    },
+    AddPeer {
+        id: String,
+        card: String,
+    },
+    RemovePeer {
+        id: String,
+        peer_id: String,
     },
     ExportCard {
         id: String,
@@ -744,6 +916,25 @@ fn parse_hex_seed(value: &str) -> anyhow::Result<[u8; 32]> {
     Ok(seed)
 }
 
+fn parse_peer_id(value: &str) -> anyhow::Result<PeerId> {
+    if value.len() != 64 {
+        bail!("peer id must be 32 bytes encoded as 64 hex characters");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("peer id must be lowercase hex");
+    }
+
+    let mut bytes = [0_u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(chunk).context("peer id is not utf-8")?;
+        bytes[index] = u8::from_str_radix(text, 16).context("peer id must be lowercase hex")?;
+    }
+    Ok(PeerId::from_bytes(bytes))
+}
+
 fn payload_bytes(value: &str) -> anyhow::Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(value)
@@ -785,6 +976,7 @@ mod tests {
             seed: [1; 32],
             token: token.map(str::to_owned),
             listen_ws: Some("127.0.0.1:0".parse().unwrap()),
+            listen_unix: None,
             peers: Vec::new(),
             transports: vec!["http"],
             relay: None,
@@ -821,25 +1013,39 @@ mod tests {
                 seed,
                 token: None,
                 listen_ws: Some("127.0.0.1:0".parse().unwrap()),
-                peers: peers.clone(),
+                listen_unix: None,
+                peers,
                 transports: vec!["http"],
                 relay: None,
                 data_dir: None,
                 log: "info".to_owned(),
             },
             namespace: Arc::new(namespace),
-            peers: Arc::new(
-                peers
-                    .into_iter()
-                    .map(|peer| (peer.peer_id.to_string(), peer))
-                    .collect(),
-            ),
         }
     }
 
     fn session() -> (Session, mpsc::Receiver<AgentResponse>) {
         let (tx, rx) = mpsc::channel(SESSION_BUFFER);
         (Session::new(tx), rx)
+    }
+
+    #[cfg(all(feature = "unix-socket", unix))]
+    async fn connect_unix_for_test(path: &std::path::Path) -> UnixStream {
+        for _ in 0..50 {
+            match UnixStream::connect(path).await {
+                Ok(stream) => return stream,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(err) => panic!("failed to connect unix socket: {err}"),
+            }
+        }
+        panic!("timed out waiting for unix socket");
     }
 
     #[test]
@@ -910,6 +1116,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(all(feature = "unix-socket", unix))]
+    #[tokio::test]
+    async fn unix_socket_accepts_health_request() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+        let state = Arc::new(state([1; 32], Vec::new(), InMemoryTransport::new()).await);
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("enlace-agent-{}-{suffix}.sock", std::process::id()));
+        let task = tokio::spawn(run_unix(Arc::clone(&state), path.clone()));
+
+        let mut stream = connect_unix_for_test(&path).await;
+        stream
+            .write_all(br#"{"id":"health","type":"health"}"#)
+            .await
+            .unwrap();
+        stream.write_all(b"\n").await.unwrap();
+
+        let mut line = String::new();
+        let mut reader = BufReader::new(stream);
+        reader.read_line(&mut line).await.unwrap();
+        let json = serde_json::from_str::<serde_json::Value>(&line).unwrap();
+
+        assert_eq!(json["type"], "health");
+        assert_eq!(json["id"], "health");
+        task.abort();
+        let _ = task.await;
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1011,6 +1250,93 @@ mod tests {
                 .peer_id,
             bob_card.peer_id
         );
+    }
+
+    #[tokio::test]
+    async fn add_peer_updates_live_trust_set() {
+        let transport = InMemoryTransport::new();
+        let alice_identity = derive_identity(&[1; 32]).unwrap();
+        let bob_identity = derive_identity(&[2; 32]).unwrap();
+        let alice_card = alice_identity.card();
+        let bob_card = bob_identity.card();
+        let alice = state([1; 32], Vec::new(), transport.clone()).await;
+        let bob = state([2; 32], vec![alice_card.clone()], transport).await;
+        let (alice_session, _alice_rx) = session();
+        let (bob_session, mut bob_rx) = session();
+
+        let add = serde_json::json!({
+            "id": "add",
+            "type": "add_peer",
+            "card": bob_card.export_string()
+        });
+        let response = alice.handle_text(&add.to_string(), &alice_session).await;
+        let AgentResponse::PeerCard(card) = response else {
+            panic!("expected peer card response");
+        };
+        assert_eq!(card.id, "add");
+        assert_eq!(card.peer_id, bob_card.peer_id.to_string());
+
+        let response = bob
+            .handle_text(
+                r#"{"id":"sub","type":"subscribe","channel":"default"}"#,
+                &bob_session,
+            )
+            .await;
+        assert!(matches!(response, AgentResponse::Ok(_)));
+
+        let send = serde_json::json!({
+            "id": "send",
+            "type": "send",
+            "to": bob_card.peer_id.to_string(),
+            "channel": "default",
+            "payload": encode_payload(b"hello")
+        });
+        let response = alice.handle_text(&send.to_string(), &alice_session).await;
+        assert!(matches!(response, AgentResponse::Ok(_)));
+
+        let Some(AgentResponse::Message(message)) = bob_rx.recv().await else {
+            panic!("expected message event");
+        };
+        assert_eq!(message.from, alice_card.peer_id.to_string());
+        assert_eq!(message.payload, encode_payload(b"hello"));
+    }
+
+    #[tokio::test]
+    async fn remove_peer_deletes_live_trust_entry() {
+        let transport = InMemoryTransport::new();
+        let bob_identity = derive_identity(&[2; 32]).unwrap();
+        let bob_card = bob_identity.card();
+        let alice = state([1; 32], vec![bob_card.clone()], transport).await;
+        let (session, _rx) = session();
+
+        let remove = serde_json::json!({
+            "id": "remove",
+            "type": "remove_peer",
+            "peer_id": bob_card.peer_id.to_string()
+        });
+        let response = alice.handle_text(&remove.to_string(), &session).await;
+        assert!(matches!(response, AgentResponse::Ok(_)));
+
+        let response = alice
+            .handle_text(r#"{"id":"peers","type":"list_peers"}"#, &session)
+            .await;
+        let AgentResponse::Peers(peers) = response else {
+            panic!("expected peers response");
+        };
+        assert!(peers.peers.is_empty());
+
+        let send = serde_json::json!({
+            "id": "send",
+            "type": "send",
+            "to": bob_card.peer_id.to_string(),
+            "channel": "default",
+            "payload": encode_payload(b"hello")
+        });
+        let response = alice.handle_text(&send.to_string(), &session).await;
+        let AgentResponse::Error(error) = response else {
+            panic!("expected error response");
+        };
+        assert!(matches!(error.code, ErrorCode::InvalidRequest));
     }
 
     #[tokio::test]
