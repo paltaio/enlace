@@ -85,7 +85,7 @@ impl core::fmt::Display for TransportKind {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NameError {
     Empty,
     TooLong,
