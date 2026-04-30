@@ -378,3 +378,63 @@ async fn http_mailbox_and_slot_fanout_work_with_dht_and_pkarr_enabled() {
     assert_eq!(dht_value.version, put.version);
     assert_eq!(dht_value.via, TransportKind::Dht);
 }
+
+#[tokio::test]
+async fn combined_dht_pkarr_slot_get_selects_newest_recovery_value() {
+    let testnet = build_dht_testnet(5).await;
+    let pkarr_relay = PkarrRelayProcess::spawn().await;
+    let seed = [0x99; 32];
+    let dht_writer = Namespace::open(&seed, dht_config(&testnet.bootstrap))
+        .await
+        .expect("DHT writer opens");
+    let pkarr_writer = Namespace::open(&seed, pkarr_config(&pkarr_relay.base_url))
+        .await
+        .expect("pkarr writer opens");
+    let combined_reader = Namespace::open(
+        &seed,
+        Config {
+            dht: dht_config(&testnet.bootstrap).dht,
+            pkarr: pkarr_config(&pkarr_relay.base_url).pkarr,
+            ..Config::default()
+        },
+    )
+    .await
+    .expect("combined reader opens");
+
+    pkarr_writer
+        .slot("control/recovery")
+        .expect("slot opens")
+        .put(b"pkarr-old")
+        .await
+        .expect("pkarr put succeeds");
+    dht_writer
+        .slot("control/recovery")
+        .expect("slot opens")
+        .put(b"dht-old")
+        .await
+        .expect("first DHT put succeeds");
+    let dht_put = dht_writer
+        .slot("control/recovery")
+        .expect("slot opens")
+        .put(b"dht-new")
+        .await
+        .expect("second DHT put succeeds");
+
+    let dht_reader = Namespace::open(&seed, dht_config(&testnet.bootstrap))
+        .await
+        .expect("DHT reader opens");
+    let dht_slot = dht_reader.slot("control/recovery").expect("slot opens");
+    let dht_value = wait_for_slot(&dht_slot).await;
+    assert_eq!(dht_value.version, dht_put.version);
+
+    let value = combined_reader
+        .slot("control/recovery")
+        .expect("slot opens")
+        .get()
+        .await
+        .expect("combined slot get succeeds")
+        .expect("combined slot value exists");
+    assert_eq!(value.version, dht_put.version);
+    assert_eq!(value.payload, b"dht-new");
+    assert_eq!(value.via, TransportKind::Dht);
+}
