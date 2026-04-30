@@ -24,16 +24,29 @@ use url::Url;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-use crate::config::{
-    ConfiguredTransport, DEFAULT_LONG_POLL_SECS, DhtConfig, HttpConfig, IrohConfig,
-    IrohEndpointAddr, PkarrConfig,
-};
+#[cfg(feature = "dht")]
+use crate::config::DhtConfig;
+#[cfg(feature = "http")]
+use crate::config::HttpConfig;
+#[cfg(feature = "iroh")]
+use crate::config::IrohConfig;
+#[cfg(feature = "pkarr")]
+use crate::config::PkarrConfig;
+use crate::config::{ConfiguredTransport, DEFAULT_LONG_POLL_SECS, IrohEndpointAddr};
 use crate::crypto::{self, AEAD_KEY_LEN, NONCE_LEN, SIG_LEN};
 use crate::dedup::Dedup;
 use crate::error::{OpenError, RecvError, TransportError};
 use crate::kdf::{ChannelKind, NameError, TransportKind, validate_name};
 use crate::state::{State, StateError};
-use crate::transports::{DhtTransport, HttpTransport, IrohTransport, PkarrTransport, Transport};
+#[cfg(feature = "dht")]
+use crate::transports::DhtTransport;
+#[cfg(feature = "http")]
+use crate::transports::HttpTransport;
+#[cfg(feature = "iroh")]
+use crate::transports::IrohTransport;
+#[cfg(feature = "pkarr")]
+use crate::transports::PkarrTransport;
+use crate::transports::Transport;
 
 pub const PEER_ID_LEN: usize = 32;
 pub const GROUP_ID_LEN: usize = 32;
@@ -673,9 +686,13 @@ pub struct PeerConfig {
     pub state: State,
     pub trusted_peers: Vec<TrustedPeer>,
     pub group_keys: Vec<(GroupId, GroupKey)>,
+    #[cfg(feature = "http")]
     pub http: Option<HttpConfig>,
+    #[cfg(feature = "pkarr")]
     pub pkarr: Option<PkarrConfig>,
+    #[cfg(feature = "dht")]
     pub dht: Option<DhtConfig>,
+    #[cfg(feature = "iroh")]
     pub iroh: Option<IrohConfig>,
     pub transports: Vec<ConfiguredTransport>,
 }
@@ -687,6 +704,7 @@ pub struct PeerNamespace {
     trusted_peers: Arc<RwLock<HashMap<PeerId, TrustedPeer>>>,
     group_keys: Arc<RwLock<HashMap<(GroupId, GroupKeyId), GroupKey>>>,
     transports: Vec<PeerTransportEndpoint>,
+    #[cfg(feature = "iroh")]
     iroh: Option<Arc<IrohTransport>>,
 }
 
@@ -704,11 +722,14 @@ enum PeerAddress {
 }
 
 impl PeerNamespace {
+    #[allow(clippy::unused_async)]
     pub async fn open(identity: PeerIdentity, config: PeerConfig) -> Result<Self, OpenError> {
         let state = config.state.clone();
+        #[cfg(feature = "iroh")]
         let state_store = state.store();
         let mut transports = Vec::new();
 
+        #[cfg(feature = "http")]
         if let Some(http_config) = config.http.clone() {
             let http = Arc::new(
                 HttpTransport::new(http_config)
@@ -721,7 +742,9 @@ impl PeerNamespace {
             });
         }
 
+        #[cfg(any(feature = "dht", feature = "pkarr"))]
         let transport_seed = identity.peer_id().to_bytes();
+        #[cfg(feature = "pkarr")]
         if let Some(pkarr_config) = &config.pkarr {
             let pkarr = Arc::new(
                 PkarrTransport::new(&transport_seed, pkarr_config)
@@ -734,6 +757,7 @@ impl PeerNamespace {
             });
         }
 
+        #[cfg(feature = "dht")]
         if let Some(dht_config) = &config.dht {
             let dht = Arc::new(
                 DhtTransport::new(&transport_seed, dht_config)
@@ -746,7 +770,9 @@ impl PeerNamespace {
             });
         }
 
+        #[cfg(feature = "iroh")]
         let iroh = open_peer_iroh_transport(&config, state_store.as_ref()).await?;
+        #[cfg(feature = "iroh")]
         if let Some(iroh) = iroh.clone() {
             let transport: Arc<dyn Transport> = iroh;
             transports.push(PeerTransportEndpoint {
@@ -768,6 +794,7 @@ impl PeerNamespace {
             trusted_peers: Arc::new(RwLock::new(HashMap::new())),
             group_keys: Arc::new(RwLock::new(HashMap::new())),
             transports,
+            #[cfg(feature = "iroh")]
             iroh,
         };
         for trusted in config.trusted_peers {
@@ -849,7 +876,13 @@ impl PeerNamespace {
         let old_endpoint_id = replaced
             .and_then(|peer| peer.card.iroh_endpoint)
             .map(|endpoint| endpoint.endpoint_id);
+        #[cfg(feature = "iroh")]
         update_iroh_trusted_endpoint(self.iroh.as_ref(), old_endpoint_id, endpoint);
+        #[cfg(not(feature = "iroh"))]
+        {
+            let _ = old_endpoint_id;
+            let _ = endpoint;
+        }
         Ok(())
     }
 
@@ -861,7 +894,10 @@ impl PeerNamespace {
         let old_endpoint_id = removed
             .and_then(|peer| peer.card.iroh_endpoint)
             .map(|endpoint| endpoint.endpoint_id);
+        #[cfg(feature = "iroh")]
         update_iroh_trusted_endpoint(self.iroh.as_ref(), old_endpoint_id, None);
+        #[cfg(not(feature = "iroh"))]
+        let _ = old_endpoint_id;
         Ok(())
     }
 
@@ -2616,35 +2652,6 @@ fn upsert_iroh_peer(peers: &mut Vec<IrohEndpointAddr>, peer: IrohEndpointAddr) {
     }
 }
 
-#[cfg(not(feature = "iroh"))]
-#[allow(clippy::unused_async)]
-async fn open_peer_iroh_transport(
-    config: &PeerConfig,
-    _state: &dyn crate::state::StateStore,
-) -> Result<Option<Arc<IrohTransport>>, OpenError> {
-    if config.iroh.is_some() {
-        return Err(OpenError::TransportInit(
-            TransportKind::Iroh,
-            Box::new(PeerIrohFeatureDisabled),
-        ));
-    }
-    Ok(None)
-}
-
-#[cfg(not(feature = "iroh"))]
-#[derive(Debug)]
-struct PeerIrohFeatureDisabled;
-
-#[cfg(not(feature = "iroh"))]
-impl fmt::Display for PeerIrohFeatureDisabled {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("iroh feature is not enabled")
-    }
-}
-
-#[cfg(not(feature = "iroh"))]
-impl StdError for PeerIrohFeatureDisabled {}
-
 fn write_trusted_peers<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     lock.write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2682,14 +2689,6 @@ fn update_iroh_trusted_endpoint(
     if let Some(endpoint) = endpoint {
         iroh.allow_peer(endpoint);
     }
-}
-
-#[cfg(not(feature = "iroh"))]
-fn update_iroh_trusted_endpoint(
-    _iroh: Option<&Arc<IrohTransport>>,
-    _old_endpoint_id: Option<[u8; 32]>,
-    _endpoint: Option<IrohEndpointAddr>,
-) {
 }
 
 fn write_endpoint(out: &mut Vec<u8>, endpoint: Option<&IrohEndpointAddr>) {

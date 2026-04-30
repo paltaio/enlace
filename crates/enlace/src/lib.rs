@@ -41,10 +41,15 @@ pub mod slot;
 pub mod state;
 pub mod transports;
 
-pub use config::{
-    BasicAuth, Config, ConfiguredTransport, DhtBootstrapCacheConfig, DhtConfig, HttpConfig,
-    IrohConfig, IrohEndpointAddr, IrohRelayMode, PkarrConfig,
-};
+#[cfg(feature = "pkarr")]
+pub use config::PkarrConfig;
+#[cfg(feature = "http")]
+pub use config::{BasicAuth, HttpConfig};
+pub use config::{Config, ConfiguredTransport, IrohEndpointAddr};
+#[cfg(feature = "dht")]
+pub use config::{DhtBootstrapCacheConfig, DhtConfig};
+#[cfg(feature = "iroh")]
+pub use config::{IrohConfig, IrohRelayMode};
 pub use error::{OpenError, RecvError, SealError, SendError, SlotError, TransportError};
 pub use kdf::{ChannelKind, NameError, TransportKind};
 pub use mailbox::{Mailbox, RecvMessage, SendReport};
@@ -59,8 +64,15 @@ pub use peer::{
 };
 pub use slot::{PutReport, Slot, SlotValue, SlotWatch};
 pub use state::{InMemoryStateStore, State, StateError, StateStore};
+#[cfg(feature = "dht")]
+pub use transports::DhtTransport;
+#[cfg(feature = "http")]
+pub use transports::HttpTransport;
+#[cfg(feature = "iroh")]
+pub use transports::IrohTransport;
+#[cfg(feature = "pkarr")]
+pub use transports::PkarrTransport;
 pub use transports::{
-    DhtTransport, EndpointHealth, HealthReport, HealthState, HealthTransition,
-    HealthTransitionKind, HttpTransport, IrohTransport, MailboxTransport, PkarrTransport,
-    SlotTransport, SlotWatchStream, Transport, TransportHealth,
+    EndpointHealth, HealthReport, HealthState, HealthTransition, HealthTransitionKind,
+    MailboxTransport, SlotTransport, SlotWatchStream, Transport, TransportHealth,
 };

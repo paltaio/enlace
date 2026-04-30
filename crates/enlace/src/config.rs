@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+#[cfg(feature = "dht")]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,9 +28,13 @@ pub const DEFAULT_IROH_MAX_STREAMS_PER_PEER: u32 = 32;
 pub const DEFAULT_IROH_MAX_CONNS_PER_PEER: u32 = 4;
 
 pub struct Config {
+    #[cfg(feature = "http")]
     pub http: Option<HttpConfig>,
+    #[cfg(feature = "pkarr")]
     pub pkarr: Option<PkarrConfig>,
+    #[cfg(feature = "dht")]
     pub dht: Option<DhtConfig>,
+    #[cfg(feature = "iroh")]
     pub iroh: Option<IrohConfig>,
     pub signing: Option<SigningKey>,
     pub trusted: Vec<VerifyingKey>,
@@ -42,9 +47,13 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "http")]
             http: None,
+            #[cfg(feature = "pkarr")]
             pkarr: None,
+            #[cfg(feature = "dht")]
             dht: None,
+            #[cfg(feature = "iroh")]
             iroh: None,
             signing: None,
             trusted: Vec::new(),
@@ -58,11 +67,16 @@ impl Default for Config {
 
 impl Config {
     pub(crate) fn transport_count(&self) -> usize {
-        usize::from(self.http.is_some())
-            + usize::from(self.pkarr.is_some())
-            + usize::from(self.dht.is_some())
-            + usize::from(self.iroh.is_some())
-            + self.transports.len()
+        let count = self.transports.len();
+        #[cfg(feature = "http")]
+        let count = count + usize::from(self.http.is_some());
+        #[cfg(feature = "pkarr")]
+        let count = count + usize::from(self.pkarr.is_some());
+        #[cfg(feature = "dht")]
+        let count = count + usize::from(self.dht.is_some());
+        #[cfg(feature = "iroh")]
+        let count = count + usize::from(self.iroh.is_some());
+        count
     }
 }
 
@@ -80,12 +94,14 @@ impl ConfiguredTransport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "http")]
 pub struct BasicAuth {
     pub username: String,
     pub password: String,
 }
 
 #[derive(Clone)]
+#[cfg(feature = "http")]
 pub struct HttpConfig {
     pub url: Url,
     pub skip_verify: bool,
@@ -93,6 +109,7 @@ pub struct HttpConfig {
     pub long_poll_secs: u32,
 }
 
+#[cfg(feature = "http")]
 impl HttpConfig {
     #[must_use]
     pub fn new(url: Url) -> Self {
@@ -106,11 +123,13 @@ impl HttpConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "pkarr")]
 pub struct PkarrConfig {
     pub resolvers: Vec<String>,
     pub republish_interval: Duration,
 }
 
+#[cfg(feature = "pkarr")]
 impl Default for PkarrConfig {
     fn default() -> Self {
         Self {
@@ -123,6 +142,7 @@ impl Default for PkarrConfig {
     }
 }
 
+#[cfg(feature = "pkarr")]
 impl PkarrConfig {
     #[must_use]
     pub fn effective_resolvers(&self) -> Vec<String> {
@@ -137,11 +157,12 @@ impl PkarrConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "pkarr", feature = "dht", feature = "iroh")))]
 mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "pkarr")]
     fn pkarr_default_resolvers_are_public_relays() {
         let config = PkarrConfig::default();
 
@@ -153,6 +174,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "pkarr")]
     fn pkarr_empty_resolvers_fall_back_to_defaults() {
         let config = PkarrConfig {
             resolvers: Vec::new(),
@@ -169,6 +191,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "pkarr")]
     fn pkarr_configured_resolvers_are_preserved() {
         let config = PkarrConfig {
             resolvers: vec!["http://127.0.0.1:8080".to_owned()],
@@ -179,6 +202,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dht")]
     fn dht_bootstrap_cache_defaults_are_bounded() {
         let config = DhtBootstrapCacheConfig::new("bootstrap.txt".into());
 
@@ -187,6 +211,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "iroh")]
     fn iroh_defaults_match_realtime_transport_shape() {
         let config = IrohConfig::default();
 
@@ -203,12 +228,14 @@ mod tests {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "dht")]
 pub struct DhtConfig {
     pub bootstrap: Vec<SocketAddr>,
     pub watch_poll_interval: Duration,
     pub bootstrap_cache: Option<DhtBootstrapCacheConfig>,
 }
 
+#[cfg(feature = "dht")]
 impl Default for DhtConfig {
     fn default() -> Self {
         Self {
@@ -220,12 +247,14 @@ impl Default for DhtConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "dht")]
 pub struct DhtBootstrapCacheConfig {
     pub path: PathBuf,
     pub ttl: Duration,
     pub max_peers: usize,
 }
 
+#[cfg(feature = "dht")]
 impl DhtBootstrapCacheConfig {
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
@@ -238,6 +267,7 @@ impl DhtBootstrapCacheConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "iroh")]
 pub struct IrohConfig {
     pub relay_mode: IrohRelayMode,
     pub bind_addrs: Vec<SocketAddr>,
@@ -247,6 +277,7 @@ pub struct IrohConfig {
     pub max_conns_per_peer: u32,
 }
 
+#[cfg(feature = "iroh")]
 impl Default for IrohConfig {
     fn default() -> Self {
         Self {
@@ -261,6 +292,7 @@ impl Default for IrohConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "iroh")]
 pub enum IrohRelayMode {
     Default,
     Custom(Vec<Url>),

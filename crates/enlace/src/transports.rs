@@ -7,19 +7,25 @@ use async_trait::async_trait;
 use futures_core::Stream;
 
 use crate::config::Config;
+#[cfg(feature = "iroh")]
 use crate::config::IrohRelayMode;
 use crate::error::TransportError;
 use crate::kdf::TransportKind;
 
+#[cfg(feature = "dht")]
 mod dht;
+#[cfg(feature = "http")]
 mod http;
 #[cfg(feature = "iroh")]
 mod iroh;
+#[cfg(feature = "pkarr")]
 mod pkarr;
 
+#[cfg(feature = "dht")]
 pub use dht::DhtTransport;
+#[cfg(feature = "http")]
 pub use http::HttpTransport;
-#[cfg(feature = "fuzzing")]
+#[cfg(all(feature = "fuzzing", feature = "http"))]
 pub(crate) use http::{
     decode_empty_response, decode_mailbox_recv_response, decode_slot_get_response,
 };
@@ -27,11 +33,8 @@ pub(crate) use http::{
 pub(crate) use iroh::IrohInitError;
 #[cfg(feature = "iroh")]
 pub use iroh::IrohTransport;
+#[cfg(feature = "pkarr")]
 pub use pkarr::PkarrTransport;
-
-#[cfg(not(feature = "iroh"))]
-#[derive(Debug)]
-pub struct IrohTransport;
 
 pub type SlotWatchStream =
     Pin<Box<dyn Stream<Item = Result<(u64, Vec<u8>), TransportError>> + Send>>;
@@ -73,6 +76,7 @@ struct TrackedTransport {
 impl HealthTracker {
     pub(crate) fn from_config(config: &Config) -> Self {
         let mut transports = Vec::with_capacity(config.transport_count());
+        #[cfg(feature = "http")]
         if let Some(http) = &config.http {
             transports.push(TrackedTransport::new(
                 TransportKind::Http,
@@ -80,6 +84,7 @@ impl HealthTracker {
                 vec![EndpointHealth::configured(http.url.to_string())],
             ));
         }
+        #[cfg(feature = "pkarr")]
         if let Some(pkarr) = &config.pkarr {
             transports.push(TrackedTransport::new(
                 TransportKind::Pkarr,
@@ -91,6 +96,7 @@ impl HealthTracker {
                     .collect(),
             ));
         }
+        #[cfg(feature = "dht")]
         if let Some(dht) = &config.dht {
             transports.push(TrackedTransport::new(
                 TransportKind::Dht,
@@ -98,6 +104,7 @@ impl HealthTracker {
                 Vec::new(),
             ));
         }
+        #[cfg(feature = "iroh")]
         if let Some(iroh) = &config.iroh {
             let mut endpoints: Vec<EndpointHealth> = iroh
                 .peers
@@ -150,7 +157,7 @@ impl HealthTracker {
         self.for_kind(kind, TrackedTransport::record_failure);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "http"))]
     fn force_last_success(&self, kind: TransportKind, age: Duration) {
         let now = Instant::now();
         let instant = now.checked_sub(age).unwrap_or(now);
@@ -212,6 +219,7 @@ pub struct EndpointHealth {
 }
 
 impl EndpointHealth {
+    #[cfg(any(feature = "http", feature = "pkarr", feature = "iroh"))]
     fn configured(endpoint: String) -> Self {
         Self {
             endpoint,
@@ -324,14 +332,17 @@ impl TrackedTransport {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "http", feature = "pkarr")))]
 mod health_tests {
     use super::*;
 
+    #[cfg(feature = "http")]
     use crate::config::HttpConfig;
+    #[cfg(feature = "http")]
     use url::Url;
 
     #[test]
+    #[cfg(feature = "http")]
     fn health_records_failure_and_recovery_transitions() {
         let config = Config {
             http: Some(HttpConfig::new(Url::parse("https://198.51.100.1").unwrap())),
@@ -365,6 +376,7 @@ mod health_tests {
     }
 
     #[test]
+    #[cfg(feature = "http")]
     fn health_snapshot_applies_staleness_windows() {
         let config = Config {
             http: Some(HttpConfig::new(Url::parse("https://198.51.100.1").unwrap())),
@@ -384,6 +396,7 @@ mod health_tests {
     }
 
     #[test]
+    #[cfg(feature = "pkarr")]
     fn pkarr_health_reports_resolver_endpoints() {
         let config = Config {
             pkarr: Some(crate::config::PkarrConfig::default()),

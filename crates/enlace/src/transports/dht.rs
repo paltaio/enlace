@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use mainline::errors::{PutMutableError, PutQueryError};
 use mainline::{Dht, MutableItem, SigningKey};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -187,11 +188,7 @@ impl SlotTransport for DhtTransport {
             }
             let cas = current.as_ref().map(MutableItem::seq);
             let item = MutableItem::new(id.signing_key, &sealed, seq, Some(&id.salt));
-            transport
-                .dht
-                .put_mutable(item, cas)
-                .map(drop)
-                .map_err(map_put_error)?;
+            put_mutable_with_bootstrap_retry(&transport.dht, item, cas)?;
             transport.maybe_persist_bootstrap_cache();
             Ok(())
         })
@@ -311,6 +308,21 @@ fn mutable_item_is_newer(candidate: &MutableItem, current: &MutableItem) -> bool
     (candidate.seq(), candidate.value()) > (current.seq(), current.value())
 }
 
+fn put_mutable_with_bootstrap_retry(
+    dht: &Dht,
+    item: MutableItem,
+    cas: Option<i64>,
+) -> Result<(), TransportError> {
+    match dht.put_mutable(item.clone(), cas) {
+        Ok(_) => Ok(()),
+        Err(PutMutableError::Query(PutQueryError::NoClosestNodes)) => {
+            let _ = dht.bootstrapped();
+            dht.put_mutable(item, cas).map(drop).map_err(map_put_error)
+        }
+        Err(err) => Err(map_put_error(err)),
+    }
+}
+
 fn combined_bootstrap(configured: &[SocketAddr], cached: Option<&[SocketAddr]>) -> Vec<SocketAddr> {
     let cached = cached.unwrap_or_default();
     let mut bootstrap = Vec::with_capacity(configured.len() + cached.len());
@@ -412,7 +424,7 @@ fn map_io_error(err: std::io::Error) -> TransportError {
     TransportError::Other(Box::new(err))
 }
 
-fn map_put_error(err: mainline::errors::PutMutableError) -> TransportError {
+fn map_put_error(err: PutMutableError) -> TransportError {
     match err {
         mainline::errors::PutMutableError::Concurrency(_) => TransportError::Stale,
         mainline::errors::PutMutableError::Query(err) => TransportError::Other(Box::new(err)),

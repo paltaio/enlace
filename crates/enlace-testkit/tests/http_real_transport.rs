@@ -1,3 +1,5 @@
+#![cfg(all(feature = "http", feature = "iroh"))]
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 

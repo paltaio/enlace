@@ -12,6 +12,19 @@ transports.
 - `enlace-relay`: HTTP relay server
 - `enlace-testkit`: in-memory, lossy, and delayed test transports
 
+## Features
+
+Default features enable all built-in transports. For smaller builds, disable
+defaults and select only what you use:
+
+```toml
+enlace = { version = "0.1", default-features = false, features = ["http"] }
+enlace = { version = "0.1", default-features = false, features = ["dht"] }
+enlace = { version = "0.1", default-features = false, features = ["pkarr"] }
+enlace = { version = "0.1", default-features = false, features = ["iroh"] }
+enlace = { version = "0.1", default-features = false, features = ["http", "iroh"] }
+```
+
 ## Modes
 
 - Shared-seed mode uses `Namespace::open(&seed, config)`. Use it when every peer
@@ -135,6 +148,8 @@ ENLACE_RELAY_AUTH=user:pass cargo run -p enlace-relay -- --listen 127.0.0.1:7777
 
 ```sh
 cargo test --workspace --locked
+cargo check -p enlace --no-default-features --locked
+cargo check -p enlace --no-default-features --features http --locked
 cargo run -p enlace-testkit --example two_peers --locked
 ```
 

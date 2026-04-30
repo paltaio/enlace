@@ -1,3 +1,5 @@
+#![cfg(all(feature = "http", feature = "dht", feature = "pkarr"))]
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -234,28 +236,28 @@ async fn build_dht_testnet(size: usize) -> mainline::Testnet {
 }
 
 async fn wait_for_slot(slot: &enlace::Slot) -> enlace::SlotValue {
-    for _ in 0..10 {
+    for _ in 0..30 {
         if let Some(value) = slot.get().await.expect("slot get succeeds") {
             return value;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
     panic!("slot value did not arrive");
 }
 
 async fn wait_for_peer_pairwise_slot(slot: &PeerSlot<'_>) -> PeerSlotValue {
-    for _ in 0..10 {
+    for _ in 0..30 {
         if let Some(value) = slot.get_pairwise().await.expect("peer slot get succeeds") {
             return value;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
     panic!("peer slot value did not arrive");
 }
 
 #[tokio::test]
 async fn namespaces_exchange_slot_over_isolated_dht_bootstrap() {
-    let testnet = build_dht_testnet(5).await;
+    let testnet = build_dht_testnet(10).await;
     let seed = [0x66; 32];
     let sender = Namespace::open(&seed, dht_config(&testnet.bootstrap))
         .await
@@ -280,7 +282,7 @@ async fn namespaces_exchange_slot_over_isolated_dht_bootstrap() {
 
 #[tokio::test]
 async fn peer_namespaces_exchange_pairwise_slot_over_isolated_dht_bootstrap() {
-    let testnet = build_dht_testnet(5).await;
+    let testnet = build_dht_testnet(10).await;
     let alice_identity = PeerIdentity::generate();
     let bob_identity = PeerIdentity::generate();
     let alice_card = alice_identity.card();
@@ -402,7 +404,7 @@ async fn peer_namespaces_exchange_pairwise_slot_over_pkarr_relay_mock() {
 
 #[tokio::test]
 async fn http_mailbox_and_slot_fanout_work_with_dht_and_pkarr_enabled() {
-    let testnet = build_dht_testnet(5).await;
+    let testnet = build_dht_testnet(10).await;
     let http_relay = HttpRelayProcess::spawn().await;
     let pkarr_relay = PkarrRelayProcess::spawn().await;
     let seed = [0x88; 32];
@@ -509,7 +511,7 @@ async fn http_mailbox_and_slot_fanout_work_with_dht_and_pkarr_enabled() {
 
 #[tokio::test]
 async fn combined_dht_pkarr_slot_get_selects_newest_recovery_value() {
-    let testnet = build_dht_testnet(5).await;
+    let testnet = build_dht_testnet(10).await;
     let pkarr_relay = PkarrRelayProcess::spawn().await;
     let seed = [0x99; 32];
     let dht_writer = Namespace::open(&seed, dht_config(&testnet.bootstrap))

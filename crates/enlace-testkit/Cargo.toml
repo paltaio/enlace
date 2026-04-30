@@ -2,12 +2,22 @@
 name = "enlace-testkit"
 edition.workspace = true
 version.workspace = true
-publish.workspace = true
+publish = false
 license.workspace = true
+repository.workspace = true
+description = "Test transports for enlace."
+
+[features]
+default = ["all-transports"]
+all-transports = ["http", "dht", "pkarr", "iroh"]
+http = ["enlace/http"]
+dht = ["enlace/dht"]
+pkarr = ["enlace/pkarr"]
+iroh = ["enlace/iroh"]
 
 [dependencies]
 async-trait = { workspace = true }
-enlace = { path = "../enlace" }
+enlace = { path = "../enlace", default-features = false }
 rand = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

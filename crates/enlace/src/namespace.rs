@@ -6,9 +6,15 @@ use crate::error::OpenError;
 use crate::kdf::NameError;
 use crate::mailbox::Mailbox;
 use crate::slot::Slot;
-use crate::transports::{
-    DhtTransport, HealthReport, HealthTracker, HttpTransport, IrohTransport, PkarrTransport,
-};
+#[cfg(feature = "dht")]
+use crate::transports::DhtTransport;
+#[cfg(feature = "http")]
+use crate::transports::HttpTransport;
+#[cfg(feature = "iroh")]
+use crate::transports::IrohTransport;
+#[cfg(feature = "pkarr")]
+use crate::transports::PkarrTransport;
+use crate::transports::{HealthReport, HealthTracker};
 
 #[derive(Clone)]
 pub struct Namespace {
@@ -17,9 +23,13 @@ pub struct Namespace {
 
 pub(crate) struct NamespaceInner {
     pub(crate) coordinator: Arc<Coordinator>,
+    #[cfg(feature = "http")]
     pub(crate) http: Option<Arc<HttpTransport>>,
+    #[cfg(feature = "pkarr")]
     pub(crate) pkarr: Option<Arc<PkarrTransport>>,
+    #[cfg(feature = "dht")]
     pub(crate) dht: Option<Arc<DhtTransport>>,
+    #[cfg(feature = "iroh")]
     pub(crate) iroh: Option<Arc<IrohTransport>>,
 }
 
@@ -37,6 +47,7 @@ impl Namespace {
 
         let state = config.state.store();
         let mut transports = Vec::new();
+        #[cfg(feature = "http")]
         let http = if let Some(http_config) = config.http.clone() {
             let http = Arc::new(HttpTransport::new(http_config).map_err(|err| {
                 OpenError::TransportInit(crate::TransportKind::Http, Box::new(err))
@@ -50,6 +61,7 @@ impl Namespace {
         } else {
             None
         };
+        #[cfg(feature = "pkarr")]
         let pkarr = if let Some(pkarr_config) = &config.pkarr {
             let pkarr = Arc::new(PkarrTransport::new(seed, pkarr_config).map_err(|err| {
                 OpenError::TransportInit(crate::TransportKind::Pkarr, Box::new(err))
@@ -63,6 +75,7 @@ impl Namespace {
         } else {
             None
         };
+        #[cfg(feature = "dht")]
         let dht = if let Some(dht_config) = &config.dht {
             let dht = Arc::new(DhtTransport::new(seed, dht_config).map_err(|err| {
                 OpenError::TransportInit(crate::TransportKind::Dht, Box::new(err))
@@ -76,6 +89,7 @@ impl Namespace {
         } else {
             None
         };
+        #[cfg(feature = "iroh")]
         let iroh = open_iroh_transport(&config, state.as_ref(), &mut transports).await?;
         for configured in &config.transports {
             transports.push(TransportEndpoint {
@@ -89,9 +103,13 @@ impl Namespace {
         Ok(Self {
             inner: Arc::new(NamespaceInner {
                 coordinator,
+                #[cfg(feature = "http")]
                 http,
+                #[cfg(feature = "pkarr")]
                 pkarr,
+                #[cfg(feature = "dht")]
                 dht,
+                #[cfg(feature = "iroh")]
                 iroh,
             }),
         })
@@ -106,21 +124,25 @@ impl Namespace {
     }
 
     #[must_use]
+    #[cfg(feature = "http")]
     pub fn http(&self) -> Option<&HttpTransport> {
         self.inner.http.as_deref()
     }
 
     #[must_use]
+    #[cfg(feature = "pkarr")]
     pub fn pkarr(&self) -> Option<&PkarrTransport> {
         self.inner.pkarr.as_deref()
     }
 
     #[must_use]
+    #[cfg(feature = "dht")]
     pub fn dht(&self) -> Option<&DhtTransport> {
         self.inner.dht.as_deref()
     }
 
     #[must_use]
+    #[cfg(feature = "iroh")]
     pub fn iroh(&self) -> Option<&IrohTransport> {
         self.inner.iroh.as_deref()
     }
@@ -171,37 +193,8 @@ async fn open_iroh_transport(
     }
 }
 
-#[cfg(not(feature = "iroh"))]
-#[allow(clippy::unused_async)]
-async fn open_iroh_transport(
-    config: &Config,
-    _state: &dyn crate::state::StateStore,
-    _transports: &mut Vec<TransportEndpoint>,
-) -> Result<Option<Arc<IrohTransport>>, OpenError> {
-    if config.iroh.is_some() {
-        return Err(OpenError::TransportInit(
-            crate::TransportKind::Iroh,
-            Box::new(IrohFeatureDisabled),
-        ));
-    }
-    Ok(None)
-}
-
-#[cfg(not(feature = "iroh"))]
-#[derive(Debug)]
-struct IrohFeatureDisabled;
-
-#[cfg(not(feature = "iroh"))]
-impl std::fmt::Display for IrohFeatureDisabled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("iroh feature is not enabled")
-    }
-}
-
-#[cfg(not(feature = "iroh"))]
-impl std::error::Error for IrohFeatureDisabled {}
-
 #[cfg(test)]
+#[cfg(feature = "iroh")]
 mod tests {
     use super::*;
 

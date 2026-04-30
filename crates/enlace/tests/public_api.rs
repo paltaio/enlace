@@ -1,3 +1,5 @@
+#![cfg(all(feature = "http", feature = "dht", feature = "pkarr"))]
+
 use ed25519_dalek::SigningKey;
 use enlace::{
     Config, DhtConfig, HealthState, HttpConfig, NameError, Namespace, OpenError, PkarrConfig,
