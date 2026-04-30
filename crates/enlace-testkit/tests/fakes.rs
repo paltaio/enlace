@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use enlace::{
-    Config, ConfiguredTransport, MailboxTransport, Namespace, SlotTransport, TransportError,
-    TransportKind,
+    Config, ConfiguredTransport, GroupId, GroupKey, GroupKeyId, MailboxTransport, Namespace,
+    PeerConfig, PeerIdentity, PeerNamespace, SlotTransport, TransportError, TransportKind,
+    TrustedPeer,
 };
 use enlace_testkit::{DelayingTransport, InMemoryTransport, LossyTransport};
 use tokio_stream::StreamExt;
@@ -144,6 +145,19 @@ where
     }
 }
 
+fn peer_namespace_config<T>(transport: T) -> PeerConfig
+where
+    T: enlace::Transport + 'static,
+{
+    PeerConfig {
+        transports: vec![ConfiguredTransport::new(
+            TransportKind::Http,
+            Arc::new(transport),
+        )],
+        ..PeerConfig::default()
+    }
+}
+
 #[tokio::test]
 async fn namespaces_exchange_mailbox_through_in_memory_transport() {
     let transport = InMemoryTransport::new();
@@ -164,6 +178,129 @@ async fn namespaces_exchange_mailbox_through_in_memory_transport() {
 
     assert_eq!(message.payload, b"hello");
     assert_eq!(message.via, TransportKind::Http);
+}
+
+#[tokio::test]
+async fn peer_namespaces_exchange_pairwise_mailbox() {
+    let transport = InMemoryTransport::new();
+    let alice_identity = PeerIdentity::generate();
+    let bob_identity = PeerIdentity::generate();
+    let stranger_identity = PeerIdentity::generate();
+    let alice_card = alice_identity.card();
+    let bob_card = bob_identity.card();
+    let stranger_card = stranger_identity.card();
+    let alice = PeerNamespace::open(
+        alice_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(bob_card.clone()).unwrap()],
+            ..peer_namespace_config(transport.clone())
+        },
+    )
+    .await
+    .unwrap();
+    let stranger = PeerNamespace::open(
+        stranger_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(bob_card.clone()).unwrap()],
+            ..peer_namespace_config(transport.clone())
+        },
+    )
+    .await
+    .unwrap();
+    let bob = PeerNamespace::open(
+        bob_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(alice_card.clone()).unwrap()],
+            ..peer_namespace_config(transport)
+        },
+    )
+    .await
+    .unwrap();
+    let inbox = bob.mailbox("chat").unwrap();
+
+    stranger
+        .mailbox("chat")
+        .unwrap()
+        .send_to_peers(std::slice::from_ref(&bob_card), b"drop")
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            inbox.recv_timeout(Duration::ZERO)
+        )
+        .await
+        .is_ok_and(|result| result.is_err())
+    );
+
+    alice
+        .mailbox("chat")
+        .unwrap()
+        .send_to_peers(std::slice::from_ref(&bob_card), b"hello")
+        .await
+        .unwrap();
+    let message = tokio::time::timeout(Duration::from_secs(1), inbox.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(message.sender, alice.peer_id());
+    assert_eq!(message.signed_by, alice_card.signing_key);
+    assert_eq!(message.payload, b"hello");
+    assert_eq!(message.via, TransportKind::Http);
+    assert_eq!(message.group, None);
+    assert_eq!(message.key_id, None);
+    assert_eq!(stranger_card.peer_id, stranger.peer_id());
+}
+
+#[tokio::test]
+async fn peer_namespaces_exchange_group_mailbox() {
+    let transport = InMemoryTransport::new();
+    let alice_identity = PeerIdentity::generate();
+    let bob_identity = PeerIdentity::generate();
+    let alice_card = alice_identity.card();
+    let group = GroupId::from_bytes([41; enlace::GROUP_ID_LEN]);
+    let key = GroupKey::new(
+        GroupKeyId::from_bytes([42; enlace::GROUP_KEY_ID_LEN]),
+        [43; enlace::GROUP_KEY_SECRET_LEN],
+    );
+    let alice = PeerNamespace::open(
+        alice_identity,
+        PeerConfig {
+            group_keys: vec![(group, key.clone())],
+            ..peer_namespace_config(transport.clone())
+        },
+    )
+    .await
+    .unwrap();
+    let bob = PeerNamespace::open(
+        bob_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(alice_card.clone()).unwrap()],
+            group_keys: vec![(group, key.clone())],
+            ..peer_namespace_config(transport)
+        },
+    )
+    .await
+    .unwrap();
+
+    alice
+        .mailbox("team")
+        .unwrap()
+        .send_to_group(group, &[key.id], b"group hello")
+        .await
+        .unwrap();
+    let message = tokio::time::timeout(Duration::from_secs(1), bob.mailbox("team").unwrap().recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(message.sender, alice.peer_id());
+    assert_eq!(message.signed_by, alice_card.signing_key);
+    assert_eq!(message.payload, b"group hello");
+    assert_eq!(message.via, TransportKind::Http);
+    assert_eq!(message.group, Some(group));
+    assert_eq!(message.key_id, Some(key.id));
 }
 
 #[tokio::test]

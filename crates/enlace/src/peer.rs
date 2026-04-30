@@ -5,7 +5,8 @@ use std::convert::TryInto;
 use std::error::Error as StdError;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -16,14 +17,20 @@ use chacha20poly1305::{
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::task::JoinSet;
 use url::Url;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-use crate::config::IrohEndpointAddr;
+use crate::config::{
+    ConfiguredTransport, DEFAULT_LONG_POLL_SECS, HttpConfig, IrohConfig, IrohEndpointAddr,
+};
 use crate::crypto::{self, AEAD_KEY_LEN, NONCE_LEN, SIG_LEN};
-use crate::kdf::{ChannelKind, NameError, validate_name};
+use crate::dedup::Dedup;
+use crate::error::{OpenError, RecvError, TransportError};
+use crate::kdf::{ChannelKind, NameError, TransportKind, validate_name};
 use crate::state::{State, StateError};
+use crate::transports::{HttpTransport, IrohTransport, Transport};
 
 pub const PEER_ID_LEN: usize = 32;
 pub const GROUP_ID_LEN: usize = 32;
@@ -157,6 +164,57 @@ impl StdError for GroupEnvelopeError {
 impl From<NameError> for GroupEnvelopeError {
     fn from(err: NameError) -> Self {
         Self::Name(err)
+    }
+}
+
+/// Failure modes for public-key mailbox sends.
+#[derive(Debug)]
+pub enum PeerSendError {
+    /// Pairwise envelope creation failed.
+    PeerEnvelope(PeerEnvelopeError),
+    /// Group envelope creation failed.
+    GroupEnvelope(GroupEnvelopeError),
+    /// Every configured transport rejected the send.
+    AllTransportsFailed(Vec<(TransportKind, TransportError)>),
+}
+
+impl fmt::Display for PeerSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PeerEnvelope(err) => write!(f, "peer envelope failed: {err}"),
+            Self::GroupEnvelope(err) => write!(f, "group envelope failed: {err}"),
+            Self::AllTransportsFailed(failures) => {
+                write!(f, "all {} transport(s) failed", failures.len())?;
+                let mut sep = ": ";
+                for (kind, err) in failures {
+                    write!(f, "{sep}{kind}: {err}")?;
+                    sep = ", ";
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl StdError for PeerSendError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::PeerEnvelope(err) => Some(err),
+            Self::GroupEnvelope(err) => Some(err),
+            Self::AllTransportsFailed(_) => None,
+        }
+    }
+}
+
+impl From<PeerEnvelopeError> for PeerSendError {
+    fn from(err: PeerEnvelopeError) -> Self {
+        Self::PeerEnvelope(err)
+    }
+}
+
+impl From<GroupEnvelopeError> for PeerSendError {
+    fn from(err: GroupEnvelopeError) -> Self {
+        Self::GroupEnvelope(err)
     }
 }
 
@@ -544,25 +602,90 @@ impl fmt::Debug for PeerIdentity {
 #[derive(Default)]
 pub struct PeerConfig {
     pub state: State,
+    pub trusted_peers: Vec<TrustedPeer>,
     pub group_keys: Vec<(GroupId, GroupKey)>,
+    pub http: Option<HttpConfig>,
+    pub iroh: Option<IrohConfig>,
+    pub transports: Vec<ConfiguredTransport>,
 }
 
 /// Live public-key namespace state.
 pub struct PeerNamespace {
     identity: PeerIdentity,
     state: State,
+    trusted_peers: RwLock<HashMap<PeerId, TrustedPeer>>,
     group_keys: RwLock<HashMap<(GroupId, GroupKeyId), GroupKey>>,
+    transports: Vec<PeerTransportEndpoint>,
+    iroh: Option<Arc<IrohTransport>>,
+}
+
+#[derive(Clone)]
+struct PeerTransportEndpoint {
+    kind: TransportKind,
+    transport: Arc<dyn Transport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerAddress {
+    Pairwise(PeerId),
+    Group(GroupId),
 }
 
 impl PeerNamespace {
-    pub fn open(identity: PeerIdentity, config: PeerConfig) -> Result<Self, GroupKeyError> {
+    pub async fn open(identity: PeerIdentity, config: PeerConfig) -> Result<Self, OpenError> {
+        let state = config.state.clone();
+        let state_store = state.store();
+        let mut transports = Vec::new();
+
+        if let Some(http_config) = config.http.clone() {
+            let http = Arc::new(
+                HttpTransport::new(http_config)
+                    .map_err(|err| OpenError::TransportInit(TransportKind::Http, Box::new(err)))?,
+            );
+            let transport: Arc<dyn Transport> = http;
+            transports.push(PeerTransportEndpoint {
+                kind: TransportKind::Http,
+                transport,
+            });
+        }
+
+        let iroh = open_peer_iroh_transport(&config, state_store.as_ref()).await?;
+        if let Some(iroh) = iroh.clone() {
+            let transport: Arc<dyn Transport> = iroh;
+            transports.push(PeerTransportEndpoint {
+                kind: TransportKind::Iroh,
+                transport,
+            });
+        }
+
+        for configured in &config.transports {
+            transports.push(PeerTransportEndpoint {
+                kind: configured.kind,
+                transport: Arc::clone(&configured.transport),
+            });
+        }
+
         let namespace = Self {
             identity,
-            state: config.state,
+            state,
+            trusted_peers: RwLock::new(HashMap::new()),
             group_keys: RwLock::new(HashMap::new()),
+            transports,
+            iroh,
         };
+        for trusted in config.trusted_peers {
+            trusted
+                .card
+                .validate()
+                .map_err(|err| OpenError::State(StateError::Corrupted(err.to_string())))?;
+            write_trusted_peers(&namespace.trusted_peers).insert(trusted.peer_id(), trusted);
+        }
         for (group, key) in config.group_keys {
-            namespace.add_group_key(group, key)?;
+            namespace
+                .add_group_key(group, key)
+                .map_err(|err| match err {
+                    GroupKeyError::State(err) => OpenError::State(err),
+                })?;
         }
         Ok(namespace)
     }
@@ -575,6 +698,18 @@ impl PeerNamespace {
     #[must_use]
     pub fn card(&self) -> PeerCard {
         self.identity.card()
+    }
+
+    #[cfg(feature = "iroh")]
+    #[must_use]
+    pub fn iroh_endpoint_addr(&self) -> Option<IrohEndpointAddr> {
+        self.iroh.as_ref().map(|iroh| iroh.endpoint_addr())
+    }
+
+    #[cfg(not(feature = "iroh"))]
+    #[must_use]
+    pub fn iroh_endpoint_addr(&self) -> Option<IrohEndpointAddr> {
+        None
     }
 
     pub fn add_group_key(&self, group: GroupId, key: GroupKey) -> Result<(), GroupKeyError> {
@@ -604,6 +739,38 @@ impl PeerNamespace {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    pub fn trust_peer(&self, peer: TrustedPeer) -> Result<(), TrustError> {
+        peer.card.validate()?;
+        self.state.store_trusted_peer(&peer)?;
+        let mut trusted = write_trusted_peers(&self.trusted_peers);
+        trusted.insert(peer.peer_id(), peer);
+        Ok(())
+    }
+
+    pub fn remove_trusted_peer(&self, peer: PeerId) -> Result<(), TrustError> {
+        self.state.remove_trusted_peer(peer)?;
+        let mut trusted = write_trusted_peers(&self.trusted_peers);
+        trusted.remove(&peer);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn trusted_peers(&self) -> Vec<PeerCard> {
+        let trusted = read_trusted_peers(&self.trusted_peers);
+        let mut peers: Vec<_> = trusted.values().map(|peer| peer.card.clone()).collect();
+        peers.sort_unstable_by_key(|peer| peer.peer_id);
+        peers
+    }
+
+    pub fn mailbox(&self, name: &str) -> Result<PeerMailbox<'_>, NameError> {
+        validate_name(name)?;
+        Ok(PeerMailbox {
+            namespace: self,
+            name: name.to_owned(),
+            dedup: std::sync::Mutex::new(Dedup::new(crate::dedup::DEFAULT_CAPACITY)),
+        })
     }
 
     pub fn seal_group_envelope(
@@ -672,6 +839,235 @@ impl PeerNamespace {
             })
             .collect()
     }
+
+    fn trusted_snapshot(&self) -> Vec<TrustedPeer> {
+        read_trusted_peers(&self.trusted_peers)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn group_ids(&self) -> Vec<GroupId> {
+        let keys = read_group_keys(&self.group_keys);
+        let mut ids: Vec<_> = keys.keys().map(|&(group, _)| group).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+}
+
+/// Public-key mailbox bound to one channel name.
+pub struct PeerMailbox<'a> {
+    namespace: &'a PeerNamespace,
+    name: String,
+    dedup: std::sync::Mutex<Dedup>,
+}
+
+impl PeerMailbox<'_> {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub async fn send_to_peers(
+        &self,
+        recipients: &[PeerCard],
+        payload: &[u8],
+    ) -> Result<PeerSendReport, PeerSendError> {
+        let envelope = PeerEnvelope::seal(
+            &self.namespace.identity,
+            ChannelKind::Mailbox,
+            &self.name,
+            payload,
+            recipients,
+        )?;
+        let bytes = envelope.to_bytes()?;
+        let addresses = recipients
+            .iter()
+            .map(|card| PeerAddress::Pairwise(card.peer_id))
+            .collect::<Vec<_>>();
+        self.send_bytes(&addresses, bytes).await
+    }
+
+    pub async fn send_to_group(
+        &self,
+        group: GroupId,
+        key_ids: &[GroupKeyId],
+        payload: &[u8],
+    ) -> Result<PeerSendReport, PeerSendError> {
+        let requested = key_ids
+            .iter()
+            .copied()
+            .map(|key_id| (group, key_id))
+            .collect::<Vec<_>>();
+        let envelope = self.namespace.seal_group_envelope(
+            ChannelKind::Mailbox,
+            &self.name,
+            payload,
+            &requested,
+        )?;
+        let bytes = envelope.to_bytes()?;
+        self.send_bytes(&[PeerAddress::Group(group)], bytes).await
+    }
+
+    pub async fn recv(&self) -> Result<PeerMailboxMessage, RecvError> {
+        self.recv_timeout(Duration::from_secs(DEFAULT_LONG_POLL_SECS.into()))
+            .await
+    }
+
+    pub async fn recv_timeout(&self, wait: Duration) -> Result<PeerMailboxMessage, RecvError> {
+        loop {
+            let mut tasks = JoinSet::new();
+            let addresses = self.recv_addresses();
+            for endpoint in &self.namespace.transports {
+                for address in &addresses {
+                    let transport = Arc::clone(&endpoint.transport);
+                    let id = peer_transport_id(
+                        endpoint.kind,
+                        *address,
+                        ChannelKind::Mailbox,
+                        &self.name,
+                    );
+                    let kind = endpoint.kind;
+                    let address = *address;
+                    tasks.spawn(async move { (kind, address, transport.recv(&id, wait).await) });
+                }
+            }
+
+            let mut received_transport_response = false;
+            while let Some(result) = tasks.join_next().await {
+                let Ok((kind, address, recv_result)) = result else {
+                    continue;
+                };
+                match recv_result {
+                    Ok(Some(bytes)) => {
+                        received_transport_response = true;
+                        if self
+                            .dedup
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .observe(&bytes)
+                        {
+                            continue;
+                        }
+                        if let Some(message) = self.open_message(kind, address, &bytes) {
+                            return Ok(message);
+                        }
+                    }
+                    Ok(None) => {
+                        received_transport_response = true;
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            if wait.is_zero() {
+                return Err(RecvError::Closed);
+            }
+            if !received_transport_response {
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+
+    async fn send_bytes(
+        &self,
+        addresses: &[PeerAddress],
+        bytes: Vec<u8>,
+    ) -> Result<PeerSendReport, PeerSendError> {
+        let mut tasks = JoinSet::new();
+        for endpoint in &self.namespace.transports {
+            for address in addresses {
+                let transport = Arc::clone(&endpoint.transport);
+                let id =
+                    peer_transport_id(endpoint.kind, *address, ChannelKind::Mailbox, &self.name);
+                let bytes = bytes.clone();
+                let kind = endpoint.kind;
+                tasks.spawn(async move { (kind, transport.send(&id, &bytes).await) });
+            }
+        }
+
+        let mut delivered = Vec::new();
+        let mut failed = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            if let Ok((kind, send_result)) = result {
+                match send_result {
+                    Ok(()) => delivered.push(kind),
+                    Err(err) => failed.push((kind, err)),
+                }
+            }
+        }
+
+        if delivered.is_empty() {
+            return Err(PeerSendError::AllTransportsFailed(failed));
+        }
+        Ok(PeerSendReport { delivered, failed })
+    }
+
+    fn recv_addresses(&self) -> Vec<PeerAddress> {
+        let mut addresses = Vec::with_capacity(1 + self.namespace.group_ids().len());
+        addresses.push(PeerAddress::Pairwise(self.namespace.peer_id()));
+        addresses.extend(
+            self.namespace
+                .group_ids()
+                .into_iter()
+                .map(PeerAddress::Group),
+        );
+        addresses
+    }
+
+    fn open_message(
+        &self,
+        via: TransportKind,
+        address: PeerAddress,
+        bytes: &[u8],
+    ) -> Option<PeerMailboxMessage> {
+        let trusted = self.namespace.trusted_snapshot();
+        match address {
+            PeerAddress::Pairwise(_) => PeerEnvelope::open_bytes_or_drop(
+                bytes,
+                &self.namespace.identity,
+                ChannelKind::Mailbox,
+                &self.name,
+                &trusted,
+            )
+            .map(|message| PeerMailboxMessage {
+                sender: message.sender,
+                signed_by: message.signed_by,
+                payload: message.payload,
+                via,
+                group: None,
+                key_id: None,
+            }),
+            PeerAddress::Group(_) => self
+                .namespace
+                .open_group_envelope_or_drop(bytes, ChannelKind::Mailbox, &self.name, &trusted)
+                .map(|message| PeerMailboxMessage {
+                    sender: message.sender,
+                    signed_by: message.signed_by,
+                    payload: message.payload,
+                    via,
+                    group: Some(message.group),
+                    key_id: Some(message.key_id),
+                }),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PeerSendReport {
+    pub delivered: Vec<TransportKind>,
+    pub failed: Vec<(TransportKind, TransportError)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerMailboxMessage {
+    pub sender: PeerId,
+    pub signed_by: VerifyingKey,
+    pub payload: Vec<u8>,
+    pub via: TransportKind,
+    pub group: Option<GroupId>,
+    pub key_id: Option<GroupKeyId>,
 }
 
 /// Public card exchanged out of band when pairing peers.
@@ -1522,6 +1918,93 @@ fn group_channel_kind_from_code(code: u8) -> Result<ChannelKind, GroupEnvelopeEr
     }
 }
 
+fn peer_transport_id(
+    transport: TransportKind,
+    address: PeerAddress,
+    kind: ChannelKind,
+    name: &str,
+) -> Vec<u8> {
+    let full = peer_address_id(address, kind, name);
+    if transport == TransportKind::Iroh {
+        full.to_vec()
+    } else {
+        full[..crate::kdf::CHANNEL_ID_LEN].to_vec()
+    }
+}
+
+fn peer_address_id(address: PeerAddress, kind: ChannelKind, name: &str) -> [u8; 32] {
+    let (domain, id): (&[u8], [u8; 32]) = match address {
+        PeerAddress::Pairwise(peer) => (b"enlace/v1/pkey/addr/pairwise", peer.to_bytes()),
+        PeerAddress::Group(group) => (b"enlace/v1/pkey/addr/group", group.to_bytes()),
+    };
+    let mut info = Vec::with_capacity(domain.len() + kind.as_bytes().len() + name.len());
+    info.extend_from_slice(domain);
+    info.extend_from_slice(kind.as_bytes());
+    info.extend_from_slice(name.as_bytes());
+    let mut out = [0u8; 32];
+    crypto::hkdf_sha256(&id, b"", &info, &mut out);
+    out
+}
+
+#[cfg(feature = "iroh")]
+async fn open_peer_iroh_transport(
+    config: &PeerConfig,
+    state: &dyn crate::state::StateStore,
+) -> Result<Option<Arc<IrohTransport>>, OpenError> {
+    if let Some(iroh_config) = &config.iroh {
+        let iroh = Arc::new(IrohTransport::new(iroh_config, state).await.map_err(
+            |err| match err {
+                crate::transports::IrohInitError::State(err) => OpenError::State(err),
+                crate::transports::IrohInitError::Transport(err) => {
+                    OpenError::TransportInit(TransportKind::Iroh, Box::new(err))
+                }
+            },
+        )?);
+        Ok(Some(iroh))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(not(feature = "iroh"))]
+#[allow(clippy::unused_async)]
+async fn open_peer_iroh_transport(
+    config: &PeerConfig,
+    _state: &dyn crate::state::StateStore,
+) -> Result<Option<Arc<IrohTransport>>, OpenError> {
+    if config.iroh.is_some() {
+        return Err(OpenError::TransportInit(
+            TransportKind::Iroh,
+            Box::new(PeerIrohFeatureDisabled),
+        ));
+    }
+    Ok(None)
+}
+
+#[cfg(not(feature = "iroh"))]
+#[derive(Debug)]
+struct PeerIrohFeatureDisabled;
+
+#[cfg(not(feature = "iroh"))]
+impl fmt::Display for PeerIrohFeatureDisabled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("iroh feature is not enabled")
+    }
+}
+
+#[cfg(not(feature = "iroh"))]
+impl StdError for PeerIrohFeatureDisabled {}
+
+fn write_trusted_peers<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn read_trusted_peers<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn write_group_keys<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     lock.write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2007,10 +2490,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn group_envelope_round_trips_for_trusted_sender() {
+    #[tokio::test]
+    async fn group_envelope_round_trips_for_trusted_sender() {
         let sender = identity(91, 92);
-        let receiver = PeerNamespace::open(identity(93, 94), PeerConfig::default()).unwrap();
+        let receiver = PeerNamespace::open(identity(93, 94), PeerConfig::default())
+            .await
+            .unwrap();
         let trusted = [TrustedPeer::try_from_card(sender.card()).unwrap()];
         let group = GroupId::from_bytes([1; GROUP_ID_LEN]);
         let key = GroupKey::new(GroupKeyId::from_bytes([2; GROUP_KEY_ID_LEN]), [3; 32]);
@@ -2081,10 +2566,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn group_envelope_ignores_missing_or_removed_keys() {
+    #[tokio::test]
+    async fn group_envelope_ignores_missing_or_removed_keys() {
         let sender = identity(97, 98);
-        let receiver = PeerNamespace::open(identity(99, 100), PeerConfig::default()).unwrap();
+        let receiver = PeerNamespace::open(identity(99, 100), PeerConfig::default())
+            .await
+            .unwrap();
         let trusted = [TrustedPeer::try_from_card(sender.card()).unwrap()];
         let group = GroupId::from_bytes([10; GROUP_ID_LEN]);
         let key = GroupKey::new(GroupKeyId::from_bytes([11; GROUP_KEY_ID_LEN]), [12; 32]);
@@ -2252,8 +2739,8 @@ mod tests {
         assert!(!rendered.contains("55, 55"));
     }
 
-    #[test]
-    fn peer_namespace_seeds_and_lists_group_keys() {
+    #[tokio::test]
+    async fn peer_namespace_seeds_and_lists_group_keys() {
         let group = GroupId::from_bytes([1; GROUP_ID_LEN]);
         let other_group = GroupId::from_bytes([2; GROUP_ID_LEN]);
         let first = GroupKey::new(GroupKeyId::from_bytes([3; GROUP_KEY_ID_LEN]), [4; 32]);
@@ -2271,6 +2758,7 @@ mod tests {
                 ..PeerConfig::default()
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(namespace.peer_id(), identity(80, 81).peer_id());
@@ -2279,13 +2767,15 @@ mod tests {
         assert_eq!(namespace.list_group_keys(other_group), vec![other.id]);
     }
 
-    #[test]
-    fn peer_namespace_adds_replaces_and_removes_group_keys() {
+    #[tokio::test]
+    async fn peer_namespace_adds_replaces_and_removes_group_keys() {
         let group = GroupId::from_bytes([9; GROUP_ID_LEN]);
         let key_id = GroupKeyId::from_bytes([10; GROUP_KEY_ID_LEN]);
         let first = GroupKey::new(key_id, [11; 32]);
         let replacement = GroupKey::new(key_id, [12; 32]);
-        let namespace = PeerNamespace::open(identity(82, 83), PeerConfig::default()).unwrap();
+        let namespace = PeerNamespace::open(identity(82, 83), PeerConfig::default())
+            .await
+            .unwrap();
 
         namespace.add_group_key(group, first).unwrap();
         namespace.add_group_key(group, replacement).unwrap();
@@ -2295,8 +2785,8 @@ mod tests {
         assert!(namespace.list_group_keys(group).is_empty());
     }
 
-    #[test]
-    fn peer_namespace_group_key_mutations_update_state() {
+    #[tokio::test]
+    async fn peer_namespace_group_key_mutations_update_state() {
         let state = State::memory();
         let group = GroupId::from_bytes([13; GROUP_ID_LEN]);
         let key = GroupKey::new(GroupKeyId::from_bytes([14; GROUP_KEY_ID_LEN]), [15; 32]);
@@ -2305,8 +2795,10 @@ mod tests {
             PeerConfig {
                 state: state.clone(),
                 group_keys: Vec::new(),
+                ..PeerConfig::default()
             },
         )
+        .await
         .unwrap();
 
         namespace.add_group_key(group, key.clone()).unwrap();
