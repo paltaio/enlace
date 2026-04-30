@@ -55,4 +55,3 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           cargo publish -p enlace
-          cargo publish -p enlace-relay

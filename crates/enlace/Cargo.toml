@@ -6,6 +6,7 @@ publish.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Encrypted mailbox and latest-value slot fan-out."
+readme = "README.md"
 
 [features]
 default = ["all-transports"]

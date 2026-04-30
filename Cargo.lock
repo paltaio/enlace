@@ -1038,7 +1038,7 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
 name = "enlace"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "enlace-agent"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -1094,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "enlace-relay"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -1108,7 +1108,7 @@ dependencies = [
 
 [[package]]
 name = "enlace-testkit"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "axum",
