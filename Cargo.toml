@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/enlace",
+    "crates/enlace-agent",
     "crates/enlace-relay",
     "crates/enlace-testkit",
 ]
@@ -23,7 +24,7 @@ strip = true
 [workspace.dependencies]
 anyhow = { version = "=1.0.102" }
 async-trait = { version = "=0.1.89" }
-axum = { version = "=0.8.9" }
+axum = { version = "=0.8.9", features = ["ws"] }
 axum-server = { version = "=0.8.0", default-features = false }
 base64 = { version = "=0.22.1", default-features = false, features = [
     "alloc",
