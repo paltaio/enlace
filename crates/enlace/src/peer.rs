@@ -9,8 +9,12 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::config::IrohEndpointAddr;
+use crate::state::{State, StateError};
 
 pub const PEER_ID_LEN: usize = 32;
+pub const GROUP_ID_LEN: usize = 32;
+pub const GROUP_KEY_ID_LEN: usize = 32;
+pub const GROUP_KEY_SECRET_LEN: usize = 32;
 
 /// Stable cryptographic peer identity derived from the signing public key.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -87,6 +91,20 @@ impl PeerIdentity {
         }
     }
 
+    pub fn load_or_generate(state: &State) -> Result<Self, StateError> {
+        if let Some(identity) = state.peer_identity()? {
+            return Ok(identity);
+        }
+
+        let identity = Self::generate();
+        identity.save(state)?;
+        Ok(identity)
+    }
+
+    pub fn save(&self, state: &State) -> Result<(), StateError> {
+        state.store_peer_identity(self)
+    }
+
     #[must_use]
     pub fn peer_id(&self) -> PeerId {
         PeerId::from_signing_key(&self.signing.verifying_key())
@@ -108,6 +126,94 @@ impl PeerIdentity {
             X25519PublicKey::from(&self.exchange).to_bytes(),
             Some(endpoint),
         )
+    }
+}
+
+/// Caller-defined public-key group address.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GroupId([u8; GROUP_ID_LEN]);
+
+impl GroupId {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; GROUP_ID_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; GROUP_ID_LEN] {
+        self.0
+    }
+}
+
+impl fmt::Debug for GroupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GroupId({self})")
+    }
+}
+
+impl fmt::Display for GroupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Caller-defined group key id.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GroupKeyId([u8; GROUP_KEY_ID_LEN]);
+
+impl GroupKeyId {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; GROUP_KEY_ID_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; GROUP_KEY_ID_LEN] {
+        self.0
+    }
+}
+
+impl fmt::Debug for GroupKeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GroupKeyId({self})")
+    }
+}
+
+impl fmt::Display for GroupKeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Symmetric key material supplied by caller code for group mode.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GroupKey {
+    pub id: GroupKeyId,
+    pub secret: Zeroizing<[u8; GROUP_KEY_SECRET_LEN]>,
+}
+
+impl GroupKey {
+    #[must_use]
+    pub fn new(id: GroupKeyId, secret: [u8; GROUP_KEY_SECRET_LEN]) -> Self {
+        Self {
+            id,
+            secret: Zeroizing::new(secret),
+        }
+    }
+}
+
+impl fmt::Debug for GroupKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupKey")
+            .field("id", &self.id)
+            .field("secret", &"<redacted>")
+            .finish()
     }
 }
 
@@ -267,5 +373,37 @@ mod tests {
         assert!(!rendered.contains("11, 11"));
         assert!(!rendered.contains("22, 22"));
         assert!(!rendered.contains("33, 33"));
+    }
+
+    #[test]
+    fn group_ids_round_trip_and_format_hex() {
+        let group = GroupId::from_bytes([0x12; GROUP_ID_LEN]);
+        let key = GroupKeyId::from_bytes([0x34; GROUP_KEY_ID_LEN]);
+
+        assert_eq!(GroupId::from_bytes(group.to_bytes()), group);
+        assert_eq!(GroupKeyId::from_bytes(key.to_bytes()), key);
+        assert_eq!(group.to_string().len(), GROUP_ID_LEN * 2);
+        assert_eq!(key.to_string().len(), GROUP_KEY_ID_LEN * 2);
+    }
+
+    #[test]
+    fn group_key_debug_redacts_secret() {
+        let key = GroupKey::new(GroupKeyId::from_bytes([1; GROUP_KEY_ID_LEN]), [0x55; 32]);
+        let rendered = format!("{key:?}");
+
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("55, 55"));
+    }
+
+    #[test]
+    fn identity_saves_through_state() {
+        let state = State::memory();
+        let identity = identity(9, 10);
+
+        identity.save(&state).unwrap();
+        let loaded = PeerIdentity::load_or_generate(&state).unwrap();
+
+        assert_eq!(loaded.peer_id(), identity.peer_id());
+        assert_eq!(loaded.card(), identity.card());
     }
 }
