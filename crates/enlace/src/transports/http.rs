@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use reqwest::header::HeaderMap;
 use reqwest::{Client, StatusCode, Url};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -80,15 +81,14 @@ impl HttpTransport {
             .await
             .map_err(map_reqwest_error)?;
 
-        match response.status() {
-            StatusCode::OK => {
-                let version = parse_version(response.headers())?;
-                let body = response.bytes().await.map_err(map_reqwest_error)?.to_vec();
-                Ok(Some((version, body)))
-            }
-            StatusCode::NO_CONTENT => Ok(None),
-            status => Err(map_status(status)),
-        }
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = if status == StatusCode::OK {
+            response.bytes().await.map_err(map_reqwest_error)?.to_vec()
+        } else {
+            Vec::new()
+        };
+        decode_slot_get_response(status, &headers, body)
     }
 }
 
@@ -107,10 +107,7 @@ impl MailboxTransport for HttpTransport {
             .await
             .map_err(map_reqwest_error)?;
 
-        match response.status() {
-            StatusCode::NO_CONTENT => Ok(()),
-            status => Err(map_status(status)),
-        }
+        decode_empty_response(response.status())
     }
 
     async fn recv(&self, id: &[u8], wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
@@ -124,15 +121,13 @@ impl MailboxTransport for HttpTransport {
             .await
             .map_err(map_reqwest_error)?;
 
-        match response.status() {
-            StatusCode::OK => response
-                .bytes()
-                .await
-                .map(|bytes| Some(bytes.to_vec()))
-                .map_err(map_reqwest_error),
-            StatusCode::NO_CONTENT => Ok(None),
-            status => Err(map_status(status)),
-        }
+        let status = response.status();
+        let body = if status == StatusCode::OK {
+            response.bytes().await.map_err(map_reqwest_error)?.to_vec()
+        } else {
+            Vec::new()
+        };
+        decode_mailbox_recv_response(status, body)
     }
 }
 
@@ -152,10 +147,7 @@ impl SlotTransport for HttpTransport {
             .await
             .map_err(map_reqwest_error)?;
 
-        match response.status() {
-            StatusCode::NO_CONTENT => Ok(()),
-            status => Err(map_status(status)),
-        }
+        decode_empty_response(response.status())
     }
 
     async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
@@ -200,7 +192,40 @@ impl SlotTransport for HttpTransport {
     }
 }
 
-fn parse_version(headers: &reqwest::header::HeaderMap) -> Result<u64, TransportError> {
+pub(crate) fn decode_empty_response(status: StatusCode) -> Result<(), TransportError> {
+    match status {
+        StatusCode::NO_CONTENT => Ok(()),
+        status => Err(map_status(status)),
+    }
+}
+
+pub(crate) fn decode_mailbox_recv_response(
+    status: StatusCode,
+    body: Vec<u8>,
+) -> Result<Option<Vec<u8>>, TransportError> {
+    match status {
+        StatusCode::OK => Ok(Some(body)),
+        StatusCode::NO_CONTENT => Ok(None),
+        status => Err(map_status(status)),
+    }
+}
+
+pub(crate) fn decode_slot_get_response(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: Vec<u8>,
+) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
+    match status {
+        StatusCode::OK => {
+            let version = parse_version(headers)?;
+            Ok(Some((version, body)))
+        }
+        StatusCode::NO_CONTENT => Ok(None),
+        status => Err(map_status(status)),
+    }
+}
+
+fn parse_version(headers: &HeaderMap) -> Result<u64, TransportError> {
     headers
         .get(VERSION_HEADER)
         .and_then(|value| value.to_str().ok())

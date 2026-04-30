@@ -18,4 +18,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "http_relay_client"
+path = "fuzz_targets/http_relay_client.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

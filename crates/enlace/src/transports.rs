@@ -16,6 +16,10 @@ mod pkarr;
 
 pub use dht::DhtTransport;
 pub use http::HttpTransport;
+#[cfg(feature = "fuzzing")]
+pub(crate) use http::{
+    decode_empty_response, decode_mailbox_recv_response, decode_slot_get_response,
+};
 #[cfg(feature = "iroh")]
 pub(crate) use iroh::IrohInitError;
 #[cfg(feature = "iroh")]
