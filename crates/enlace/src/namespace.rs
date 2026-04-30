@@ -7,7 +7,9 @@ use crate::kdf::NameError;
 use crate::mailbox::Mailbox;
 use crate::slot::Slot;
 use crate::state::InMemoryStateStore;
-use crate::transports::{DhtTransport, HealthReport, HttpTransport, IrohTransport, PkarrTransport};
+use crate::transports::{
+    DhtTransport, HealthReport, HealthTracker, HttpTransport, IrohTransport, PkarrTransport,
+};
 
 #[derive(Clone)]
 pub struct Namespace {
@@ -15,7 +17,6 @@ pub struct Namespace {
 }
 
 pub(crate) struct NamespaceInner {
-    pub(crate) config: Config,
     pub(crate) coordinator: Arc<Coordinator>,
     pub(crate) http: Option<Arc<HttpTransport>>,
     pub(crate) pkarr: Option<Arc<PkarrTransport>>,
@@ -86,19 +87,11 @@ impl Namespace {
                 transport: Arc::clone(&configured.transport),
             });
         }
-        let coordinator = Arc::new(Coordinator::new(
-            seed,
-            transports,
-            config.signing.clone(),
-            config.trusted.clone(),
-            config.dedup_buffer,
-            config.max_plaintext_bytes,
-            state,
-        ));
+        let health = Arc::new(HealthTracker::from_config(&config));
+        let coordinator = Arc::new(Coordinator::new(seed, transports, &config, state, health));
 
         Ok(Self {
             inner: Arc::new(NamespaceInner {
-                config,
                 coordinator,
                 http,
                 pkarr,
@@ -138,7 +131,7 @@ impl Namespace {
 
     #[must_use]
     pub fn health(&self) -> HealthReport {
-        HealthReport::from_config(&self.inner.config)
+        self.inner.coordinator.health()
     }
 }
 

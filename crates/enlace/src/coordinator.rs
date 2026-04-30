@@ -8,16 +8,17 @@ use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 use zeroize::Zeroizing;
 
+use crate::config::Config;
 use crate::crypto::{self, SIG_LEN};
 use crate::dedup::Dedup;
-use crate::error::{RecvError, SealError, SendError, SlotError};
+use crate::error::{RecvError, SealError, SendError, SlotError, TransportError};
 use crate::kdf::{
     ChannelKind, NameError, TransportKind, channel_aead_key, channel_id, iroh_topic_id,
 };
 use crate::mailbox::{RecvMessage, SendReport};
 use crate::slot::{PutReport, SlotValue, SlotWatch};
 use crate::state::StateStore;
-use crate::transports::Transport;
+use crate::transports::{HealthReport, HealthTracker, Transport};
 
 const WATCH_BUFFER: usize = 64;
 
@@ -35,6 +36,7 @@ pub(crate) struct Coordinator {
     dedup_buffer: usize,
     max_plaintext_bytes: usize,
     state: Arc<dyn StateStore>,
+    health: Arc<HealthTracker>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,25 +57,28 @@ impl Coordinator {
     pub(crate) fn new(
         seed: &[u8; 32],
         transports: Vec<TransportEndpoint>,
-        signing: Option<SigningKey>,
-        trusted: Vec<VerifyingKey>,
-        dedup_buffer: usize,
-        max_plaintext_bytes: usize,
+        config: &Config,
         state: Arc<dyn StateStore>,
+        health: Arc<HealthTracker>,
     ) -> Self {
         Self {
             seed: Zeroizing::new(*seed),
             transports,
-            signing,
-            trusted,
-            dedup_buffer,
-            max_plaintext_bytes,
+            signing: config.signing.clone(),
+            trusted: config.trusted.clone(),
+            dedup_buffer: config.dedup_buffer,
+            max_plaintext_bytes: config.max_plaintext_bytes,
             state,
+            health,
         }
     }
 
     pub(crate) fn dedup_buffer(&self) -> usize {
         self.dedup_buffer
+    }
+
+    pub(crate) fn health(&self) -> HealthReport {
+        self.health.snapshot()
     }
 
     pub(crate) async fn mailbox_send(
@@ -97,6 +102,7 @@ impl Coordinator {
         let mut failed = Vec::new();
         while let Some(result) = tasks.join_next().await {
             if let Ok((kind, send_result)) = result {
+                self.record_transport_result(kind, &send_result);
                 match send_result {
                     Ok(()) => delivered.push(kind),
                     Err(err) => failed.push((kind, err)),
@@ -132,6 +138,7 @@ impl Coordinator {
                 let Ok(recv_result) = result else {
                     continue;
                 };
+                self.record_transport_result(recv_result.0, &recv_result.1);
                 match recv_result {
                     (kind, Ok(Some(sealed))) => {
                         received_transport_response = true;
@@ -192,6 +199,7 @@ impl Coordinator {
         let mut failed = Vec::new();
         while let Some(result) = tasks.join_next().await {
             if let Ok((kind, put_result)) = result {
+                self.record_transport_result(kind, &put_result);
                 match put_result {
                     Ok(()) => stored.push(kind),
                     Err(err) => failed.push((kind, err)),
@@ -227,6 +235,7 @@ impl Coordinator {
             let Ok(get_result) = result else {
                 continue;
             };
+            self.record_transport_result(get_result.0, &get_result.1);
             match get_result {
                 (_, Ok(None)) => ok_count += 1,
                 (kind, Ok(Some((_server_version, sealed)))) => {
@@ -279,6 +288,7 @@ impl Coordinator {
 
             tokio::spawn(async move {
                 while let Some(item) = stream.next().await {
+                    coordinator.record_transport_result(kind, &item);
                     let Ok((_server_version, sealed)) = item else {
                         continue;
                     };
@@ -374,6 +384,21 @@ impl Coordinator {
     #[cfg(feature = "fuzzing")]
     pub(crate) fn open_for_fuzz(&self, kind: ChannelKind, name: &str, sealed: &[u8]) {
         let _ = self.open(kind, name, sealed);
+    }
+
+    fn record_transport_result<T>(&self, kind: TransportKind, result: &Result<T, TransportError>) {
+        match result {
+            Ok(_) | Err(TransportError::Stale | TransportError::BodyTooLarge) => {
+                self.health.record_success(kind);
+            }
+            Err(TransportError::Unsupported) => {}
+            Err(
+                TransportError::Network(_)
+                | TransportError::Auth
+                | TransportError::Timeout
+                | TransportError::Other(_),
+            ) => self.health.record_failure(kind),
+        }
     }
 }
 

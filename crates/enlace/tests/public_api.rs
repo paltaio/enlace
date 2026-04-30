@@ -1,7 +1,7 @@
 use ed25519_dalek::SigningKey;
 use enlace::{
-    Config, DhtConfig, HttpConfig, NameError, Namespace, OpenError, PkarrConfig, SendError,
-    TransportError, TransportKind,
+    Config, DhtConfig, HealthState, HttpConfig, NameError, Namespace, OpenError, PkarrConfig,
+    SendError, TransportError, TransportKind,
 };
 use url::Url;
 
@@ -70,6 +70,8 @@ async fn health_reflects_configured_transports() {
     let health = namespace.health();
     assert_eq!(health.transports.len(), 1);
     assert_eq!(health.transports[0].kind, TransportKind::Http);
+    assert_eq!(health.transports[0].state, HealthState::Healthy);
+    assert_eq!(health.transports[0].endpoints.len(), 1);
 }
 
 #[tokio::test]
