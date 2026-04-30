@@ -1,0 +1,15 @@
+[Unit]
+Description=Enlace Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/enlace-agent --config /etc/enlace/agent.toml
+DynamicUser=yes
+StateDirectory=enlace-agent
+RuntimeDirectory=enlace
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

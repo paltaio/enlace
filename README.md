@@ -9,6 +9,7 @@ transports.
 ## Crates
 
 - `enlace`: library API
+- `enlace-agent`: local daemon for non-Rust clients
 - `enlace-relay`: HTTP relay server
 - `enlace-testkit`: in-memory, lossy, and delayed test transports
 
@@ -129,6 +130,62 @@ fn peer_config(transport: InMemoryTransport, trusted_peers: Vec<TrustedPeer>) ->
     }
 }
 ```
+
+## Agent Daemon
+
+`enlace-agent` exposes the public-key peer API to local clients over WebSocket
+and Unix socket JSON.
+
+Build a release binary:
+
+```sh
+cargo build -p enlace-agent --release --all-features --locked
+```
+
+Example host A config at `/etc/enlace/agent.toml`:
+
+```toml
+seed_file = "/etc/enlace/seed"
+token_file = "/etc/enlace/token"
+listen_ws = "127.0.0.1:3000"
+listen_unix = "/run/enlace/agent.sock"
+data_dir = "/var/lib/enlace-agent"
+transports = ["http"]
+relay = "https://relay.example.com"
+```
+
+Host B uses its own seed and a different local port:
+
+```toml
+seed_file = "/etc/enlace/seed"
+token_file = "/etc/enlace/token"
+listen_ws = "127.0.0.1:3001"
+data_dir = "/var/lib/enlace-agent"
+transports = ["http"]
+relay = "https://relay.example.com"
+```
+
+Start each host:
+
+```sh
+enlace-agent --config /etc/enlace/agent.toml
+```
+
+Pair hosts by exporting each local card and adding it on the other host:
+
+```json
+{"id":"card","type":"export_card"}
+{"id":"add","type":"add_peer","card":"<peer-card-from-other-host>"}
+```
+
+Client messages stay opaque base64 payloads:
+
+```json
+{"id":"sub","type":"subscribe","channel":"default"}
+{"id":"send","type":"send","to":"<peer-id>","channel":"default","payload":"aGVsbG8="}
+```
+
+The systemd unit template is in `packaging/systemd/enlace-agent.service`.
 
 ## Relay
 

@@ -37,6 +37,10 @@ tokio = { version = "=1.52.1", default-features = false, features = [
     "time",
 ] }
 futures-core = { version = "=0.3.32", default-features = false }
+futures-util = { version = "=0.3.32", default-features = false, features = [
+    "sink",
+    "std",
+] }
 clap = { version = "=4.6.1", default-features = false, features = [
     "derive",
     "std",
@@ -75,6 +79,14 @@ sled = { version = "=0.34.7" }
 subtle = { version = "=2.6.1", default-features = false }
 tokio-stream = { version = "=0.1.18", default-features = false, features = [
     "sync",
+] }
+tokio-tungstenite = { version = "=0.29.0", default-features = false, features = [
+    "connect",
+] }
+toml = { version = "=1.1.2", default-features = false, features = [
+    "parse",
+    "serde",
+    "std",
 ] }
 tower = { version = "=0.5.3" }
 tracing = { version = "=0.1.44", default-features = false }
