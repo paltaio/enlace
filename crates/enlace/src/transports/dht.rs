@@ -70,9 +70,9 @@ impl DhtTransport {
         }
     }
 
-    fn get_latest(&self, id: &[u8; 16], after: Option<i64>) -> Option<MutableItem> {
+    fn get_latest(&self, id: &DhtSlotId, after: Option<i64>) -> Option<MutableItem> {
         let mut best: Option<MutableItem> = None;
-        for item in self.dht.get_mutable(&self.public_key, Some(id), after) {
+        for item in self.dht.get_mutable(&id.public_key, Some(&id.salt), after) {
             if best
                 .as_ref()
                 .is_none_or(|current| mutable_item_is_newer(&item, current))
@@ -103,11 +103,10 @@ impl DhtTransport {
 
     async fn slot_get_since(
         &self,
-        id: &[u8; 16],
+        id: DhtSlotId,
         since: u64,
     ) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
         let transport = self.clone();
-        let id = *id;
         let after = u64_to_seq(since)?;
         run_blocking(move || {
             let Some(current) = transport.get_latest(&id, Some(after)) else {
@@ -176,7 +175,7 @@ impl MailboxTransport for DhtTransport {
 #[async_trait]
 impl SlotTransport for DhtTransport {
     async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
-        let id = dht_channel_id(id)?;
+        let id = self.dht_slot_id(id)?;
         ensure_value_fits(sealed)?;
         let transport = self.clone();
         let sealed = sealed.to_vec();
@@ -187,7 +186,7 @@ impl SlotTransport for DhtTransport {
                 return Err(TransportError::Stale);
             }
             let cas = current.as_ref().map(MutableItem::seq);
-            let item = MutableItem::new(transport.signing_key.clone(), &sealed, seq, Some(&id));
+            let item = MutableItem::new(id.signing_key, &sealed, seq, Some(&id.salt));
             transport
                 .dht
                 .put_mutable(item, cas)
@@ -200,14 +199,14 @@ impl SlotTransport for DhtTransport {
     }
 
     async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
-        let id = dht_channel_id(id)?;
-        self.slot_get_since(&id, 0).await
+        let id = self.dht_slot_id(id)?;
+        self.slot_get_since(id, 0).await
     }
 
     fn watch(&self, id: &[u8], since: u64) -> SlotWatchStream {
-        let Ok(id) = dht_channel_id(id) else {
+        let Ok(id) = self.dht_slot_id(id) else {
             return Box::pin(tokio_stream::iter([Err(TransportError::Network(
-                "DHT channel id must be 16 bytes".to_owned(),
+                "DHT channel id must be 16 or 32 bytes".to_owned(),
             ))]));
         };
         let transport = self.clone();
@@ -216,7 +215,7 @@ impl SlotTransport for DhtTransport {
         tokio::spawn(async move {
             let mut since = since;
             loop {
-                match transport.slot_get_since(&id, since).await {
+                match transport.slot_get_since(id.clone(), since).await {
                     Ok(Some((version, value))) => {
                         since = version;
                         if tx.send(Ok((version, value))).await.is_err() {
@@ -238,6 +237,44 @@ impl SlotTransport for DhtTransport {
     }
 }
 
+#[derive(Clone)]
+struct DhtSlotId {
+    signing_key: SigningKey,
+    public_key: [u8; 32],
+    salt: [u8; 16],
+}
+
+impl DhtTransport {
+    fn dht_slot_id(&self, id: &[u8]) -> Result<DhtSlotId, TransportError> {
+        match id.len() {
+            16 => {
+                let salt: [u8; 16] = id.try_into().map_err(|_| {
+                    TransportError::Network("DHT channel id must be 16 bytes".to_owned())
+                })?;
+                Ok(DhtSlotId {
+                    signing_key: self.signing_key.clone(),
+                    public_key: self.public_key,
+                    salt,
+                })
+            }
+            32 => {
+                let seed: [u8; 32] = id.try_into().map_err(|_| {
+                    TransportError::Network("DHT address id must be 32 bytes".to_owned())
+                })?;
+                let signing_key = dht_signing_key(&seed);
+                Ok(DhtSlotId {
+                    public_key: signing_key.verifying_key().to_bytes(),
+                    signing_key,
+                    salt: [0; 16],
+                })
+            }
+            _ => Err(TransportError::Network(
+                "DHT channel id must be 16 or 32 bytes".to_owned(),
+            )),
+        }
+    }
+}
+
 async fn run_blocking<T, F>(f: F) -> Result<T, TransportError>
 where
     T: Send + 'static,
@@ -251,11 +288,6 @@ where
 fn dht_signing_key(seed: &[u8; 32]) -> SigningKey {
     let key = derive_key32(seed, b"enlace/v1/key/dht-id");
     SigningKey::from_bytes(&key)
-}
-
-fn dht_channel_id(id: &[u8]) -> Result<[u8; 16], TransportError> {
-    id.try_into()
-        .map_err(|_| TransportError::Network("DHT channel id must be 16 bytes".to_owned()))
 }
 
 fn ensure_value_fits(value: &[u8]) -> Result<(), TransportError> {
@@ -422,6 +454,18 @@ mod tests {
         assert!(mutable_item_is_newer(&newer_seq, &older));
         assert!(mutable_item_is_newer(&newer_value, &newer_seq));
         assert!(!mutable_item_is_newer(&older, &newer_value));
+    }
+
+    #[test]
+    fn slot_id_accepts_shared_seed_and_public_key_addresses() {
+        let transport = DhtTransport::new(&[1; 32], &DhtConfig::default()).unwrap();
+
+        let shared = transport.dht_slot_id(&[2; 16]).unwrap();
+        let public = transport.dht_slot_id(&[3; 32]).unwrap();
+
+        assert_eq!(shared.salt, [2; 16]);
+        assert_eq!(public.salt, [0; 16]);
+        assert_ne!(shared.public_key, public.public_key);
     }
 
     #[test]

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use enlace::{
     Config, ConfiguredTransport, GroupId, GroupKey, GroupKeyId, MailboxTransport, Namespace,
-    PeerConfig, PeerIdentity, PeerNamespace, SlotTransport, TransportError, TransportKind,
-    TrustedPeer,
+    PeerConfig, PeerIdentity, PeerNamespace, PeerSlotScope, SlotTransport, TransportError,
+    TransportKind, TrustedPeer,
 };
 use enlace_testkit::{DelayingTransport, InMemoryTransport, LossyTransport};
 use tokio_stream::StreamExt;
@@ -158,6 +158,13 @@ where
     }
 }
 
+fn peer_namespace_config_many(transports: Vec<ConfiguredTransport>) -> PeerConfig {
+    PeerConfig {
+        transports,
+        ..PeerConfig::default()
+    }
+}
+
 #[tokio::test]
 async fn namespaces_exchange_mailbox_through_in_memory_transport() {
     let transport = InMemoryTransport::new();
@@ -301,6 +308,198 @@ async fn peer_namespaces_exchange_group_mailbox() {
     assert_eq!(message.via, TransportKind::Http);
     assert_eq!(message.group, Some(group));
     assert_eq!(message.key_id, Some(key.id));
+}
+
+#[tokio::test]
+async fn peer_namespaces_exchange_pairwise_slot() {
+    let transport = InMemoryTransport::new();
+    let alice_identity = PeerIdentity::generate();
+    let bob_identity = PeerIdentity::generate();
+    let alice_card = alice_identity.card();
+    let bob_card = bob_identity.card();
+    let alice = PeerNamespace::open(
+        alice_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(bob_card.clone()).unwrap()],
+            ..peer_namespace_config(transport.clone())
+        },
+    )
+    .await
+    .unwrap();
+    let bob = PeerNamespace::open(
+        bob_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(alice_card.clone()).unwrap()],
+            ..peer_namespace_config(transport)
+        },
+    )
+    .await
+    .unwrap();
+
+    let report = alice
+        .slot("status")
+        .unwrap()
+        .put_for_peers(std::slice::from_ref(&bob_card), b"ready")
+        .await
+        .unwrap();
+    assert_eq!(report.version, 1);
+
+    let value = bob
+        .slot("status")
+        .unwrap()
+        .get_pairwise()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value.version, 1);
+    assert_eq!(value.sender, alice.peer_id());
+    assert_eq!(value.signed_by, alice_card.signing_key);
+    assert_eq!(value.payload, b"ready");
+    assert_eq!(value.via, TransportKind::Http);
+    assert_eq!(value.scope, PeerSlotScope::Pairwise);
+    assert_eq!(value.key_id, None);
+}
+
+#[tokio::test]
+async fn peer_namespaces_exchange_publisher_and_group_slots() {
+    let transport = InMemoryTransport::new();
+    let alice_identity = PeerIdentity::generate();
+    let bob_identity = PeerIdentity::generate();
+    let alice_card = alice_identity.card();
+    let bob_card = bob_identity.card();
+    let group = GroupId::from_bytes([51; enlace::GROUP_ID_LEN]);
+    let key = GroupKey::new(
+        GroupKeyId::from_bytes([52; enlace::GROUP_KEY_ID_LEN]),
+        [53; enlace::GROUP_KEY_SECRET_LEN],
+    );
+    let alice = PeerNamespace::open(
+        alice_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(bob_card.clone()).unwrap()],
+            group_keys: vec![(group, key.clone())],
+            ..peer_namespace_config(transport.clone())
+        },
+    )
+    .await
+    .unwrap();
+    let bob = PeerNamespace::open(
+        bob_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(alice_card.clone()).unwrap()],
+            group_keys: vec![(group, key.clone())],
+            ..peer_namespace_config(transport)
+        },
+    )
+    .await
+    .unwrap();
+
+    alice
+        .slot("profile")
+        .unwrap()
+        .put_publisher_for_peers(std::slice::from_ref(&bob_card), b"pub-v1")
+        .await
+        .unwrap();
+    alice
+        .slot("profile")
+        .unwrap()
+        .put_group(group, &[key.id], b"group-v1")
+        .await
+        .unwrap();
+
+    let publisher = bob
+        .slot("profile")
+        .unwrap()
+        .get_publisher(alice.peer_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(publisher.payload, b"pub-v1");
+    assert_eq!(
+        publisher.scope,
+        PeerSlotScope::Publisher {
+            publisher: alice.peer_id()
+        }
+    );
+    assert_eq!(publisher.key_id, None);
+
+    let group_value = bob
+        .slot("profile")
+        .unwrap()
+        .get_group(group)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(group_value.payload, b"group-v1");
+    assert_eq!(group_value.scope, PeerSlotScope::Group { group });
+    assert_eq!(group_value.key_id, Some(key.id));
+}
+
+#[tokio::test]
+async fn peer_slot_get_and_watch_select_latest_across_slot_transports() {
+    let http = InMemoryTransport::new();
+    let dht = InMemoryTransport::new();
+    let pkarr = InMemoryTransport::new();
+    let alice_identity = PeerIdentity::generate();
+    let bob_identity = PeerIdentity::generate();
+    let alice_card = alice_identity.card();
+    let bob_card = bob_identity.card();
+    let transports = |http: InMemoryTransport, dht: InMemoryTransport, pkarr: InMemoryTransport| {
+        peer_namespace_config_many(vec![
+            ConfiguredTransport::new(TransportKind::Http, Arc::new(http)),
+            ConfiguredTransport::new(TransportKind::Dht, Arc::new(dht)),
+            ConfiguredTransport::new(TransportKind::Pkarr, Arc::new(pkarr)),
+        ])
+    };
+    let alice = PeerNamespace::open(
+        alice_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(bob_card.clone()).unwrap()],
+            ..transports(http.clone(), dht.clone(), pkarr.clone())
+        },
+    )
+    .await
+    .unwrap();
+    let bob = PeerNamespace::open(
+        bob_identity,
+        PeerConfig {
+            trusted_peers: vec![TrustedPeer::try_from_card(alice_card).unwrap()],
+            ..transports(http, dht, pkarr)
+        },
+    )
+    .await
+    .unwrap();
+
+    let bob_slot = bob.slot("state").unwrap();
+    let mut watch = bob_slot.watch_pairwise().unwrap();
+    alice
+        .slot("state")
+        .unwrap()
+        .put_for_peers(std::slice::from_ref(&bob_card), b"v1")
+        .await
+        .unwrap();
+    alice
+        .slot("state")
+        .unwrap()
+        .put_for_peers(std::slice::from_ref(&bob_card), b"v2")
+        .await
+        .unwrap();
+
+    let value = bob_slot.get_pairwise().await.unwrap().unwrap();
+    assert_eq!(value.version, 2);
+    assert_eq!(value.payload, b"v2");
+
+    let mut watched = tokio::time::timeout(Duration::from_secs(1), watch.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if watched.version == 1 {
+        watched = tokio::time::timeout(Duration::from_secs(1), watch.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(watched.version, 2);
+    assert_eq!(watched.payload, b"v2");
 }
 
 #[tokio::test]

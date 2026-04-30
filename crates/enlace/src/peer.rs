@@ -17,20 +17,23 @@ use chacha20poly1305::{
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
+use tokio_stream::StreamExt;
 use url::Url;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::config::{
-    ConfiguredTransport, DEFAULT_LONG_POLL_SECS, HttpConfig, IrohConfig, IrohEndpointAddr,
+    ConfiguredTransport, DEFAULT_LONG_POLL_SECS, DhtConfig, HttpConfig, IrohConfig,
+    IrohEndpointAddr, PkarrConfig,
 };
 use crate::crypto::{self, AEAD_KEY_LEN, NONCE_LEN, SIG_LEN};
 use crate::dedup::Dedup;
 use crate::error::{OpenError, RecvError, TransportError};
 use crate::kdf::{ChannelKind, NameError, TransportKind, validate_name};
 use crate::state::{State, StateError};
-use crate::transports::{HttpTransport, IrohTransport, Transport};
+use crate::transports::{DhtTransport, HttpTransport, IrohTransport, PkarrTransport, Transport};
 
 pub const PEER_ID_LEN: usize = 32;
 pub const GROUP_ID_LEN: usize = 32;
@@ -40,6 +43,8 @@ const PEER_CARD_EXPORT_PREFIX: &str = "enlace-peer-card-v1:";
 const PEER_CARD_RECORD_VERSION: u8 = 1;
 const PEER_ENVELOPE_RECORD_VERSION: u8 = 1;
 const GROUP_ENVELOPE_RECORD_VERSION: u8 = 1;
+const PEER_SLOT_INNER_VERSION: u8 = 1;
+const PEER_SLOT_WATCH_BUFFER: usize = 64;
 
 /// Failure modes for public-key peer envelopes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +220,70 @@ impl From<PeerEnvelopeError> for PeerSendError {
 impl From<GroupEnvelopeError> for PeerSendError {
     fn from(err: GroupEnvelopeError) -> Self {
         Self::GroupEnvelope(err)
+    }
+}
+
+/// Failure modes for public-key slot operations.
+#[derive(Debug)]
+pub enum PeerSlotError {
+    /// Pairwise envelope creation failed.
+    PeerEnvelope(PeerEnvelopeError),
+    /// Group envelope creation failed.
+    GroupEnvelope(GroupEnvelopeError),
+    /// Slot payload failed to encode or decode.
+    MsgpackFailed,
+    /// State storage failed.
+    State(StateError),
+    /// Every configured transport rejected the operation.
+    AllTransportsFailed(Vec<(TransportKind, TransportError)>),
+}
+
+impl fmt::Display for PeerSlotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PeerEnvelope(err) => write!(f, "peer envelope failed: {err}"),
+            Self::GroupEnvelope(err) => write!(f, "group envelope failed: {err}"),
+            Self::MsgpackFailed => f.write_str("peer slot payload is malformed"),
+            Self::State(err) => write!(f, "state store error: {err}"),
+            Self::AllTransportsFailed(failures) => {
+                write!(f, "all {} transport(s) failed", failures.len())?;
+                let mut sep = ": ";
+                for (kind, err) in failures {
+                    write!(f, "{sep}{kind}: {err}")?;
+                    sep = ", ";
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl StdError for PeerSlotError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::PeerEnvelope(err) => Some(err),
+            Self::GroupEnvelope(err) => Some(err),
+            Self::State(err) => Some(err),
+            Self::MsgpackFailed | Self::AllTransportsFailed(_) => None,
+        }
+    }
+}
+
+impl From<PeerEnvelopeError> for PeerSlotError {
+    fn from(err: PeerEnvelopeError) -> Self {
+        Self::PeerEnvelope(err)
+    }
+}
+
+impl From<GroupEnvelopeError> for PeerSlotError {
+    fn from(err: GroupEnvelopeError) -> Self {
+        Self::GroupEnvelope(err)
+    }
+}
+
+impl From<StateError> for PeerSlotError {
+    fn from(err: StateError) -> Self {
+        Self::State(err)
     }
 }
 
@@ -605,16 +674,18 @@ pub struct PeerConfig {
     pub trusted_peers: Vec<TrustedPeer>,
     pub group_keys: Vec<(GroupId, GroupKey)>,
     pub http: Option<HttpConfig>,
+    pub pkarr: Option<PkarrConfig>,
+    pub dht: Option<DhtConfig>,
     pub iroh: Option<IrohConfig>,
     pub transports: Vec<ConfiguredTransport>,
 }
 
 /// Live public-key namespace state.
 pub struct PeerNamespace {
-    identity: PeerIdentity,
+    identity: Arc<PeerIdentity>,
     state: State,
-    trusted_peers: RwLock<HashMap<PeerId, TrustedPeer>>,
-    group_keys: RwLock<HashMap<(GroupId, GroupKeyId), GroupKey>>,
+    trusted_peers: Arc<RwLock<HashMap<PeerId, TrustedPeer>>>,
+    group_keys: Arc<RwLock<HashMap<(GroupId, GroupKeyId), GroupKey>>>,
     transports: Vec<PeerTransportEndpoint>,
     iroh: Option<Arc<IrohTransport>>,
 }
@@ -628,6 +699,7 @@ struct PeerTransportEndpoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeerAddress {
     Pairwise(PeerId),
+    Publisher(PeerId),
     Group(GroupId),
 }
 
@@ -649,6 +721,31 @@ impl PeerNamespace {
             });
         }
 
+        let transport_seed = identity.peer_id().to_bytes();
+        if let Some(pkarr_config) = &config.pkarr {
+            let pkarr = Arc::new(
+                PkarrTransport::new(&transport_seed, pkarr_config)
+                    .map_err(|err| OpenError::TransportInit(TransportKind::Pkarr, Box::new(err)))?,
+            );
+            let transport: Arc<dyn Transport> = pkarr;
+            transports.push(PeerTransportEndpoint {
+                kind: TransportKind::Pkarr,
+                transport,
+            });
+        }
+
+        if let Some(dht_config) = &config.dht {
+            let dht = Arc::new(
+                DhtTransport::new(&transport_seed, dht_config)
+                    .map_err(|err| OpenError::TransportInit(TransportKind::Dht, Box::new(err)))?,
+            );
+            let transport: Arc<dyn Transport> = dht;
+            transports.push(PeerTransportEndpoint {
+                kind: TransportKind::Dht,
+                transport,
+            });
+        }
+
         let iroh = open_peer_iroh_transport(&config, state_store.as_ref()).await?;
         if let Some(iroh) = iroh.clone() {
             let transport: Arc<dyn Transport> = iroh;
@@ -666,10 +763,10 @@ impl PeerNamespace {
         }
 
         let namespace = Self {
-            identity,
+            identity: Arc::new(identity),
             state,
-            trusted_peers: RwLock::new(HashMap::new()),
-            group_keys: RwLock::new(HashMap::new()),
+            trusted_peers: Arc::new(RwLock::new(HashMap::new())),
+            group_keys: Arc::new(RwLock::new(HashMap::new())),
             transports,
             iroh,
         };
@@ -773,6 +870,14 @@ impl PeerNamespace {
         })
     }
 
+    pub fn slot(&self, name: &str) -> Result<PeerSlot<'_>, NameError> {
+        validate_name(name)?;
+        Ok(PeerSlot {
+            namespace: self,
+            name: name.to_owned(),
+        })
+    }
+
     pub fn seal_group_envelope(
         &self,
         kind: ChannelKind,
@@ -853,6 +958,106 @@ impl PeerNamespace {
         ids.sort_unstable();
         ids.dedup();
         ids
+    }
+
+    fn clone_for_task(&self) -> PeerSlotTaskNamespace {
+        PeerSlotTaskNamespace {
+            identity: Arc::clone(&self.identity),
+            state: self.state.clone(),
+            trusted_peers: Arc::clone(&self.trusted_peers),
+            group_keys: Arc::clone(&self.group_keys),
+        }
+    }
+
+    fn open_slot_value(
+        &self,
+        name: &str,
+        via: TransportKind,
+        address: PeerAddress,
+        scope: PeerSlotScope,
+        bytes: &[u8],
+    ) -> Option<PeerSlotValue> {
+        self.clone_for_task()
+            .open_slot_value(name, via, address, scope, bytes)
+    }
+}
+
+#[derive(Clone)]
+struct PeerSlotTaskNamespace {
+    identity: Arc<PeerIdentity>,
+    state: State,
+    trusted_peers: Arc<RwLock<HashMap<PeerId, TrustedPeer>>>,
+    group_keys: Arc<RwLock<HashMap<(GroupId, GroupKeyId), GroupKey>>>,
+}
+
+impl PeerSlotTaskNamespace {
+    fn trusted_snapshot(&self) -> Vec<TrustedPeer> {
+        read_trusted_peers(&self.trusted_peers)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn group_keys_for_envelope(&self, envelope: &GroupEnvelope) -> Vec<(GroupId, GroupKey)> {
+        let keys = read_group_keys(&self.group_keys);
+        envelope
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                keys.get(&(entry.group, entry.key_id))
+                    .cloned()
+                    .map(|key| (entry.group, key))
+            })
+            .collect()
+    }
+
+    fn open_slot_value(
+        &self,
+        name: &str,
+        via: TransportKind,
+        address: PeerAddress,
+        scope: PeerSlotScope,
+        bytes: &[u8],
+    ) -> Option<PeerSlotValue> {
+        let trusted = self.trusted_snapshot();
+        match address {
+            PeerAddress::Pairwise(_) | PeerAddress::Publisher(_) => {
+                let message = PeerEnvelope::open_bytes_or_drop(
+                    bytes,
+                    &self.identity,
+                    ChannelKind::Slot,
+                    name,
+                    &trusted,
+                )?;
+                let inner = decode_peer_slot_payload(&message.payload).ok()?;
+                Some(PeerSlotValue {
+                    version: inner.version,
+                    sender: message.sender,
+                    signed_by: message.signed_by,
+                    payload: inner.payload,
+                    via,
+                    scope,
+                    key_id: None,
+                })
+            }
+            PeerAddress::Group(_) => {
+                let envelope = GroupEnvelope::from_bytes(bytes).ok()?;
+                let keys = self.group_keys_for_envelope(&envelope);
+                let message = envelope
+                    .open(ChannelKind::Slot, name, &trusted, &keys)
+                    .ok()?;
+                let inner = decode_peer_slot_payload(&message.payload).ok()?;
+                Some(PeerSlotValue {
+                    version: inner.version,
+                    sender: message.sender,
+                    signed_by: message.signed_by,
+                    payload: inner.payload,
+                    via,
+                    scope,
+                    key_id: Some(message.key_id),
+                })
+            }
+        }
     }
 }
 
@@ -1024,21 +1229,23 @@ impl PeerMailbox<'_> {
     ) -> Option<PeerMailboxMessage> {
         let trusted = self.namespace.trusted_snapshot();
         match address {
-            PeerAddress::Pairwise(_) => PeerEnvelope::open_bytes_or_drop(
-                bytes,
-                &self.namespace.identity,
-                ChannelKind::Mailbox,
-                &self.name,
-                &trusted,
-            )
-            .map(|message| PeerMailboxMessage {
-                sender: message.sender,
-                signed_by: message.signed_by,
-                payload: message.payload,
-                via,
-                group: None,
-                key_id: None,
-            }),
+            PeerAddress::Pairwise(_) | PeerAddress::Publisher(_) => {
+                PeerEnvelope::open_bytes_or_drop(
+                    bytes,
+                    &self.namespace.identity,
+                    ChannelKind::Mailbox,
+                    &self.name,
+                    &trusted,
+                )
+                .map(|message| PeerMailboxMessage {
+                    sender: message.sender,
+                    signed_by: message.signed_by,
+                    payload: message.payload,
+                    via,
+                    group: None,
+                    key_id: None,
+                })
+            }
             PeerAddress::Group(_) => self
                 .namespace
                 .open_group_envelope_or_drop(bytes, ChannelKind::Mailbox, &self.name, &trusted)
@@ -1051,6 +1258,299 @@ impl PeerMailbox<'_> {
                     key_id: Some(message.key_id),
                 }),
         }
+    }
+}
+
+/// Public-key slot bound to one channel name.
+pub struct PeerSlot<'a> {
+    namespace: &'a PeerNamespace,
+    name: String,
+}
+
+impl PeerSlot<'_> {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub async fn put_for_peers(
+        &self,
+        recipients: &[PeerCard],
+        payload: &[u8],
+    ) -> Result<PeerSlotPutReport, PeerSlotError> {
+        let version = self.next_version(PeerSlotScopeKey::Pairwise)?;
+        let payload = encode_peer_slot_payload(version, payload)?;
+        let envelope = PeerEnvelope::seal(
+            &self.namespace.identity,
+            ChannelKind::Slot,
+            &self.name,
+            &payload,
+            recipients,
+        )?;
+        let bytes = envelope.to_bytes()?;
+        let addresses = recipients
+            .iter()
+            .map(|card| PeerAddress::Pairwise(card.peer_id))
+            .collect::<Vec<_>>();
+        self.put_bytes(&addresses, version, bytes).await
+    }
+
+    pub async fn put_publisher_for_peers(
+        &self,
+        recipients: &[PeerCard],
+        payload: &[u8],
+    ) -> Result<PeerSlotPutReport, PeerSlotError> {
+        let publisher = self.namespace.peer_id();
+        let version = self.next_version(PeerSlotScopeKey::Publisher(publisher))?;
+        let payload = encode_peer_slot_payload(version, payload)?;
+        let envelope = PeerEnvelope::seal(
+            &self.namespace.identity,
+            ChannelKind::Slot,
+            &self.name,
+            &payload,
+            recipients,
+        )?;
+        let bytes = envelope.to_bytes()?;
+        self.put_bytes(&[PeerAddress::Publisher(publisher)], version, bytes)
+            .await
+    }
+
+    pub async fn put_group(
+        &self,
+        group: GroupId,
+        key_ids: &[GroupKeyId],
+        payload: &[u8],
+    ) -> Result<PeerSlotPutReport, PeerSlotError> {
+        let version = self.next_version(PeerSlotScopeKey::Group(group))?;
+        let payload = encode_peer_slot_payload(version, payload)?;
+        let requested = key_ids
+            .iter()
+            .copied()
+            .map(|key_id| (group, key_id))
+            .collect::<Vec<_>>();
+        let envelope = self.namespace.seal_group_envelope(
+            ChannelKind::Slot,
+            &self.name,
+            &payload,
+            &requested,
+        )?;
+        let bytes = envelope.to_bytes()?;
+        self.put_bytes(&[PeerAddress::Group(group)], version, bytes)
+            .await
+    }
+
+    pub async fn get_pairwise(&self) -> Result<Option<PeerSlotValue>, PeerSlotError> {
+        self.get_address(
+            PeerAddress::Pairwise(self.namespace.peer_id()),
+            PeerSlotScope::Pairwise,
+        )
+        .await
+    }
+
+    pub async fn get_publisher(
+        &self,
+        publisher: PeerId,
+    ) -> Result<Option<PeerSlotValue>, PeerSlotError> {
+        self.get_address(
+            PeerAddress::Publisher(publisher),
+            PeerSlotScope::Publisher { publisher },
+        )
+        .await
+    }
+
+    pub async fn get_group(&self, group: GroupId) -> Result<Option<PeerSlotValue>, PeerSlotError> {
+        self.get_address(PeerAddress::Group(group), PeerSlotScope::Group { group })
+            .await
+    }
+
+    pub fn watch_pairwise(&self) -> Result<PeerSlotWatch, PeerSlotError> {
+        self.watch_address(
+            PeerAddress::Pairwise(self.namespace.peer_id()),
+            PeerSlotScope::Pairwise,
+            PeerSlotScopeKey::Pairwise,
+        )
+    }
+
+    pub fn watch_publisher(&self, publisher: PeerId) -> Result<PeerSlotWatch, PeerSlotError> {
+        self.watch_address(
+            PeerAddress::Publisher(publisher),
+            PeerSlotScope::Publisher { publisher },
+            PeerSlotScopeKey::Publisher(publisher),
+        )
+    }
+
+    pub fn watch_group(&self, group: GroupId) -> Result<PeerSlotWatch, PeerSlotError> {
+        self.watch_address(
+            PeerAddress::Group(group),
+            PeerSlotScope::Group { group },
+            PeerSlotScopeKey::Group(group),
+        )
+    }
+
+    async fn put_bytes(
+        &self,
+        addresses: &[PeerAddress],
+        version: u64,
+        bytes: Vec<u8>,
+    ) -> Result<PeerSlotPutReport, PeerSlotError> {
+        let mut tasks = JoinSet::new();
+        for endpoint in &self.namespace.transports {
+            for address in addresses {
+                let transport = Arc::clone(&endpoint.transport);
+                let id = peer_transport_id(endpoint.kind, *address, ChannelKind::Slot, &self.name);
+                let bytes = bytes.clone();
+                let kind = endpoint.kind;
+                tasks.spawn(async move { (kind, transport.put(&id, version, &bytes).await) });
+            }
+        }
+
+        let mut stored = Vec::new();
+        let mut failed = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            if let Ok((kind, put_result)) = result {
+                match put_result {
+                    Ok(()) => stored.push(kind),
+                    Err(err) => failed.push((kind, err)),
+                }
+            }
+        }
+
+        if stored.is_empty() {
+            return Err(PeerSlotError::AllTransportsFailed(failed));
+        }
+        Ok(PeerSlotPutReport {
+            version,
+            stored,
+            failed,
+        })
+    }
+
+    async fn get_address(
+        &self,
+        address: PeerAddress,
+        scope: PeerSlotScope,
+    ) -> Result<Option<PeerSlotValue>, PeerSlotError> {
+        let mut tasks = JoinSet::new();
+        for endpoint in &self.namespace.transports {
+            let transport = Arc::clone(&endpoint.transport);
+            let id = peer_transport_id(endpoint.kind, address, ChannelKind::Slot, &self.name);
+            let kind = endpoint.kind;
+            tasks.spawn(async move { (kind, transport.get(&id).await) });
+        }
+
+        let mut ok_count = 0usize;
+        let mut failures = Vec::new();
+        let mut best: Option<(u64, Vec<u8>, PeerSlotValue)> = None;
+        while let Some(result) = tasks.join_next().await {
+            let Ok((kind, get_result)) = result else {
+                continue;
+            };
+            match get_result {
+                Ok(None) => ok_count += 1,
+                Ok(Some((_server_version, bytes))) => {
+                    ok_count += 1;
+                    let Some(value) = self.open_value(kind, address, scope, &bytes) else {
+                        continue;
+                    };
+                    if best.as_ref().is_none_or(|(best_version, best_bytes, _)| {
+                        peer_slot_pair_is_newer(value.version, &bytes, *best_version, best_bytes)
+                    }) {
+                        best = Some((value.version, bytes, value));
+                    }
+                }
+                Err(err) => failures.push((kind, err)),
+            }
+        }
+
+        if ok_count == 0 && !failures.is_empty() {
+            return Err(PeerSlotError::AllTransportsFailed(failures));
+        }
+        Ok(best.map(|(_, _, value)| value))
+    }
+
+    fn watch_address(
+        &self,
+        address: PeerAddress,
+        scope: PeerSlotScope,
+        state_key: PeerSlotScopeKey,
+    ) -> Result<PeerSlotWatch, PeerSlotError> {
+        let (tx, rx) = mpsc::channel(PEER_SLOT_WATCH_BUFFER);
+        let best = Arc::new(Mutex::new(None::<(u64, Vec<u8>)>));
+        let dedup = Arc::new(Mutex::new(Dedup::new(crate::dedup::DEFAULT_CAPACITY)));
+        let since = self
+            .namespace
+            .state
+            .store()
+            .last_seen_slot_version(&peer_slot_state_key(&self.name, state_key))?
+            .unwrap_or(0);
+
+        for endpoint in &self.namespace.transports {
+            let id = peer_transport_id(endpoint.kind, address, ChannelKind::Slot, &self.name);
+            let mut stream = endpoint.transport.watch(&id, since);
+            let tx = tx.clone();
+            let best = Arc::clone(&best);
+            let dedup = Arc::clone(&dedup);
+            let name = self.name.clone();
+            let namespace = self.namespace.clone_for_task();
+            let kind = endpoint.kind;
+
+            tokio::spawn(async move {
+                while let Some(item) = stream.next().await {
+                    let Ok((_server_version, bytes)) = item else {
+                        continue;
+                    };
+                    if dedup.lock().await.observe(&bytes) {
+                        continue;
+                    }
+                    let Some(value) =
+                        namespace.open_slot_value(&name, kind, address, scope, &bytes)
+                    else {
+                        continue;
+                    };
+
+                    let mut best = best.lock().await;
+                    if best.as_ref().is_some_and(|(best_version, best_bytes)| {
+                        !peer_slot_pair_is_newer(value.version, &bytes, *best_version, best_bytes)
+                    }) {
+                        continue;
+                    }
+                    *best = Some((value.version, bytes.clone()));
+                    drop(best);
+
+                    let _ = namespace.state.store().record_seen_slot_version(
+                        &peer_slot_state_key(&name, state_key),
+                        value.version,
+                    );
+                    if tx.send(value).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        Ok(PeerSlotWatch {
+            name: self.name.clone(),
+            rx,
+        })
+    }
+
+    fn next_version(&self, scope: PeerSlotScopeKey) -> Result<u64, PeerSlotError> {
+        self.namespace
+            .state
+            .store()
+            .next_local_slot_version(&peer_slot_state_key(&self.name, scope))
+            .map_err(PeerSlotError::State)
+    }
+
+    fn open_value(
+        &self,
+        via: TransportKind,
+        address: PeerAddress,
+        scope: PeerSlotScope,
+        bytes: &[u8],
+    ) -> Option<PeerSlotValue> {
+        self.namespace
+            .open_slot_value(&self.name, via, address, scope, bytes)
     }
 }
 
@@ -1068,6 +1568,48 @@ pub struct PeerMailboxMessage {
     pub via: TransportKind,
     pub group: Option<GroupId>,
     pub key_id: Option<GroupKeyId>,
+}
+
+#[derive(Debug)]
+pub struct PeerSlotPutReport {
+    pub version: u64,
+    pub stored: Vec<TransportKind>,
+    pub failed: Vec<(TransportKind, TransportError)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerSlotScope {
+    Pairwise,
+    Publisher { publisher: PeerId },
+    Group { group: GroupId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSlotValue {
+    pub version: u64,
+    pub sender: PeerId,
+    pub signed_by: VerifyingKey,
+    pub payload: Vec<u8>,
+    pub via: TransportKind,
+    pub scope: PeerSlotScope,
+    pub key_id: Option<GroupKeyId>,
+}
+
+#[derive(Debug)]
+pub struct PeerSlotWatch {
+    name: String,
+    rx: mpsc::Receiver<PeerSlotValue>,
+}
+
+impl PeerSlotWatch {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub async fn recv(&mut self) -> Result<PeerSlotValue, RecvError> {
+        self.rx.recv().await.ok_or(RecvError::Closed)
+    }
 }
 
 /// Public card exchanged out of band when pairing peers.
@@ -1918,6 +2460,65 @@ fn group_channel_kind_from_code(code: u8) -> Result<ChannelKind, GroupEnvelopeEr
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct PeerSlotInner {
+    version: u8,
+    slot_version: u64,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct OpenPeerSlotInner {
+    version: u64,
+    payload: Vec<u8>,
+}
+
+fn encode_peer_slot_payload(version: u64, payload: &[u8]) -> Result<Vec<u8>, PeerSlotError> {
+    rmp_serde::to_vec_named(&PeerSlotInner {
+        version: PEER_SLOT_INNER_VERSION,
+        slot_version: version,
+        payload: payload.to_vec(),
+    })
+    .map_err(|_| PeerSlotError::MsgpackFailed)
+}
+
+fn decode_peer_slot_payload(bytes: &[u8]) -> Result<OpenPeerSlotInner, PeerSlotError> {
+    let inner: PeerSlotInner =
+        rmp_serde::from_slice(bytes).map_err(|_| PeerSlotError::MsgpackFailed)?;
+    if inner.version != PEER_SLOT_INNER_VERSION {
+        return Err(PeerSlotError::MsgpackFailed);
+    }
+    Ok(OpenPeerSlotInner {
+        version: inner.slot_version,
+        payload: inner.payload,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PeerSlotScopeKey {
+    Pairwise,
+    Publisher(PeerId),
+    Group(GroupId),
+}
+
+fn peer_slot_state_key(name: &str, scope: PeerSlotScopeKey) -> String {
+    match scope {
+        PeerSlotScopeKey::Pairwise => format!("peer-slot\0pairwise\0{name}"),
+        PeerSlotScopeKey::Publisher(peer) => format!("peer-slot\0publisher\0{peer}\0{name}"),
+        PeerSlotScopeKey::Group(group) => format!("peer-slot\0group\0{group}\0{name}"),
+    }
+}
+
+fn peer_slot_pair_is_newer(
+    version: u64,
+    bytes: &[u8],
+    best_version: u64,
+    best_bytes: &[u8],
+) -> bool {
+    (version, bytes) > (best_version, best_bytes)
+}
+
 fn peer_transport_id(
     transport: TransportKind,
     address: PeerAddress,
@@ -1925,7 +2526,10 @@ fn peer_transport_id(
     name: &str,
 ) -> Vec<u8> {
     let full = peer_address_id(address, kind, name);
-    if transport == TransportKind::Iroh {
+    if matches!(
+        transport,
+        TransportKind::Iroh | TransportKind::Dht | TransportKind::Pkarr
+    ) {
         full.to_vec()
     } else {
         full[..crate::kdf::CHANNEL_ID_LEN].to_vec()
@@ -1935,6 +2539,7 @@ fn peer_transport_id(
 fn peer_address_id(address: PeerAddress, kind: ChannelKind, name: &str) -> [u8; 32] {
     let (domain, id): (&[u8], [u8; 32]) = match address {
         PeerAddress::Pairwise(peer) => (b"enlace/v1/pkey/addr/pairwise", peer.to_bytes()),
+        PeerAddress::Publisher(peer) => (b"enlace/v1/pkey/addr/publisher", peer.to_bytes()),
         PeerAddress::Group(group) => (b"enlace/v1/pkey/addr/group", group.to_bytes()),
     };
     let mut info = Vec::with_capacity(domain.len() + kind.as_bytes().len() + name.len());

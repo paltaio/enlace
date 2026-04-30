@@ -34,7 +34,8 @@ pub use peer::{
     GroupEnvelopeError, GroupEnvelopeMessage, GroupId, GroupKey, GroupKeyError, GroupKeyId,
     PEER_ID_LEN, PeerCard, PeerCardError, PeerConfig, PeerEnvelope, PeerEnvelopeError,
     PeerEnvelopeMessage, PeerId, PeerIdentity, PeerMailbox, PeerMailboxMessage, PeerNamespace,
-    PeerRecipientEnvelope, PeerSendError, PeerSendReport, TrustError, TrustedPeer,
+    PeerRecipientEnvelope, PeerSendError, PeerSendReport, PeerSlot, PeerSlotError,
+    PeerSlotPutReport, PeerSlotScope, PeerSlotValue, PeerSlotWatch, TrustError, TrustedPeer,
 };
 pub use slot::{PutReport, Slot, SlotValue, SlotWatch};
 pub use state::{InMemoryStateStore, State, StateError, StateStore};

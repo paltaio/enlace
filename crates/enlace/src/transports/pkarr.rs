@@ -49,19 +49,19 @@ impl PkarrTransport {
         })
     }
 
-    async fn resolve_packet(&self) -> Option<SignedPacket> {
-        self.client.resolve_most_recent(&self.public_key).await
+    async fn resolve_packet_for(&self, public_key: &PublicKey) -> Option<SignedPacket> {
+        self.client.resolve_most_recent(public_key).await
     }
 
     async fn slot_get_since(
         &self,
-        id: &[u8; 16],
+        id: PkarrSlotId,
         since: u64,
     ) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
-        let Some(packet) = self.resolve_packet().await else {
+        let Some(packet) = self.resolve_packet_for(&id.public_key).await else {
             return Ok(None);
         };
-        let Some((version, sealed)) = slot_record(&packet, id)? else {
+        let Some((version, sealed)) = slot_record(&packet, &id.record)? else {
             return Ok(None);
         };
         if version <= since {
@@ -95,11 +95,11 @@ impl MailboxTransport for PkarrTransport {
 #[async_trait]
 impl SlotTransport for PkarrTransport {
     async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
-        let id = pkarr_channel_id(id)?;
-        let current = self.resolve_packet().await;
+        let id = self.pkarr_slot_id(id)?;
+        let current = self.resolve_packet_for(&id.public_key).await;
         if current
             .as_ref()
-            .and_then(|packet| slot_record(packet, &id).transpose())
+            .and_then(|packet| slot_record(packet, &id.record).transpose())
             .transpose()?
             .is_some_and(|(current_version, _)| current_version >= version)
         {
@@ -107,10 +107,10 @@ impl SlotTransport for PkarrTransport {
         }
 
         let packet = build_packet(
-            &self.keypair,
-            &self.public_key,
+            &id.keypair,
+            &id.public_key,
             current.as_ref(),
-            &id,
+            &id.record,
             version,
             sealed,
             self.record_ttl,
@@ -123,14 +123,14 @@ impl SlotTransport for PkarrTransport {
     }
 
     async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
-        let id = pkarr_channel_id(id)?;
-        self.slot_get_since(&id, 0).await
+        let id = self.pkarr_slot_id(id)?;
+        self.slot_get_since(id, 0).await
     }
 
     fn watch(&self, id: &[u8], since: u64) -> SlotWatchStream {
-        let Ok(id) = pkarr_channel_id(id) else {
+        let Ok(id) = self.pkarr_slot_id(id) else {
             return Box::pin(tokio_stream::iter([Err(TransportError::Network(
-                "pkarr channel id must be 16 bytes".to_owned(),
+                "pkarr channel id must be 16 or 32 bytes".to_owned(),
             ))]));
         };
         let transport = self.clone();
@@ -139,7 +139,7 @@ impl SlotTransport for PkarrTransport {
         tokio::spawn(async move {
             let mut since = since;
             loop {
-                match transport.slot_get_since(&id, since).await {
+                match transport.slot_get_since(id.clone(), since).await {
                     Ok(Some((version, value))) => {
                         since = version;
                         if tx.send(Ok((version, value))).await.is_err() {
@@ -158,6 +158,44 @@ impl SlotTransport for PkarrTransport {
         });
 
         Box::pin(ReceiverStream::new(rx))
+    }
+}
+
+#[derive(Clone)]
+struct PkarrSlotId {
+    keypair: Keypair,
+    public_key: PublicKey,
+    record: [u8; 16],
+}
+
+impl PkarrTransport {
+    fn pkarr_slot_id(&self, id: &[u8]) -> Result<PkarrSlotId, TransportError> {
+        match id.len() {
+            16 => {
+                let record: [u8; 16] = id.try_into().map_err(|_| {
+                    TransportError::Network("pkarr channel id must be 16 bytes".to_owned())
+                })?;
+                Ok(PkarrSlotId {
+                    keypair: self.keypair.clone(),
+                    public_key: self.public_key.clone(),
+                    record,
+                })
+            }
+            32 => {
+                let seed: [u8; 32] = id.try_into().map_err(|_| {
+                    TransportError::Network("pkarr address id must be 32 bytes".to_owned())
+                })?;
+                let keypair = pkarr_keypair(&seed);
+                Ok(PkarrSlotId {
+                    public_key: keypair.public_key(),
+                    keypair,
+                    record: [0; 16],
+                })
+            }
+            _ => Err(TransportError::Network(
+                "pkarr channel id must be 16 or 32 bytes".to_owned(),
+            )),
+        }
     }
 }
 
@@ -285,11 +323,6 @@ fn pkarr_keypair(seed: &[u8; 32]) -> Keypair {
     Keypair::from_secret_key(&key)
 }
 
-fn pkarr_channel_id(id: &[u8]) -> Result<[u8; 16], TransportError> {
-    id.try_into()
-        .map_err(|_| TransportError::Network("pkarr channel id must be 16 bytes".to_owned()))
-}
-
 fn map_build_error(err: pkarr::errors::SignedPacketBuildError) -> TransportError {
     match err {
         pkarr::errors::SignedPacketBuildError::PacketTooLarge(_) => TransportError::BodyTooLarge,
@@ -357,6 +390,18 @@ mod tests {
             Some((7, b"sealed".to_vec()))
         );
         assert_eq!(slot_record(&packet, &[3; 16]).unwrap(), None);
+    }
+
+    #[test]
+    fn slot_id_accepts_shared_seed_and_public_key_addresses() {
+        let transport = PkarrTransport::new(&[1; 32], &PkarrConfig::default()).unwrap();
+
+        let shared = transport.pkarr_slot_id(&[2; 16]).unwrap();
+        let public = transport.pkarr_slot_id(&[3; 32]).unwrap();
+
+        assert_eq!(shared.record, [2; 16]);
+        assert_eq!(public.record, [0; 16]);
+        assert_ne!(shared.public_key, public.public_key);
     }
 
     #[tokio::test]
