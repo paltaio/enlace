@@ -1,0 +1,93 @@
+name: agent release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Verify tag matches workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          VERSION=$(grep -E '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "tag v$TAG does not match Cargo.toml version $VERSION"
+            exit 1
+          fi
+
+  build:
+    name: agent (${{ matrix.name }})
+    needs: verify-tag
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: enlace-agent
+            artifact: enlace-agent-linux-x86_64
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bin: enlace-agent
+            artifact: enlace-agent-linux-arm64
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            bin: enlace-agent
+            artifact: enlace-agent-macos-x86_64
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            bin: enlace-agent
+            artifact: enlace-agent-macos-arm64
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: enlace-agent.exe
+            artifact: enlace-agent-windows-x86_64.exe
+          - name: windows-arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bin: enlace-agent.exe
+            artifact: enlace-agent-windows-arm64.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Select Rust
+        run: rustup default stable
+
+      - name: Install target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build agent
+        run: cargo build -p enlace-agent --release --locked --all-features --target ${{ matrix.target }}
+
+      - name: Upload agent
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          if-no-files-found: error
