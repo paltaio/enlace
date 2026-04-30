@@ -16,6 +16,7 @@ pub mod guard;
 pub mod kdf;
 pub mod mailbox;
 pub mod namespace;
+pub mod peer;
 pub mod slot;
 pub mod state;
 pub mod transports;
@@ -28,6 +29,7 @@ pub use error::{OpenError, RecvError, SealError, SendError, SlotError, Transport
 pub use kdf::{NameError, TransportKind};
 pub use mailbox::{Mailbox, RecvMessage, SendReport};
 pub use namespace::Namespace;
+pub use peer::{PEER_ID_LEN, PeerCard, PeerId, PeerIdentity, TrustedPeer};
 pub use slot::{PutReport, Slot, SlotValue, SlotWatch};
 pub use state::{InMemoryStateStore, State, StateError, StateStore};
 pub use transports::{
