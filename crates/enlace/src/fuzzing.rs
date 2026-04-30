@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
+use crate::config::Config;
 use crate::coordinator::Coordinator;
 use crate::crypto;
 use crate::kdf::{ChannelKind, channel_aead_key};
 use crate::state::InMemoryStateStore;
 use crate::transports::{
-    decode_empty_response, decode_mailbox_recv_response, decode_slot_get_response,
+    HealthTracker, decode_empty_response, decode_mailbox_recv_response, decode_slot_get_response,
 };
 
 use reqwest::StatusCode;
@@ -16,14 +17,17 @@ const NAME: &str = "fuzz";
 const MAX_PLAINTEXT_BYTES: usize = 65_536;
 
 pub fn open_mailbox(data: &[u8]) {
+    let config = Config {
+        dedup_buffer: 0,
+        max_plaintext_bytes: MAX_PLAINTEXT_BYTES,
+        ..Config::default()
+    };
     let coordinator = Coordinator::new(
         &SEED,
         Vec::new(),
-        None,
-        Vec::new(),
-        0,
-        MAX_PLAINTEXT_BYTES,
+        &config,
         Arc::new(InMemoryStateStore::default()),
+        Arc::new(HealthTracker::from_config(&config)),
     );
     let Some((&mode, bytes)) = data.split_first() else {
         coordinator.open_for_fuzz(ChannelKind::Mailbox, NAME, data);
