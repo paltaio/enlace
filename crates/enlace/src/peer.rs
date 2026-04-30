@@ -840,16 +840,28 @@ impl PeerNamespace {
 
     pub fn trust_peer(&self, peer: TrustedPeer) -> Result<(), TrustError> {
         peer.card.validate()?;
+        let peer_id = peer.peer_id();
+        let endpoint = peer.card.iroh_endpoint.clone();
         self.state.store_trusted_peer(&peer)?;
         let mut trusted = write_trusted_peers(&self.trusted_peers);
-        trusted.insert(peer.peer_id(), peer);
+        let replaced = trusted.insert(peer_id, peer);
+        drop(trusted);
+        let old_endpoint_id = replaced
+            .and_then(|peer| peer.card.iroh_endpoint)
+            .map(|endpoint| endpoint.endpoint_id);
+        update_iroh_trusted_endpoint(self.iroh.as_ref(), old_endpoint_id, endpoint);
         Ok(())
     }
 
     pub fn remove_trusted_peer(&self, peer: PeerId) -> Result<(), TrustError> {
         self.state.remove_trusted_peer(peer)?;
         let mut trusted = write_trusted_peers(&self.trusted_peers);
-        trusted.remove(&peer);
+        let removed = trusted.remove(&peer);
+        drop(trusted);
+        let old_endpoint_id = removed
+            .and_then(|peer| peer.card.iroh_endpoint)
+            .map(|endpoint| endpoint.endpoint_id);
+        update_iroh_trusted_endpoint(self.iroh.as_ref(), old_endpoint_id, None);
         Ok(())
     }
 
@@ -2557,17 +2569,50 @@ async fn open_peer_iroh_transport(
     state: &dyn crate::state::StateStore,
 ) -> Result<Option<Arc<IrohTransport>>, OpenError> {
     if let Some(iroh_config) = &config.iroh {
-        let iroh = Arc::new(IrohTransport::new(iroh_config, state).await.map_err(
-            |err| match err {
-                crate::transports::IrohInitError::State(err) => OpenError::State(err),
-                crate::transports::IrohInitError::Transport(err) => {
-                    OpenError::TransportInit(TransportKind::Iroh, Box::new(err))
-                }
-            },
-        )?);
+        let mut iroh_config = iroh_config.clone();
+        let trusted_endpoints = trusted_iroh_endpoints(&config.trusted_peers);
+        for endpoint in &trusted_endpoints {
+            upsert_iroh_peer(&mut iroh_config.peers, endpoint.clone());
+        }
+        let allowed = (!trusted_endpoints.is_empty()).then(|| {
+            trusted_endpoints
+                .iter()
+                .map(|endpoint| endpoint.endpoint_id)
+                .collect::<Vec<_>>()
+        });
+        let iroh = Arc::new(
+            IrohTransport::new_with_allowed_endpoints(&iroh_config, state, allowed)
+                .await
+                .map_err(|err| match err {
+                    crate::transports::IrohInitError::State(err) => OpenError::State(err),
+                    crate::transports::IrohInitError::Transport(err) => {
+                        OpenError::TransportInit(TransportKind::Iroh, Box::new(err))
+                    }
+                })?,
+        );
         Ok(Some(iroh))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(feature = "iroh")]
+fn trusted_iroh_endpoints(trusted: &[TrustedPeer]) -> Vec<IrohEndpointAddr> {
+    trusted
+        .iter()
+        .filter_map(|peer| peer.card.iroh_endpoint.clone())
+        .collect()
+}
+
+#[cfg(feature = "iroh")]
+fn upsert_iroh_peer(peers: &mut Vec<IrohEndpointAddr>, peer: IrohEndpointAddr) {
+    if let Some(existing) = peers
+        .iter_mut()
+        .find(|existing| existing.endpoint_id == peer.endpoint_id)
+    {
+        *existing = peer;
+    } else {
+        peers.push(peer);
     }
 }
 
@@ -2618,6 +2663,33 @@ fn write_group_keys<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 fn read_group_keys<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(feature = "iroh")]
+fn update_iroh_trusted_endpoint(
+    iroh: Option<&Arc<IrohTransport>>,
+    old_endpoint_id: Option<[u8; 32]>,
+    endpoint: Option<IrohEndpointAddr>,
+) {
+    let Some(iroh) = iroh else {
+        return;
+    };
+    if old_endpoint_id.is_some_and(|old| endpoint.as_ref().is_none_or(|new| new.endpoint_id != old))
+        && let Some(old) = old_endpoint_id
+    {
+        iroh.revoke_peer(old);
+    }
+    if let Some(endpoint) = endpoint {
+        iroh.allow_peer(endpoint);
+    }
+}
+
+#[cfg(not(feature = "iroh"))]
+fn update_iroh_trusted_endpoint(
+    _iroh: Option<&Arc<IrohTransport>>,
+    _old_endpoint_id: Option<[u8; 32]>,
+    _endpoint: Option<IrohEndpointAddr>,
+) {
 }
 
 fn write_endpoint(out: &mut Vec<u8>, endpoint: Option<&IrohEndpointAddr>) {

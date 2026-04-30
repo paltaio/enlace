@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -39,12 +39,14 @@ struct IrohInner {
     memory_lookup: MemoryLookup,
     endpoint_id: [u8; 32],
     peers: RwLock<Vec<IrohEndpointAddr>>,
-    topics: tokio::sync::Mutex<HashMap<Vec<u8>, Arc<TopicState>>>,
+    allowed_endpoints: Option<Arc<RwLock<HashSet<EndpointId>>>>,
+    topics: Mutex<HashMap<Vec<u8>, Arc<TopicState>>>,
 }
 
 #[derive(Debug, Clone)]
 struct ConnLimitHook {
     max_conns_per_peer: u32,
+    allowed_endpoints: Option<Arc<RwLock<HashSet<EndpointId>>>>,
     active: Arc<Mutex<HashMap<EndpointId, u32>>>,
 }
 
@@ -98,6 +100,14 @@ impl IrohTransport {
         config: &IrohConfig,
         state: &dyn StateStore,
     ) -> Result<Self, IrohInitError> {
+        Self::new_with_allowed_endpoints(config, state, None).await
+    }
+
+    pub(crate) async fn new_with_allowed_endpoints(
+        config: &IrohConfig,
+        state: &dyn StateStore,
+        allowed: Option<Vec<[u8; 32]>>,
+    ) -> Result<Self, IrohInitError> {
         let secret_key = if let Some(secret) = state.iroh_keypair()? {
             iroh::SecretKey::from_bytes(&secret)
         } else {
@@ -110,8 +120,23 @@ impl IrohTransport {
         for peer in &config.peers {
             memory_lookup.add_endpoint_info(endpoint_addr(peer)?);
         }
+        let allowed_endpoints = allowed
+            .map(|endpoints| {
+                endpoints
+                    .into_iter()
+                    .map(|endpoint| endpoint_id_from_bytes(&endpoint))
+                    .collect::<Result<HashSet<_>, _>>()
+                    .map(|endpoints| Arc::new(RwLock::new(endpoints)))
+            })
+            .transpose()?;
 
-        let endpoint = bind_endpoint(config, secret_key, memory_lookup.clone()).await?;
+        let endpoint = bind_endpoint(
+            config,
+            secret_key,
+            memory_lookup.clone(),
+            allowed_endpoints.clone(),
+        )
+        .await?;
         let gossip = Gossip::builder()
             .max_message_size(config.max_message_bytes)
             .spawn(endpoint.clone());
@@ -127,7 +152,8 @@ impl IrohTransport {
                 memory_lookup,
                 endpoint_id,
                 peers: RwLock::new(config.peers.clone()),
-                topics: tokio::sync::Mutex::new(HashMap::new()),
+                allowed_endpoints,
+                topics: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -152,6 +178,52 @@ impl IrohTransport {
     }
 
     pub fn add_peer(&self, peer: IrohEndpointAddr) {
+        self.add_peer_addr(peer);
+    }
+
+    pub fn remove_peer(&self, endpoint_id: [u8; 32]) -> bool {
+        let removed = {
+            let mut peers = self
+                .inner
+                .peers
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let old_len = peers.len();
+            peers.retain(|peer| peer.endpoint_id != endpoint_id);
+            peers.len() != old_len
+        };
+        if removed {
+            self.reset_topics();
+        }
+        removed
+    }
+
+    pub(crate) fn allow_peer(&self, peer: IrohEndpointAddr) {
+        if let Some(allowed) = &self.inner.allowed_endpoints
+            && let Ok(endpoint) = endpoint_id_from_bytes(&peer.endpoint_id)
+        {
+            allowed
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(endpoint);
+        }
+        self.add_peer_addr(peer);
+    }
+
+    pub(crate) fn revoke_peer(&self, endpoint_id: [u8; 32]) {
+        if let Some(allowed) = &self.inner.allowed_endpoints
+            && let Ok(endpoint) = endpoint_id_from_bytes(&endpoint_id)
+        {
+            allowed
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&endpoint);
+        }
+        self.remove_peer(endpoint_id);
+        self.reset_topics();
+    }
+
+    fn add_peer_addr(&self, peer: IrohEndpointAddr) {
         if let Ok(addr) = endpoint_addr(&peer) {
             self.inner.memory_lookup.add_endpoint_info(addr);
         }
@@ -171,12 +243,27 @@ impl IrohTransport {
         }
     }
 
+    fn reset_topics(&self) {
+        self.inner
+            .topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     async fn ensure_topic(
         &self,
         id: &[u8],
         wait_for_join: bool,
     ) -> Result<Arc<TopicState>, TransportError> {
-        if let Some(topic) = self.inner.topics.lock().await.get(id).cloned() {
+        if let Some(topic) = self
+            .inner
+            .topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
+        {
             return Ok(topic);
         }
 
@@ -224,7 +311,11 @@ impl IrohTransport {
             }
         });
 
-        let mut topics = self.inner.topics.lock().await;
+        let mut topics = self
+            .inner
+            .topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(topics.entry(id.to_vec()).or_insert(state).clone())
     }
 
@@ -392,6 +483,7 @@ async fn bind_endpoint(
     config: &IrohConfig,
     secret_key: iroh::SecretKey,
     memory_lookup: MemoryLookup,
+    allowed_endpoints: Option<Arc<RwLock<HashSet<EndpointId>>>>,
 ) -> Result<Endpoint, TransportError> {
     let stream_cap = VarInt::from_u32(config.max_streams_per_peer);
     let transport_config = QuicTransportConfig::builder()
@@ -400,6 +492,7 @@ async fn bind_endpoint(
         .build();
     let conn_limit = ConnLimitHook {
         max_conns_per_peer: config.max_conns_per_peer,
+        allowed_endpoints,
         active: Arc::new(Mutex::new(HashMap::new())),
     };
     let mut builder = Endpoint::builder(presets::Minimal)
@@ -427,6 +520,17 @@ async fn bind_endpoint(
 impl EndpointHooks for ConnLimitHook {
     async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
         let peer = conn.remote_id();
+        if let Some(allowed) = &self.allowed_endpoints
+            && !allowed
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&peer)
+        {
+            return AfterHandshakeOutcome::Reject {
+                error_code: VarInt::from_u32(403),
+                reason: b"endpoint not trusted".to_vec(),
+            };
+        }
         {
             let mut active = self
                 .active
@@ -477,13 +581,13 @@ fn topic_id(id: &[u8]) -> Result<TopicId, TransportError> {
     Ok(TopicId::from_bytes(id))
 }
 
-fn endpoint_id(id: &[u8; 32]) -> Result<EndpointId, TransportError> {
+fn endpoint_id_from_bytes(id: &[u8; 32]) -> Result<EndpointId, TransportError> {
     EndpointId::from_bytes(id)
         .map_err(|_| TransportError::Network("invalid iroh endpoint id".to_owned()))
 }
 
 fn endpoint_addr(peer: &IrohEndpointAddr) -> Result<EndpointAddr, TransportError> {
-    let id = endpoint_id(&peer.endpoint_id)?;
+    let id = endpoint_id_from_bytes(&peer.endpoint_id)?;
     let addrs = peer
         .relay_urls
         .iter()
@@ -596,11 +700,15 @@ mod tests {
             ..IrohConfig::default()
         };
         let client_secret = iroh::SecretKey::generate();
-        let first_client =
-            bind_endpoint(&client_config, client_secret.clone(), MemoryLookup::new())
-                .await
-                .unwrap();
-        let second_client = bind_endpoint(&client_config, client_secret, MemoryLookup::new())
+        let first_client = bind_endpoint(
+            &client_config,
+            client_secret.clone(),
+            MemoryLookup::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let second_client = bind_endpoint(&client_config, client_secret, MemoryLookup::new(), None)
             .await
             .unwrap();
 
@@ -621,6 +729,111 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(100), first_conn.closed())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_allowlist_rejects_unknown_and_accepts_runtime_peer() {
+        let server_state = InMemoryStateStore::new();
+        let server_config = IrohConfig {
+            relay_mode: IrohRelayMode::Disabled,
+            bind_addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+            ..IrohConfig::default()
+        };
+        let server =
+            IrohTransport::new_with_allowed_endpoints(&server_config, &server_state, Some(vec![]))
+                .await
+                .unwrap();
+
+        let client_config = IrohConfig {
+            relay_mode: IrohRelayMode::Disabled,
+            bind_addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+            ..IrohConfig::default()
+        };
+        let client_secret = iroh::SecretKey::generate();
+        let client_id = *client_secret.public().as_bytes();
+        let first_client = bind_endpoint(
+            &client_config,
+            client_secret.clone(),
+            MemoryLookup::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rejected = first_client
+            .connect(server.inner.endpoint.addr(), iroh_gossip::ALPN)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), rejected.closed())
+            .await
+            .unwrap();
+
+        server.allow_peer(IrohEndpointAddr {
+            endpoint_id: client_id,
+            relay_urls: Vec::new(),
+            direct_addrs: Vec::new(),
+        });
+        let second_client = bind_endpoint(&client_config, client_secret, MemoryLookup::new(), None)
+            .await
+            .unwrap();
+        let accepted = second_client
+            .connect(server.inner.endpoint.addr(), iroh_gossip::ALPN)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), accepted.closed())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoking_peer_resets_topics() {
+        let state = InMemoryStateStore::new();
+        let config = IrohConfig {
+            relay_mode: IrohRelayMode::Disabled,
+            bind_addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+            ..IrohConfig::default()
+        };
+        let transport = IrohTransport::new_with_allowed_endpoints(&config, &state, Some(vec![]))
+            .await
+            .unwrap();
+        let peer_id = *iroh::SecretKey::generate().public().as_bytes();
+        let topic = [7u8; 32];
+
+        transport.allow_peer(IrohEndpointAddr {
+            endpoint_id: peer_id,
+            relay_urls: Vec::new(),
+            direct_addrs: Vec::new(),
+        });
+        transport.ensure_topic(&topic, false).await.unwrap();
+        assert_eq!(
+            transport
+                .inner
+                .topics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+
+        transport.revoke_peer(peer_id);
+
+        assert!(
+            transport
+                .inner
+                .topics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+        let allowed = transport.inner.allowed_endpoints.as_ref().unwrap();
+        assert!(
+            !allowed
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&EndpointId::from_bytes(&peer_id).unwrap())
         );
     }
 
