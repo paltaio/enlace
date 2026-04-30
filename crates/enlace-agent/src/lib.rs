@@ -1221,6 +1221,19 @@ mod tests {
         ))
     }
 
+    fn toml_string(value: impl fmt::Display) -> String {
+        let mut text = String::from("\"");
+        for ch in value.to_string().chars() {
+            match ch {
+                '\\' => text.push_str("\\\\"),
+                '"' => text.push_str("\\\""),
+                _ => text.push(ch),
+            }
+        }
+        text.push('"');
+        text
+    }
+
     fn local_ws_addr_for_test() -> SocketAddr {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.local_addr().unwrap()
@@ -1569,16 +1582,16 @@ mod tests {
             &config_path,
             format!(
                 r#"
-seed_file = "{}"
-token_file = "{}"
+seed_file = {}
+token_file = {}
 listen_ws = "127.0.0.1:3000"
-data_dir = "{}"
+data_dir = {}
 relay = "https://relay.example.com"
 log = "debug"
 "#,
-                seed_path.display(),
-                token_path.display(),
-                data_dir.display()
+                toml_string(seed_path.display()),
+                toml_string(token_path.display()),
+                toml_string(data_dir.display())
             ),
         )
         .unwrap();
@@ -1622,16 +1635,16 @@ log = "debug"
             &config_path,
             format!(
                 r#"
-seed_file = "{}"
-token_file = "{}"
+seed_file = {}
+token_file = {}
 listen_ws = "127.0.0.1:3000"
-data_dir = "{}"
+data_dir = {}
 relay = "https://relay.example.com"
 log = "debug"
 "#,
-                seed_path.display(),
-                token_path.display(),
-                config_data_dir.display()
+                toml_string(seed_path.display()),
+                toml_string(token_path.display()),
+                toml_string(config_data_dir.display())
             ),
         )
         .unwrap();
