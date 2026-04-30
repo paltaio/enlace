@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::coordinator::Coordinator;
 use crate::crypto;
 use crate::kdf::{ChannelKind, channel_aead_key};
-use crate::state::InMemoryStateStore;
+use crate::state::State;
 use crate::transports::{
     HealthTracker, decode_empty_response, decode_mailbox_recv_response, decode_slot_get_response,
 };
@@ -26,7 +26,7 @@ pub fn open_mailbox(data: &[u8]) {
         &SEED,
         Vec::new(),
         &config,
-        Arc::new(InMemoryStateStore::default()),
+        State::memory().store(),
         Arc::new(HealthTracker::from_config(&config)),
     );
     let Some((&mode, bytes)) = data.split_first() else {

@@ -6,7 +6,6 @@ use crate::error::OpenError;
 use crate::kdf::NameError;
 use crate::mailbox::Mailbox;
 use crate::slot::Slot;
-use crate::state::InMemoryStateStore;
 use crate::transports::{
     DhtTransport, HealthReport, HealthTracker, HttpTransport, IrohTransport, PkarrTransport,
 };
@@ -26,7 +25,7 @@ pub(crate) struct NamespaceInner {
 
 impl Namespace {
     #[allow(clippy::unused_async)]
-    pub async fn open(seed: &[u8; 32], mut config: Config) -> Result<Self, OpenError> {
+    pub async fn open(seed: &[u8; 32], config: Config) -> Result<Self, OpenError> {
         validate_seed(seed)?;
         validate_config(&config)?;
 
@@ -36,10 +35,7 @@ impl Namespace {
             );
         }
 
-        let state = config
-            .state
-            .take()
-            .unwrap_or_else(|| Arc::new(InMemoryStateStore::new()));
+        let state = config.state.store();
         let mut transports = Vec::new();
         let http = if let Some(http_config) = config.http.clone() {
             let http = Arc::new(HttpTransport::new(http_config).map_err(|err| {

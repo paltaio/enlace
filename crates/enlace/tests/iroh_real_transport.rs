@@ -1,13 +1,9 @@
 #![cfg(feature = "iroh")]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
 
-use enlace::{
-    Config, InMemoryStateStore, IrohConfig, IrohEndpointAddr, IrohRelayMode, Namespace,
-    TransportKind,
-};
+use enlace::{Config, IrohConfig, IrohEndpointAddr, IrohRelayMode, Namespace, TransportKind};
 
 fn iroh_config(peers: Vec<IrohEndpointAddr>) -> IrohConfig {
     IrohConfig {
@@ -21,7 +17,6 @@ fn iroh_config(peers: Vec<IrohEndpointAddr>) -> IrohConfig {
 fn config(peers: Vec<IrohEndpointAddr>) -> Config {
     Config {
         iroh: Some(iroh_config(peers)),
-        state: Some(Arc::new(InMemoryStateStore::new())),
         ..Config::default()
     }
 }

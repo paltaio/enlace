@@ -1,10 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
 
 use enlace::{
-    Config, HttpConfig, InMemoryStateStore, IrohConfig, IrohEndpointAddr, IrohRelayMode, Namespace,
-    TransportKind,
+    Config, HttpConfig, IrohConfig, IrohEndpointAddr, IrohRelayMode, Namespace, TransportKind,
 };
 use enlace_relay::{RelayConfig, build_router};
 use tokio::task::JoinHandle;
@@ -85,7 +83,6 @@ fn http_iroh_config(base_url: &str, peers: Vec<IrohEndpointAddr>) -> Config {
     Config {
         http: Some(HttpConfig::new(base_url.parse().expect("relay URL parses"))),
         iroh: Some(iroh_config(peers)),
-        state: Some(Arc::new(InMemoryStateStore::new())),
         ..Config::default()
     }
 }

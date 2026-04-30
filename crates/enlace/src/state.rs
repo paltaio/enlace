@@ -14,11 +14,17 @@
 //! across restarts.
 
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::error::Error as StdError;
 use std::fmt;
-use std::sync::RwLock;
+use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 use zeroize::Zeroizing;
+
+const LOCAL_SLOT_PREFIX: &[u8] = b"local-slot\0";
+const SEEN_SLOT_PREFIX: &[u8] = b"seen-slot\0";
+const IROH_KEYPAIR_KEY: &[u8] = b"iroh-keypair";
 
 /// Failure modes for a [`StateStore`] backend.
 ///
@@ -47,6 +53,44 @@ impl StdError for StateError {
             Self::Backend(e) => Some(&**e),
             Self::Corrupted(_) => None,
         }
+    }
+}
+
+/// Ergonomic handle for endpoint-local state.
+///
+/// The default is volatile memory state. Callers that need restart-stable slot
+/// counters or iroh identity can pass a file path or a custom backend.
+#[derive(Clone)]
+pub struct State {
+    store: Arc<dyn StateStore>,
+}
+
+impl State {
+    /// Construct volatile state that resets when dropped.
+    #[must_use]
+    pub fn memory() -> Self {
+        Self::custom(Arc::new(InMemoryStateStore::new()))
+    }
+
+    /// Open persistent state rooted at `path`.
+    pub fn file(path: impl AsRef<Path>) -> Result<Self, StateError> {
+        Ok(Self::custom(Arc::new(FileStateStore::open(path)?)))
+    }
+
+    /// Wrap caller-owned state storage.
+    #[must_use]
+    pub fn custom(store: Arc<dyn StateStore>) -> Self {
+        Self { store }
+    }
+
+    pub(crate) fn store(&self) -> Arc<dyn StateStore> {
+        Arc::clone(&self.store)
+    }
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::memory()
     }
 }
 
@@ -171,12 +215,135 @@ impl StateStore for InMemoryStateStore {
     }
 }
 
+struct FileStateStore {
+    db: sled::Db,
+}
+
+impl FileStateStore {
+    fn open(path: impl AsRef<Path>) -> Result<Self, StateError> {
+        let db = sled::open(path).map_err(backend_error)?;
+        Ok(Self { db })
+    }
+
+    fn slot_key(prefix: &[u8], slot: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(prefix.len() + slot.len());
+        key.extend_from_slice(prefix);
+        key.extend_from_slice(slot.as_bytes());
+        key
+    }
+
+    fn flush(&self) -> Result<(), StateError> {
+        self.db.flush().map(|_| ()).map_err(backend_error)
+    }
+}
+
+impl StateStore for FileStateStore {
+    fn next_local_slot_version(&self, slot: &str) -> Result<u64, StateError> {
+        let key = Self::slot_key(LOCAL_SLOT_PREFIX, slot);
+        loop {
+            let current = self.db.get(&key).map_err(backend_error)?;
+            let current_version = current
+                .as_deref()
+                .map(|bytes| decode_u64(bytes, "local slot version"))
+                .transpose()?
+                .unwrap_or(0);
+            let next = current_version
+                .checked_add(1)
+                .expect("local slot version counter overflowed u64");
+            let encoded = next.to_be_bytes().to_vec();
+            if let Ok(()) = self
+                .db
+                .compare_and_swap(&key, current.as_deref(), Some(encoded))
+                .map_err(backend_error)?
+            {
+                self.flush()?;
+                return Ok(next);
+            }
+        }
+    }
+
+    fn last_seen_slot_version(&self, slot: &str) -> Result<Option<u64>, StateError> {
+        let key = Self::slot_key(SEEN_SLOT_PREFIX, slot);
+        self.db
+            .get(key)
+            .map_err(backend_error)?
+            .as_deref()
+            .map(|bytes| decode_u64(bytes, "seen slot version"))
+            .transpose()
+    }
+
+    fn record_seen_slot_version(&self, slot: &str, version: u64) -> Result<(), StateError> {
+        let key = Self::slot_key(SEEN_SLOT_PREFIX, slot);
+        loop {
+            let current = self.db.get(&key).map_err(backend_error)?;
+            let current_version = current
+                .as_deref()
+                .map(|bytes| decode_u64(bytes, "seen slot version"))
+                .transpose()?;
+            if current_version.is_some_and(|current| version <= current) {
+                return Ok(());
+            }
+            let encoded = version.to_be_bytes().to_vec();
+            if let Ok(()) = self
+                .db
+                .compare_and_swap(&key, current.as_deref(), Some(encoded))
+                .map_err(backend_error)?
+            {
+                self.flush()?;
+                return Ok(());
+            }
+        }
+    }
+
+    fn iroh_keypair(&self) -> Result<Option<[u8; 32]>, StateError> {
+        self.db
+            .get(IROH_KEYPAIR_KEY)
+            .map_err(backend_error)?
+            .as_deref()
+            .map(decode_iroh_keypair)
+            .transpose()
+    }
+
+    fn store_iroh_keypair(&self, secret: &[u8; 32]) -> Result<(), StateError> {
+        self.db
+            .insert(IROH_KEYPAIR_KEY, &secret[..])
+            .map_err(backend_error)?;
+        self.flush()
+    }
+}
+
+fn decode_u64(bytes: &[u8], field: &str) -> Result<u64, StateError> {
+    let array: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| StateError::Corrupted(format!("{field} has invalid length")))?;
+    Ok(u64::from_be_bytes(array))
+}
+
+fn decode_iroh_keypair(bytes: &[u8]) -> Result<[u8; 32], StateError> {
+    bytes
+        .try_into()
+        .map_err(|_| StateError::Corrupted("iroh keypair has invalid length".to_owned()))
+}
+
+fn backend_error(err: impl StdError + Send + Sync + 'static) -> StateError {
+    StateError::Backend(Box::new(err))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     use super::*;
+
+    static TEMP_ID: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_state_path(name: &str) -> PathBuf {
+        let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("enlace-state-{name}-{}-{id}", std::process::id()))
+    }
 
     #[test]
     fn next_local_slot_version_starts_at_one() {
@@ -269,6 +436,41 @@ mod tests {
         assert_eq!(s.next_local_slot_version("x").unwrap(), 1);
         s.record_seen_slot_version("x", 42).unwrap();
         assert_eq!(s.last_seen_slot_version("x").unwrap(), Some(42));
+    }
+
+    #[test]
+    fn state_memory_wraps_volatile_store() {
+        let state = State::memory();
+        let store = state.store();
+        assert_eq!(store.next_local_slot_version("x").unwrap(), 1);
+    }
+
+    #[test]
+    fn state_custom_wraps_caller_store() {
+        let store = Arc::new(InMemoryStateStore::new());
+        let state = State::custom(store.clone());
+        assert_eq!(state.store().next_local_slot_version("x").unwrap(), 1);
+        assert_eq!(store.next_local_slot_version("x").unwrap(), 2);
+    }
+
+    #[test]
+    fn state_file_persists_shared_seed_state() {
+        let path = temp_state_path("shared-seed");
+        {
+            let state = State::file(&path).unwrap();
+            let store = state.store();
+            assert_eq!(store.next_local_slot_version("slot").unwrap(), 1);
+            store.record_seen_slot_version("slot", 9).unwrap();
+            store.store_iroh_keypair(&[7u8; 32]).unwrap();
+        }
+        {
+            let state = State::file(&path).unwrap();
+            let store = state.store();
+            assert_eq!(store.next_local_slot_version("slot").unwrap(), 2);
+            assert_eq!(store.last_seen_slot_version("slot").unwrap(), Some(9));
+            assert_eq!(store.iroh_keypair().unwrap(), Some([7u8; 32]));
+        }
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]

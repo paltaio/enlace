@@ -8,7 +8,7 @@ use url::Url;
 
 use crate::TransportKind;
 use crate::dedup;
-use crate::state::StateStore;
+use crate::state::State;
 use crate::transports::Transport;
 
 pub const DEFAULT_MAX_PLAINTEXT_BYTES: usize = 65_536;
@@ -35,7 +35,7 @@ pub struct Config {
     pub trusted: Vec<VerifyingKey>,
     pub dedup_buffer: usize,
     pub max_plaintext_bytes: usize,
-    pub state: Option<Arc<dyn StateStore>>,
+    pub state: State,
     pub transports: Vec<ConfiguredTransport>,
 }
 
@@ -50,7 +50,7 @@ impl Default for Config {
             trusted: Vec::new(),
             dedup_buffer: dedup::DEFAULT_CAPACITY,
             max_plaintext_bytes: DEFAULT_MAX_PLAINTEXT_BYTES,
-            state: None,
+            state: State::memory(),
             transports: Vec::new(),
         }
     }

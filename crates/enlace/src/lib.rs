@@ -29,7 +29,7 @@ pub use kdf::{NameError, TransportKind};
 pub use mailbox::{Mailbox, RecvMessage, SendReport};
 pub use namespace::Namespace;
 pub use slot::{PutReport, Slot, SlotValue, SlotWatch};
-pub use state::{InMemoryStateStore, StateError, StateStore};
+pub use state::{InMemoryStateStore, State, StateError, StateStore};
 pub use transports::{
     DhtTransport, EndpointHealth, HealthReport, HealthState, HealthTransition,
     HealthTransitionKind, HttpTransport, IrohTransport, MailboxTransport, PkarrTransport,

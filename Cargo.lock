@@ -1053,6 +1053,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "sha2 0.10.9",
+ "sled",
  "subtle",
  "tokio",
  "tokio-stream",
