@@ -31,7 +31,7 @@ pub use mailbox::{Mailbox, RecvMessage, SendReport};
 pub use namespace::Namespace;
 pub use peer::{
     GROUP_ID_LEN, GROUP_KEY_ID_LEN, GROUP_KEY_SECRET_LEN, GroupId, GroupKey, GroupKeyId,
-    PEER_ID_LEN, PeerCard, PeerId, PeerIdentity, TrustedPeer,
+    PEER_ID_LEN, PeerCard, PeerCardError, PeerId, PeerIdentity, TrustError, TrustedPeer,
 };
 pub use slot::{PutReport, Slot, SlotValue, SlotWatch};
 pub use state::{InMemoryStateStore, State, StateError, StateStore};

@@ -1,10 +1,16 @@
 //! Public-key peer identity types.
 
+use std::convert::TryInto;
+use std::error::Error as StdError;
 use std::fmt;
+use std::net::SocketAddr;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
+use url::Url;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
@@ -15,6 +21,103 @@ pub const PEER_ID_LEN: usize = 32;
 pub const GROUP_ID_LEN: usize = 32;
 pub const GROUP_KEY_ID_LEN: usize = 32;
 pub const GROUP_KEY_SECRET_LEN: usize = 32;
+const PEER_CARD_EXPORT_PREFIX: &str = "enlace-peer-card-v1:";
+const PEER_CARD_RECORD_VERSION: u8 = 1;
+
+/// Failure modes when importing or validating a public peer card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerCardError {
+    /// Exported text did not use the expected prefix.
+    MissingPrefix,
+    /// Exported text was not valid unpadded URL-safe base64.
+    InvalidEncoding,
+    /// Binary card used an unsupported version.
+    UnsupportedVersion,
+    /// Binary card ended before a required field was complete.
+    Truncated(&'static str),
+    /// Binary card had extra bytes after the last field.
+    TrailingBytes,
+    /// Card contained an invalid Ed25519 verifying key.
+    InvalidSigningKey,
+    /// `peer_id` did not match the signing public key.
+    InconsistentPeerId,
+    /// X25519 public exchange key was all zero.
+    EmptyExchangeKey,
+    /// Iroh endpoint id was all zero.
+    InvalidIrohEndpoint,
+    /// String field was not UTF-8.
+    InvalidUtf8(&'static str),
+    /// Relay URL field was not a valid URL.
+    InvalidRelayUrl,
+    /// Direct address field was not a socket address.
+    InvalidDirectAddr,
+    /// Repeated field count exceeded platform limits.
+    CountTooLarge(&'static str),
+    /// Field length exceeded the binary card format.
+    FieldTooLarge(&'static str),
+}
+
+impl fmt::Display for PeerCardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingPrefix => f.write_str("peer card export prefix missing"),
+            Self::InvalidEncoding => f.write_str("peer card export encoding invalid"),
+            Self::UnsupportedVersion => f.write_str("peer card version unsupported"),
+            Self::Truncated(field) => write!(f, "peer card ended inside {field}"),
+            Self::TrailingBytes => f.write_str("peer card has trailing bytes"),
+            Self::InvalidSigningKey => f.write_str("peer card signing key invalid"),
+            Self::InconsistentPeerId => f.write_str("peer card id does not match signing key"),
+            Self::EmptyExchangeKey => f.write_str("peer card exchange key is empty"),
+            Self::InvalidIrohEndpoint => f.write_str("peer card iroh endpoint invalid"),
+            Self::InvalidUtf8(field) => write!(f, "peer card {field} is not utf-8"),
+            Self::InvalidRelayUrl => f.write_str("peer card relay url invalid"),
+            Self::InvalidDirectAddr => f.write_str("peer card direct address invalid"),
+            Self::CountTooLarge(field) => write!(f, "peer card {field} count too large"),
+            Self::FieldTooLarge(field) => write!(f, "peer card {field} too large"),
+        }
+    }
+}
+
+impl StdError for PeerCardError {}
+
+/// Failure modes for trust-set mutations.
+#[derive(Debug)]
+pub enum TrustError {
+    /// The supplied card failed validation.
+    InvalidPeerCard(PeerCardError),
+    /// Trust storage failed.
+    State(StateError),
+}
+
+impl fmt::Display for TrustError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPeerCard(err) => write!(f, "invalid peer card: {err}"),
+            Self::State(err) => write!(f, "state store error: {err}"),
+        }
+    }
+}
+
+impl StdError for TrustError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::InvalidPeerCard(err) => Some(err),
+            Self::State(err) => Some(err),
+        }
+    }
+}
+
+impl From<PeerCardError> for TrustError {
+    fn from(err: PeerCardError) -> Self {
+        Self::InvalidPeerCard(err)
+    }
+}
+
+impl From<StateError> for TrustError {
+    fn from(err: StateError) -> Self {
+        Self::State(err)
+    }
+}
 
 /// Stable cryptographic peer identity derived from the signing public key.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -259,6 +362,71 @@ impl PeerCard {
     pub fn is_consistent(&self) -> bool {
         self.peer_id == PeerId::from_signing_key(&self.signing_key)
     }
+
+    pub fn validate(&self) -> Result<(), PeerCardError> {
+        if !self.is_consistent() {
+            return Err(PeerCardError::InconsistentPeerId);
+        }
+        if self.exchange_key.iter().all(|&byte| byte == 0) {
+            return Err(PeerCardError::EmptyExchangeKey);
+        }
+        if self
+            .iroh_endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.endpoint_id.iter().all(|&byte| byte == 0))
+        {
+            return Err(PeerCardError::InvalidIrohEndpoint);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(PEER_CARD_RECORD_VERSION);
+        out.extend_from_slice(&self.peer_id.to_bytes());
+        out.extend_from_slice(&self.signing_key.to_bytes());
+        out.extend_from_slice(&self.exchange_key);
+        write_endpoint(&mut out, self.iroh_endpoint.as_ref());
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, PeerCardError> {
+        let mut cursor = CardDecoder::new(bytes);
+        cursor.version()?;
+        let peer_id = PeerId::from_bytes(cursor.array("peer id")?);
+        let signing_key = VerifyingKey::from_bytes(&cursor.array("signing key")?)
+            .map_err(|_| PeerCardError::InvalidSigningKey)?;
+        let exchange_key = cursor.array("exchange key")?;
+        let iroh_endpoint = read_endpoint(&mut cursor)?;
+        cursor.finish()?;
+
+        let card = Self {
+            peer_id,
+            signing_key,
+            exchange_key,
+            iroh_endpoint,
+        };
+        card.validate()?;
+        Ok(card)
+    }
+
+    #[must_use]
+    pub fn export_string(&self) -> String {
+        let mut out = String::from(PEER_CARD_EXPORT_PREFIX);
+        out.push_str(&URL_SAFE_NO_PAD.encode(self.to_bytes()));
+        out
+    }
+
+    pub fn import_string(exported: &str) -> Result<Self, PeerCardError> {
+        let encoded = exported
+            .strip_prefix(PEER_CARD_EXPORT_PREFIX)
+            .ok_or(PeerCardError::MissingPrefix)?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| PeerCardError::InvalidEncoding)?;
+        Self::from_bytes(&bytes)
+    }
 }
 
 /// One-way trust entry. Authorization policy stays with caller code.
@@ -273,9 +441,143 @@ impl TrustedPeer {
         Self { card }
     }
 
+    pub fn try_from_card(card: PeerCard) -> Result<Self, PeerCardError> {
+        card.validate()?;
+        Ok(Self { card })
+    }
+
     #[must_use]
     pub const fn peer_id(&self) -> PeerId {
         self.card.peer_id
+    }
+}
+
+fn write_endpoint(out: &mut Vec<u8>, endpoint: Option<&IrohEndpointAddr>) {
+    let Some(endpoint) = endpoint else {
+        out.push(0);
+        return;
+    };
+    out.push(1);
+    out.extend_from_slice(&endpoint.endpoint_id);
+    write_string_list(out, endpoint.relay_urls.iter().map(Url::as_str));
+    write_string_list(out, endpoint.direct_addrs.iter().map(ToString::to_string));
+}
+
+fn read_endpoint(cursor: &mut CardDecoder<'_>) -> Result<Option<IrohEndpointAddr>, PeerCardError> {
+    match cursor.u8("iroh endpoint flag")? {
+        0 => Ok(None),
+        1 => {
+            let endpoint_id = cursor.array("iroh endpoint id")?;
+            let relay_urls = read_string_list(cursor, "relay url")?
+                .into_iter()
+                .map(|raw| Url::parse(&raw).map_err(|_| PeerCardError::InvalidRelayUrl))
+                .collect::<Result<Vec<_>, _>>()?;
+            let direct_addrs = read_string_list(cursor, "direct address")?
+                .into_iter()
+                .map(|raw| {
+                    raw.parse::<SocketAddr>()
+                        .map_err(|_| PeerCardError::InvalidDirectAddr)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(IrohEndpointAddr {
+                endpoint_id,
+                relay_urls,
+                direct_addrs,
+            }))
+        }
+        _ => Err(PeerCardError::InvalidIrohEndpoint),
+    }
+}
+
+fn write_string_list<'a>(out: &mut Vec<u8>, values: impl Iterator<Item = impl AsRef<str> + 'a>) {
+    let start = out.len();
+    out.extend_from_slice(&0u32.to_be_bytes());
+    let mut count = 0u32;
+    for value in values {
+        write_bytes(out, value.as_ref().as_bytes());
+        count = count
+            .checked_add(1)
+            .expect("peer card string count overflowed u32");
+    }
+    out[start..start + 4].copy_from_slice(&count.to_be_bytes());
+}
+
+fn read_string_list(
+    cursor: &mut CardDecoder<'_>,
+    field: &'static str,
+) -> Result<Vec<String>, PeerCardError> {
+    let count = cursor.u32(field)?;
+    let count = usize::try_from(count).map_err(|_| PeerCardError::CountTooLarge(field))?;
+    (0..count)
+        .map(|_| {
+            let bytes = cursor.bytes(field)?;
+            String::from_utf8(bytes.to_vec()).map_err(|_| PeerCardError::InvalidUtf8(field))
+        })
+        .collect()
+}
+
+fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u32::try_from(bytes.len()).expect("peer card field length overflowed u32");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+struct CardDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CardDecoder<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn version(&mut self) -> Result<(), PeerCardError> {
+        let version = self.u8("version")?;
+        if version != PEER_CARD_RECORD_VERSION {
+            return Err(PeerCardError::UnsupportedVersion);
+        }
+        Ok(())
+    }
+
+    fn u8(&mut self, field: &'static str) -> Result<u8, PeerCardError> {
+        Ok(self.take(field, 1)?[0])
+    }
+
+    fn u32(&mut self, field: &'static str) -> Result<u32, PeerCardError> {
+        Ok(u32::from_be_bytes(self.array(field)?))
+    }
+
+    fn array<const N: usize>(&mut self, field: &'static str) -> Result<[u8; N], PeerCardError> {
+        self.take(field, N)?
+            .try_into()
+            .map_err(|_| PeerCardError::Truncated(field))
+    }
+
+    fn bytes(&mut self, field: &'static str) -> Result<&'a [u8], PeerCardError> {
+        let len =
+            usize::try_from(self.u32(field)?).map_err(|_| PeerCardError::FieldTooLarge(field))?;
+        self.take(field, len)
+    }
+
+    fn take(&mut self, field: &'static str, len: usize) -> Result<&'a [u8], PeerCardError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(PeerCardError::FieldTooLarge(field))?;
+        let Some(bytes) = self.bytes.get(self.offset..end) else {
+            return Err(PeerCardError::Truncated(field));
+        };
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn finish(&self) -> Result<(), PeerCardError> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(PeerCardError::TrailingBytes)
+        }
     }
 }
 
@@ -349,6 +651,70 @@ mod tests {
         card.peer_id = identity(3, 2).peer_id();
 
         assert!(!card.is_consistent());
+        assert_eq!(card.validate(), Err(PeerCardError::InconsistentPeerId));
+    }
+
+    #[test]
+    fn peer_card_export_round_trips_text_and_bytes() {
+        let endpoint = IrohEndpointAddr {
+            endpoint_id: [8u8; 32],
+            relay_urls: vec![Url::parse("https://relay.example.test").unwrap()],
+            direct_addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4096)],
+        };
+        let card = identity(5, 6).card_with_iroh_endpoint(endpoint);
+
+        let exported = card.export_string();
+
+        assert!(exported.starts_with(PEER_CARD_EXPORT_PREFIX));
+        assert_eq!(PeerCard::import_string(&exported).unwrap(), card);
+        assert_eq!(PeerCard::from_bytes(&card.to_bytes()).unwrap(), card);
+    }
+
+    #[test]
+    fn peer_card_import_rejects_bad_exports() {
+        assert_eq!(
+            PeerCard::import_string("bad").unwrap_err(),
+            PeerCardError::MissingPrefix
+        );
+        assert_eq!(
+            PeerCard::import_string("enlace-peer-card-v1:***").unwrap_err(),
+            PeerCardError::InvalidEncoding
+        );
+
+        let mut card = identity(1, 2).card().to_bytes();
+        card[0] = PEER_CARD_RECORD_VERSION.wrapping_add(1);
+        assert_eq!(
+            PeerCard::from_bytes(&card).unwrap_err(),
+            PeerCardError::UnsupportedVersion
+        );
+    }
+
+    #[test]
+    fn peer_card_import_rejects_invalid_card_material() {
+        let mut inconsistent = identity(1, 2).card().to_bytes();
+        inconsistent[1] ^= 0xff;
+        assert_eq!(
+            PeerCard::from_bytes(&inconsistent).unwrap_err(),
+            PeerCardError::InconsistentPeerId
+        );
+
+        let mut empty_exchange = identity(1, 2).card();
+        empty_exchange.exchange_key = [0; 32];
+        assert_eq!(
+            empty_exchange.validate().unwrap_err(),
+            PeerCardError::EmptyExchangeKey
+        );
+    }
+
+    #[test]
+    fn trusted_peer_try_from_card_validates() {
+        let mut card = identity(7, 8).card();
+        card.peer_id = identity(9, 8).peer_id();
+
+        assert_eq!(
+            TrustedPeer::try_from_card(card).unwrap_err(),
+            PeerCardError::InconsistentPeerId
+        );
     }
 
     #[test]

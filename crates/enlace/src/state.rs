@@ -27,7 +27,9 @@ use x25519_dalek::StaticSecret;
 use zeroize::Zeroizing;
 
 use crate::config::IrohEndpointAddr;
-use crate::peer::{GroupId, GroupKey, GroupKeyId, PeerCard, PeerId, PeerIdentity, TrustedPeer};
+use crate::peer::{
+    GroupId, GroupKey, GroupKeyId, PeerCard, PeerId, PeerIdentity, TrustError, TrustedPeer,
+};
 
 const LOCAL_SLOT_PREFIX: &[u8] = b"local-slot\0";
 const SEEN_SLOT_PREFIX: &[u8] = b"seen-slot\0";
@@ -115,6 +117,12 @@ impl State {
 
     pub fn trusted_peers(&self) -> Result<Vec<TrustedPeer>, StateError> {
         self.store.trusted_peers()
+    }
+
+    pub fn trust_peer(&self, card: PeerCard) -> Result<TrustedPeer, TrustError> {
+        let peer = TrustedPeer::try_from_card(card)?;
+        self.store_trusted_peer(&peer)?;
+        Ok(peer)
     }
 
     pub fn store_trusted_peer(&self, peer: &TrustedPeer) -> Result<(), StateError> {
@@ -647,12 +655,14 @@ fn decode_trusted_peer(bytes: &[u8]) -> Result<TrustedPeer, StateError> {
     let exchange_key = cursor.array::<32>("exchange key")?;
     let iroh_endpoint = read_endpoint(&mut cursor)?;
     cursor.finish()?;
-    Ok(TrustedPeer::new(PeerCard {
+    let card = PeerCard {
         peer_id,
         signing_key,
         exchange_key,
         iroh_endpoint,
-    }))
+    };
+    TrustedPeer::try_from_card(card)
+        .map_err(|err| StateError::Corrupted(format!("trusted peer card is invalid: {err}")))
 }
 
 fn encode_group_key(key: &GroupKey) -> Vec<u8> {
@@ -1031,6 +1041,24 @@ mod tests {
 
         assert!(state.trusted_peer(trusted.peer_id()).unwrap().is_none());
         assert!(state.group_keys(group).unwrap().is_empty());
+    }
+
+    #[test]
+    fn state_trust_peer_validates_and_stores_one_way_card() {
+        let state = State::memory();
+        let trusted = state.trust_peer(identity(30, 31).card()).unwrap();
+
+        assert_eq!(
+            state.trusted_peer(trusted.peer_id()).unwrap(),
+            Some(trusted.clone())
+        );
+
+        let mut invalid = identity(32, 33).card();
+        invalid.peer_id = trusted.peer_id();
+        assert!(matches!(
+            state.trust_peer(invalid),
+            Err(TrustError::InvalidPeerCard(_))
+        ));
     }
 
     #[test]
