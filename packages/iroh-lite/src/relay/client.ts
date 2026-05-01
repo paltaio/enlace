@@ -56,6 +56,9 @@ export class RelayAuthDeniedError extends Error {
 }
 
 type ReaderItem = Uint8Array | null | Error
+interface TerminalReaderItem {
+  readonly item: ReaderItem
+}
 
 class RelayWebSocketReader {
   private readonly socket: RelayBrowserWebSocket
@@ -64,18 +67,18 @@ class RelayWebSocketReader {
   private readonly onMessage: EventListener
   private readonly onError: EventListener
   private readonly onClose: EventListener
-  private closed = false
+  private terminal: TerminalReaderItem | null = null
 
   constructor(socket: RelayBrowserWebSocket) {
     this.socket = socket
     this.onMessage = (event) => {
-      void this.acceptMessage(event)
+      this.acceptMessage(event)
     }
     this.onError = () => {
-      this.push(new Error('relay websocket error'))
+      this.finish(new Error('relay websocket error'))
     }
     this.onClose = () => {
-      this.close()
+      this.finish(null)
     }
     socket.addEventListener('message', this.onMessage)
     socket.addEventListener('error', this.onError)
@@ -89,6 +92,12 @@ class RelayWebSocketReader {
         return Promise.reject(item)
       }
       return Promise.resolve(item)
+    }
+    if (this.terminal !== null) {
+      if (this.terminal.item instanceof Error) {
+        return Promise.reject(this.terminal.item)
+      }
+      return Promise.resolve(this.terminal.item)
     }
     return new Promise((resolve, reject) => {
       this.waiters.push((next) => {
@@ -105,26 +114,43 @@ class RelayWebSocketReader {
     this.socket.removeEventListener('message', this.onMessage)
     this.socket.removeEventListener('error', this.onError)
     this.socket.removeEventListener('close', this.onClose)
-    this.close()
+    this.finish(null)
   }
 
-  private async acceptMessage(event: Event): Promise<void> {
+  private acceptMessage(event: Event): void {
     try {
-      this.push(await messageEventBytes(event))
+      const bytes = messageEventBytes(event)
+      if (bytes instanceof Promise) {
+        void bytes.then(
+          (resolved) => {
+            this.push(resolved)
+          },
+          (error: unknown) => {
+            this.push(error instanceof Error ? error : new Error(String(error)))
+          },
+        )
+        return
+      }
+      this.push(bytes)
     } catch (error) {
       this.push(error instanceof Error ? error : new Error(String(error)))
     }
   }
 
-  private close(): void {
-    if (this.closed) {
+  private finish(item: ReaderItem): void {
+    if (this.terminal !== null) {
       return
     }
-    this.closed = true
-    this.push(null)
+    this.terminal = { item }
+    for (const waiter of this.waiters.splice(0)) {
+      waiter(item)
+    }
   }
 
   private push(item: ReaderItem): void {
+    if (this.terminal !== null) {
+      return
+    }
     const waiter = this.waiters.shift()
     if (waiter === undefined) {
       this.queue.push(item)
@@ -162,25 +188,27 @@ export class RelayWebSocketClient {
         return null
       }
       const frame = decodeRelayToClientFrame(bytes)
-      switch (frame.type) {
-        case 'ping':
-          this.sendPong(frame.data)
-          break
-        default:
-          return frame
+      if (frame.type !== 'ping') {
+        return frame
+      }
+      if (this.socket.readyState === WEBSOCKET_OPEN) {
+        this.sendPong(frame.data)
       }
     }
   }
 
   sendDatagrams(datagrams: Datagrams): void {
+    this.assertOpen()
     this.sendFrame(encodeClientToRelayFrame({ type: 'datagrams', datagrams }))
   }
 
   sendPing(data: Uint8Array): void {
+    this.assertOpen()
     this.sendFrame(encodeClientToRelayFrame({ type: 'ping', data }))
   }
 
   sendPong(data: Uint8Array): void {
+    this.assertOpen()
     this.sendFrame(encodeClientToRelayFrame({ type: 'pong', data }))
   }
 
@@ -189,11 +217,14 @@ export class RelayWebSocketClient {
     this.reader.dispose()
   }
 
-  private sendFrame(frame: Uint8Array): void {
+  private assertOpen(): void {
     if (this.socket.readyState !== WEBSOCKET_OPEN) {
       throw new Error('relay websocket is not open')
     }
-    this.socket.send(frame)
+  }
+
+  private sendFrame(frame: Uint8Array): void {
+    sendSocketFrame(this.socket, frame)
   }
 }
 
@@ -211,7 +242,7 @@ export async function connectRelayWebSocket(
     const protocol = parseRelayProtocol(socket.protocol)
     const challenge = await readServerChallenge(reader)
     const auth = await createClientAuth(options.secretKey, { challenge })
-    socket.send(encodeClientAuth(auth))
+    sendSocketFrame(socket, encodeClientAuth(auth))
     await readServerConfirmation(reader)
     return new RelayWebSocketClient(socket, reader, url, protocol, auth.endpointId)
   } catch (error) {
@@ -227,14 +258,13 @@ async function readServerChallenge(reader: RelayWebSocketReader): Promise<Uint8A
     throw new Error('relay websocket closed before server challenge')
   }
   const frame = decodeHandshakeFrame(bytes)
-  switch (frame.type) {
-    case 'server-challenge':
-      return frame.challenge
-    case 'server-denies-auth':
-      throw new RelayAuthDeniedError(frame.reason)
-    default:
-      throw new Error(`unexpected relay handshake frame: ${frame.type}`)
+  if (frame.type === 'server-challenge') {
+    return frame.challenge
   }
+  if (frame.type === 'server-denies-auth') {
+    throw new RelayAuthDeniedError(frame.reason)
+  }
+  throw new Error(`unexpected relay handshake frame: ${frame.type}`)
 }
 
 async function readServerConfirmation(reader: RelayWebSocketReader): Promise<void> {
@@ -243,14 +273,13 @@ async function readServerConfirmation(reader: RelayWebSocketReader): Promise<voi
     throw new Error('relay websocket closed before auth confirmation')
   }
   const frame = decodeHandshakeFrame(bytes)
-  switch (frame.type) {
-    case 'server-confirms-auth':
-      return
-    case 'server-denies-auth':
-      throw new RelayAuthDeniedError(frame.reason)
-    default:
-      throw new Error(`unexpected relay handshake frame: ${frame.type}`)
+  if (frame.type === 'server-confirms-auth') {
+    return
   }
+  if (frame.type === 'server-denies-auth') {
+    throw new RelayAuthDeniedError(frame.reason)
+  }
+  throw new Error(`unexpected relay handshake frame: ${frame.type}`)
 }
 
 function defaultWebSocketConstructor(): RelayWebSocketConstructor {
@@ -314,7 +343,14 @@ function closeQuietly(socket: RelayBrowserWebSocket): void {
   }
 }
 
-async function messageEventBytes(event: Event): Promise<Uint8Array> {
+function sendSocketFrame(socket: RelayBrowserWebSocket, frame: Uint8Array): void {
+  if (socket.readyState !== WEBSOCKET_OPEN) {
+    throw new Error('relay websocket is not open')
+  }
+  socket.send(frame)
+}
+
+function messageEventBytes(event: Event): Uint8Array | Promise<Uint8Array> {
   if (!('data' in event)) {
     throw new TypeError('websocket message event has no data')
   }
@@ -330,7 +366,7 @@ async function messageEventBytes(event: Event): Promise<Uint8Array> {
     return copyBytes(bytes)
   }
   if (typeof Blob !== 'undefined' && data instanceof Blob) {
-    return new Uint8Array(await data.arrayBuffer())
+    return data.arrayBuffer().then((buffer) => new Uint8Array(buffer))
   }
   throw new TypeError('relay websocket message must be binary')
 }

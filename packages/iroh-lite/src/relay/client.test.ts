@@ -16,6 +16,7 @@ const challenge = hexToBytes('07070707070707070707070707070707')
 const clientAuth = hexToBytes(
   '01197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d6140425fda43adca848e71a65ded8c4fb4f4434ca7f248aa6aec7c547ff96aa0b33bd3245943b407b12a9d8a55522f1bd07fa03180b01793ed572a8068bc49319205',
 )
+const authDenied = hexToBytes('030e6e6f7420617574686f72697a6564')
 const helloWorld = new TextEncoder().encode('Hello World!')
 
 class FakeWebSocket extends EventTarget implements RelayBrowserWebSocket {
@@ -25,13 +26,13 @@ class FakeWebSocket extends EventTarget implements RelayBrowserWebSocket {
   protocol = 'iroh-relay-v2'
   readyState = 0
   readonly url: string | URL
-  readonly protocols: string | string[] | undefined
+  readonly protocols: string | string[] | null
   readonly sent: Uint8Array[] = []
 
   constructor(url: string | URL, protocols?: string | string[]) {
     super()
     this.url = url
-    this.protocols = protocols
+    this.protocols = protocols ?? null
     FakeWebSocket.instances.push(this)
   }
 
@@ -47,7 +48,7 @@ class FakeWebSocket extends EventTarget implements RelayBrowserWebSocket {
     this.sent.push(new Uint8Array(bytes))
   }
 
-  close(): void {
+  close(_code?: number, _reason?: string): void {
     this.readyState = 3
     this.dispatchEvent(new Event('close'))
   }
@@ -60,6 +61,14 @@ class FakeWebSocket extends EventTarget implements RelayBrowserWebSocket {
   message(bytes: Uint8Array): void {
     const data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
     this.dispatchEvent(new MessageEvent('message', { data }))
+  }
+
+  messageData(data: unknown): void {
+    this.dispatchEvent(new MessageEvent('message', { data }))
+  }
+
+  fail(): void {
+    this.dispatchEvent(new Event('error'))
   }
 }
 
@@ -78,6 +87,23 @@ function latestSocket(): FakeWebSocket {
 async function drainMicrotasks(): Promise<void> {
   await Promise.resolve()
   await Promise.resolve()
+}
+
+async function waitForSent(socket: FakeWebSocket, count: number): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (socket.sent.length >= count) {
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  throw new Error('fake websocket did not send expected frame')
+}
+
+function rejectionReason(promise: Promise<unknown>): Promise<unknown> {
+  return promise.then(
+    () => new Error('expected promise rejection'),
+    (error: unknown) => error,
+  )
 }
 
 async function connectWithServerHandshake(): Promise<{
@@ -121,9 +147,153 @@ describe('relay websocket connect', () => {
     socket.open()
     socket.message(encodeServerChallengeFrame({ challenge }))
     await drainMicrotasks()
-    socket.message(hexToBytes('030e6e6f7420617574686f72697a6564'))
+    socket.message(authDenied)
 
     await expect(connecting).rejects.toEqual(new RelayAuthDeniedError('not authorized'))
+  })
+
+  test('rejects unsupported selected relay subprotocol', async () => {
+    resetFakeSockets()
+    const connecting = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      WebSocket: FakeWebSocket,
+    })
+    const socket = latestSocket()
+    socket.protocol = 'other-protocol'
+    socket.open()
+
+    await expect(connecting).rejects.toThrow(
+      'relay selected unsupported subprotocol: other-protocol',
+    )
+    expect(socket.readyState).toBe(3)
+  })
+
+  test('rejects missing selected relay subprotocol', async () => {
+    resetFakeSockets()
+    const connecting = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      WebSocket: FakeWebSocket,
+    })
+    const socket = latestSocket()
+    socket.protocol = ''
+    socket.open()
+
+    await expect(connecting).rejects.toThrow('relay selected unsupported subprotocol: <none>')
+    expect(socket.readyState).toBe(3)
+  })
+
+  test('rejects open failure and close before open', async () => {
+    resetFakeSockets()
+    const failedOpen = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      WebSocket: FakeWebSocket,
+    })
+    latestSocket().fail()
+    await expect(failedOpen).rejects.toThrow('relay websocket failed to open')
+
+    resetFakeSockets()
+    const closedBeforeOpen = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      WebSocket: FakeWebSocket,
+    })
+    latestSocket().close()
+    await expect(closedBeforeOpen).rejects.toThrow('relay websocket closed before open')
+  })
+
+  test('rejects close before server challenge', async () => {
+    resetFakeSockets()
+    const connecting = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      WebSocket: FakeWebSocket,
+    })
+    const socket = latestSocket()
+    socket.open()
+    socket.close()
+
+    await expect(connecting).rejects.toThrow('relay websocket closed before server challenge')
+  })
+
+  test('rejects close before auth confirmation', async () => {
+    resetFakeSockets()
+    const connecting = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      WebSocket: FakeWebSocket,
+    })
+    const socket = latestSocket()
+    socket.open()
+    socket.message(encodeServerChallengeFrame({ challenge }))
+    await waitForSent(socket, 1)
+    socket.close()
+
+    await expect(connecting).rejects.toThrow('relay websocket closed before auth confirmation')
+    expect(socket.sent).toEqual([clientAuth])
+  })
+
+  test('does not send auth after close during auth creation', async () => {
+    resetFakeSockets()
+    const connecting = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      WebSocket: FakeWebSocket,
+    })
+    const socket = latestSocket()
+    socket.open()
+    socket.message(encodeServerChallengeFrame({ challenge }))
+    socket.close()
+
+    await expect(connecting).rejects.toThrow('relay websocket is not open')
+    expect(socket.sent).toEqual([])
+  })
+
+  test('surfaces server auth denial before challenge', async () => {
+    resetFakeSockets()
+    const connecting = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      WebSocket: FakeWebSocket,
+    })
+    const socket = latestSocket()
+    socket.open()
+    socket.message(authDenied)
+
+    await expect(connecting).rejects.toEqual(new RelayAuthDeniedError('not authorized'))
+    expect(socket.sent).toEqual([])
+  })
+
+  test('rejects unexpected handshake frames', async () => {
+    resetFakeSockets()
+    const missingChallenge = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      WebSocket: FakeWebSocket,
+    })
+    const socket = latestSocket()
+    socket.open()
+    socket.message(encodeServerConfirmsAuthFrame())
+    await expect(missingChallenge).rejects.toThrow(
+      'unexpected relay handshake frame: server-confirms-auth',
+    )
+
+    resetFakeSockets()
+    const missingConfirmation = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      WebSocket: FakeWebSocket,
+    })
+    const nextSocket = latestSocket()
+    nextSocket.open()
+    nextSocket.message(encodeServerChallengeFrame({ challenge }))
+    await drainMicrotasks()
+    nextSocket.message(encodeServerChallengeFrame({ challenge }))
+    await expect(missingConfirmation).rejects.toThrow(
+      'unexpected relay handshake frame: server-challenge',
+    )
   })
 })
 
@@ -151,5 +321,107 @@ describe('relay websocket frames', () => {
     const received = client.receive()
     socket.message(encodeRelayToClientFrame({ type: 'datagrams', datagrams }))
     await expect(received).resolves.toEqual({ type: 'datagrams', datagrams })
+  })
+
+  test('resolves pending receive with null on close', async () => {
+    const { client } = await connectWithServerHandshake()
+    const received = client.receive()
+
+    client.close(1000, 'done')
+
+    await expect(received).resolves.toBeNull()
+  })
+
+  test('resolves all pending and future receives with null on close', async () => {
+    const { client } = await connectWithServerHandshake()
+    const first = client.receive()
+    const second = client.receive()
+
+    client.close()
+
+    await expect(first).resolves.toBeNull()
+    await expect(second).resolves.toBeNull()
+    await expect(client.receive()).resolves.toBeNull()
+  })
+
+  test('does not pong a queued ping after close', async () => {
+    const { client, socket } = await connectWithServerHandshake()
+    const received = client.receive()
+
+    socket.message(encodeRelayToClientFrame({ type: 'ping', data: new Uint8Array(8) }))
+    socket.close()
+
+    await expect(received).resolves.toBeNull()
+    expect(socket.sent).toEqual([clientAuth])
+  })
+
+  test('delivers binary message that arrives before close', async () => {
+    const { client, socket } = await connectWithServerHandshake()
+    const received = client.receive()
+    const datagrams = { endpointId, ecn: null, contents: helloWorld } as const
+
+    socket.message(encodeRelayToClientFrame({ type: 'datagrams', datagrams }))
+    socket.close()
+
+    await expect(received).resolves.toEqual({ type: 'datagrams', datagrams })
+    await expect(client.receive()).resolves.toBeNull()
+  })
+
+  test('rejects pending receive on websocket error', async () => {
+    const { client, socket } = await connectWithServerHandshake()
+    const received = client.receive()
+
+    socket.fail()
+
+    await expect(received).rejects.toThrow('relay websocket error')
+  })
+
+  test('rejects all pending and future receives on websocket error', async () => {
+    const { client, socket } = await connectWithServerHandshake()
+    const first = client.receive()
+    const second = client.receive()
+    const firstRejected = rejectionReason(first)
+    const secondRejected = rejectionReason(second)
+
+    socket.fail()
+
+    for (const error of await Promise.all([firstRejected, secondRejected])) {
+      expect(error).toBeInstanceOf(Error)
+      if (error instanceof Error) {
+        expect(error.message).toBe('relay websocket error')
+      }
+    }
+    await expect(client.receive()).rejects.toThrow('relay websocket error')
+  })
+
+  test('rejects non-binary websocket messages', async () => {
+    const { client, socket } = await connectWithServerHandshake()
+    const received = client.receive()
+
+    socket.messageData('text frame')
+
+    await expect(received).rejects.toThrow('relay websocket message must be binary')
+  })
+
+  test('throws when sending after close', async () => {
+    const { client } = await connectWithServerHandshake()
+
+    client.close()
+
+    expect(() => client.sendPing(new Uint8Array(8))).toThrow('relay websocket is not open')
+    expect(() => client.sendPong(new Uint8Array())).toThrow('relay websocket is not open')
+    expect(() =>
+      client.sendDatagrams({
+        endpointId: new Uint8Array(),
+        ecn: null,
+        contents: new Uint8Array(),
+      }),
+    ).toThrow('relay websocket is not open')
+  })
+
+  test('validates outgoing frames while open', async () => {
+    const { client } = await connectWithServerHandshake()
+
+    expect(() => client.sendPing(new Uint8Array())).toThrow('ping/pong payload must be 8 bytes')
   })
 })
