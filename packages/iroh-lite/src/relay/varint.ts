@@ -1,3 +1,5 @@
+import { readU8 } from "../bytes";
+
 export const MAX_QUIC_VARINT = (1n << 62n) - 1n;
 
 export interface VarIntDecodeResult {
@@ -42,11 +44,7 @@ export function encodeVarInt(value: number | bigint): Uint8Array {
 }
 
 export function decodeVarInt(bytes: Uint8Array, offset = 0): VarIntDecodeResult {
-  const first = bytes[offset];
-  if (first === undefined) {
-    throw new RangeError("not enough bytes for QUIC varint");
-  }
-
+  const first = readU8(bytes, offset);
   const prefix = first >> 6;
   const length = 1 << prefix;
   if (bytes.length - offset < length) {
@@ -55,10 +53,7 @@ export function decodeVarInt(bytes: Uint8Array, offset = 0): VarIntDecodeResult 
 
   let value = BigInt(first & 0x3f);
   for (let index = 1; index < length; index += 1) {
-    const byte = bytes[offset + index];
-    if (byte === undefined) {
-      throw new RangeError("not enough bytes for QUIC varint");
-    }
+    const byte = readU8(bytes, offset + index);
     value = (value << 8n) | BigInt(byte);
   }
 

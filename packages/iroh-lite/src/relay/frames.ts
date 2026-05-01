@@ -1,6 +1,7 @@
 import {
   concatBytes,
   copyBytes,
+  readU8,
   readU16BE,
   readU32BE,
   requireLength,
@@ -109,10 +110,7 @@ function decodeDatagrams(payload: Uint8Array, isBatch: boolean): Datagrams {
     throw new RangeError("invalid datagrams frame");
   }
   const endpointId = validateEndpointId(payload.subarray(0, ENDPOINT_ID_LENGTH));
-  const ecnByte = payload[ENDPOINT_ID_LENGTH];
-  if (ecnByte === undefined) {
-    throw new RangeError("invalid datagrams frame");
-  }
+  const ecnByte = readU8(payload, ENDPOINT_ID_LENGTH);
   const maskedEcn = ecnByte & 0b11;
   const ecn = maskedEcn === 0 ? null : parseEcn(maskedEcn);
   if (isBatch) {
@@ -140,15 +138,12 @@ function parseStatus(payload: Uint8Array): RelayStatusValue {
   if (payload.length < 1) {
     throw new RangeError("invalid status frame");
   }
-  const value = payload[0];
+  const value = readU8(payload, 0);
   if (value === RelayStatus.Healthy) {
     return { type: "healthy" };
   }
   if (value === RelayStatus.SameEndpointIdConnected) {
     return { type: "same-endpoint-id-connected" };
-  }
-  if (value === undefined) {
-    throw new RangeError("invalid status frame");
   }
   return { type: "unknown", value };
 }

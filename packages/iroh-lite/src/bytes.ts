@@ -19,6 +19,14 @@ export function requireLength(bytes: Uint8Array, length: number, name: string): 
   }
 }
 
+export function readU8(bytes: Uint8Array, offset: number): number {
+  const value = bytes[offset];
+  if (value === undefined) {
+    throw new RangeError("not enough bytes for u8");
+  }
+  return value;
+}
+
 export function readU16BE(bytes: Uint8Array, offset: number): number {
   const hi = bytes[offset];
   const lo = bytes[offset + 1];
@@ -65,7 +73,7 @@ export function encodePostcardLen(value: number): Uint8Array {
   const out: number[] = [];
   let remaining = value;
   while (remaining >= 0x80) {
-    out.push((remaining & 0x7f) | 0x80);
+    out.push((remaining % 0x80) | 0x80);
     remaining = Math.floor(remaining / 0x80);
   }
   out.push(remaining);
@@ -82,10 +90,7 @@ export function decodePostcardLen(bytes: Uint8Array, offset = 0): PostcardLen {
   let shift = 0;
   let pos = offset;
   while (pos < bytes.length) {
-    const byte = bytes[pos];
-    if (byte === undefined) {
-      throw new RangeError("not enough bytes for postcard length");
-    }
+    const byte = readU8(bytes, pos);
     value += (byte & 0x7f) * 2 ** shift;
     pos += 1;
     if ((byte & 0x80) === 0) {
