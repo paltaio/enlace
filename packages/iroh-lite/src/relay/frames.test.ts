@@ -1,21 +1,19 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from 'bun:test'
 
-import { bytesToHex, hexToBytes } from "../testing/hex";
+import { bytesToHex, hexToBytes } from '../testing/hex'
 import {
   FrameType,
   decodeClientToRelayFrame,
   decodeRelayToClientFrame,
   encodeClientToRelayFrame,
   encodeRelayToClientFrame,
-} from "./frames";
+} from './frames'
 
-const endpointId = hexToBytes(
-  "197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61",
-);
-const helloWorld = new TextEncoder().encode("Hello World!");
+const endpointId = hexToBytes('197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61')
+const helloWorld = new TextEncoder().encode('Hello World!')
 
-describe("relay frame tags", () => {
-  test("matches pinned iroh-relay frame ids", () => {
+describe('relay frame tags', () => {
+  test('matches pinned iroh-relay frame ids', () => {
     expect(FrameType).toEqual({
       ServerChallenge: 0,
       ClientAuth: 1,
@@ -31,118 +29,118 @@ describe("relay frame tags", () => {
       Health: 11,
       Restarting: 12,
       Status: 13,
-    });
-  });
-});
+    })
+  })
+})
 
-describe("relay-to-client frames", () => {
-  test("encodes and decodes ping", () => {
-    const encoded = encodeRelayToClientFrame({ type: "ping", data: new Uint8Array(8).fill(42) });
-    expect(bytesToHex(encoded)).toBe("092a2a2a2a2a2a2a2a");
+describe('relay-to-client frames', () => {
+  test('encodes and decodes ping', () => {
+    const encoded = encodeRelayToClientFrame({ type: 'ping', data: new Uint8Array(8).fill(42) })
+    expect(bytesToHex(encoded)).toBe('092a2a2a2a2a2a2a2a')
     expect(decodeRelayToClientFrame(encoded)).toEqual({
-      type: "ping",
+      type: 'ping',
       data: new Uint8Array(8).fill(42),
-    });
-  });
+    })
+  })
 
-  test("encodes and decodes pong", () => {
-    const encoded = encodeRelayToClientFrame({ type: "pong", data: new Uint8Array(8).fill(42) });
-    expect(bytesToHex(encoded)).toBe("0a2a2a2a2a2a2a2a2a");
+  test('encodes and decodes pong', () => {
+    const encoded = encodeRelayToClientFrame({ type: 'pong', data: new Uint8Array(8).fill(42) })
+    expect(bytesToHex(encoded)).toBe('0a2a2a2a2a2a2a2a2a')
     expect(decodeRelayToClientFrame(encoded)).toEqual({
-      type: "pong",
+      type: 'pong',
       data: new Uint8Array(8).fill(42),
-    });
-  });
+    })
+  })
 
-  test("encodes and decodes endpoint gone", () => {
-    const encoded = encodeRelayToClientFrame({ type: "endpoint-gone", endpointId });
+  test('encodes and decodes endpoint gone', () => {
+    const encoded = encodeRelayToClientFrame({ type: 'endpoint-gone', endpointId })
     expect(bytesToHex(encoded)).toBe(
-      "08197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61",
-    );
-    expect(decodeRelayToClientFrame(encoded)).toEqual({ type: "endpoint-gone", endpointId });
-  });
+      '08197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61',
+    )
+    expect(decodeRelayToClientFrame(encoded)).toEqual({ type: 'endpoint-gone', endpointId })
+  })
 
-  test("encodes and decodes datagram batch", () => {
+  test('encodes and decodes datagram batch', () => {
     const encoded = encodeRelayToClientFrame({
-      type: "datagrams",
+      type: 'datagrams',
       datagrams: { endpointId, ecn: 3, segmentSize: 6, contents: helloWorld },
-    });
+    })
     expect(bytesToHex(encoded)).toBe(
-      "07197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d6103000648656c6c6f20576f726c6421",
-    );
+      '07197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d6103000648656c6c6f20576f726c6421',
+    )
     expect(decodeRelayToClientFrame(encoded)).toEqual({
-      type: "datagrams",
+      type: 'datagrams',
       datagrams: { endpointId, ecn: 3, segmentSize: 6, contents: helloWorld },
-    });
-  });
+    })
+  })
 
-  test("encodes and decodes single datagram", () => {
+  test('encodes and decodes single datagram', () => {
     const encoded = encodeRelayToClientFrame({
-      type: "datagrams",
+      type: 'datagrams',
       datagrams: { endpointId, ecn: 3, contents: helloWorld },
-    });
+    })
     expect(bytesToHex(encoded)).toBe(
-      "06197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d610348656c6c6f20576f726c6421",
-    );
+      '06197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d610348656c6c6f20576f726c6421',
+    )
     expect(decodeRelayToClientFrame(encoded)).toEqual({
-      type: "datagrams",
+      type: 'datagrams',
       datagrams: { endpointId, ecn: 3, contents: helloWorld },
-    });
-  });
+    })
+  })
 
-  test("encodes and decodes restarting", () => {
+  test('encodes and decodes restarting', () => {
     const encoded = encodeRelayToClientFrame({
-      type: "restarting",
+      type: 'restarting',
       reconnectInMs: 10,
       tryForMs: 20,
-    });
-    expect(bytesToHex(encoded)).toBe("0c0000000a00000014");
+    })
+    expect(bytesToHex(encoded)).toBe('0c0000000a00000014')
     expect(decodeRelayToClientFrame(encoded)).toEqual({
-      type: "restarting",
+      type: 'restarting',
       reconnectInMs: 10,
       tryForMs: 20,
-    });
-  });
+    })
+  })
 
-  test("encodes and decodes status", () => {
+  test('encodes and decodes status', () => {
     const encoded = encodeRelayToClientFrame({
-      type: "status",
-      status: { type: "same-endpoint-id-connected" },
-    });
-    expect(bytesToHex(encoded)).toBe("0d01");
+      type: 'status',
+      status: { type: 'same-endpoint-id-connected' },
+    })
+    expect(bytesToHex(encoded)).toBe('0d01')
     expect(decodeRelayToClientFrame(encoded)).toEqual({
-      type: "status",
-      status: { type: "same-endpoint-id-connected" },
-    });
-  });
-});
+      type: 'status',
+      status: { type: 'same-endpoint-id-connected' },
+    })
+  })
+})
 
-describe("client-to-relay frames", () => {
-  test("encodes datagram batch with client tag", () => {
+describe('client-to-relay frames', () => {
+  test('encodes datagram batch with client tag', () => {
     const encoded = encodeClientToRelayFrame({
-      type: "datagrams",
+      type: 'datagrams',
       datagrams: { endpointId, ecn: 3, segmentSize: 6, contents: helloWorld },
-    });
+    })
     expect(bytesToHex(encoded)).toBe(
-      "05197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d6103000648656c6c6f20576f726c6421",
-    );
+      '05197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d6103000648656c6c6f20576f726c6421',
+    )
     expect(decodeClientToRelayFrame(encoded)).toEqual({
-      type: "datagrams",
+      type: 'datagrams',
       datagrams: { endpointId, ecn: 3, segmentSize: 6, contents: helloWorld },
-    });
-  });
+    })
+  })
 
-  test("encodes single datagram with client tag", () => {
+  test('encodes single datagram with client tag', () => {
     const encoded = encodeClientToRelayFrame({
-      type: "datagrams",
+      type: 'datagrams',
       datagrams: { endpointId, ecn: 3, contents: helloWorld },
-    });
+    })
     expect(bytesToHex(encoded)).toBe(
-      "04197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d610348656c6c6f20576f726c6421",
-    );
+      '04197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d610348656c6c6f20576f726c6421',
+    )
     expect(decodeClientToRelayFrame(encoded)).toEqual({
-      type: "datagrams",
+      type: 'datagrams',
       datagrams: { endpointId, ecn: 3, contents: helloWorld },
-    });
-  });
-});
+    })
+  })
+})
