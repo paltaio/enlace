@@ -1,6 +1,6 @@
 import { copyBytes } from '../bytes'
 import type { Datagrams, RelayFrame } from './frames'
-import { decodeRelayToClientFrame, encodeClientToRelayFrame } from './frames'
+import { MAX_FRAME_SIZE, decodeRelayToClientFrame, encodeClientToRelayFrame } from './frames'
 import {
   RELAY_SUBPROTOCOLS,
   createClientAuth,
@@ -356,17 +356,30 @@ function messageEventBytes(event: Event): Uint8Array | Promise<Uint8Array> {
   }
   const data = event.data
   if (data instanceof ArrayBuffer) {
+    assertWebSocketMessageSize(data.byteLength)
     return new Uint8Array(data.slice(0))
   }
   if (data instanceof Uint8Array) {
+    assertWebSocketMessageSize(data.byteLength)
     return copyBytes(data)
   }
   if (ArrayBuffer.isView(data)) {
+    assertWebSocketMessageSize(data.byteLength)
     const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
     return copyBytes(bytes)
   }
   if (typeof Blob !== 'undefined' && data instanceof Blob) {
-    return data.arrayBuffer().then((buffer) => new Uint8Array(buffer))
+    assertWebSocketMessageSize(data.size)
+    return data.arrayBuffer().then((buffer) => {
+      assertWebSocketMessageSize(buffer.byteLength)
+      return new Uint8Array(buffer)
+    })
   }
   throw new TypeError('relay websocket message must be binary')
+}
+
+function assertWebSocketMessageSize(size: number): void {
+  if (size > MAX_FRAME_SIZE) {
+    throw new RangeError(`relay websocket message exceeds ${MAX_FRAME_SIZE} bytes`)
+  }
 }

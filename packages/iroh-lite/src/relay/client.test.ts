@@ -2,7 +2,12 @@ import { describe, expect, test } from 'bun:test'
 
 import type { RelayBrowserWebSocket } from './client'
 import { RelayAuthDeniedError, connectRelayWebSocket } from './client'
-import { encodeClientToRelayFrame, encodeRelayToClientFrame } from './frames'
+import {
+  MAX_FRAME_SIZE,
+  decodeClientToRelayFrame,
+  encodeClientToRelayFrame,
+  encodeRelayToClientFrame,
+} from './frames'
 import {
   RELAY_SUBPROTOCOLS,
   encodeServerChallengeFrame,
@@ -104,6 +109,39 @@ function rejectionReason(promise: Promise<unknown>): Promise<unknown> {
     () => new Error('expected promise rejection'),
     (error: unknown) => error,
   )
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>
+  readonly resolve: (value: T) => void
+  readonly reject: (reason: unknown) => void
+} {
+  let resolveFn: ((value: T) => void) | null = null
+  let rejectFn: ((reason: unknown) => void) | null = null
+  const promise = new Promise<T>((resolve, reject) => {
+    resolveFn = resolve
+    rejectFn = reject
+  })
+  if (resolveFn === null || rejectFn === null) {
+    throw new Error('deferred promise was not initialized')
+  }
+  return { promise, resolve: resolveFn, reject: rejectFn }
+}
+
+async function withTestTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timed out`))
+    }, 500)
+  })
+  try {
+    return await Promise.race([promise, timeout])
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId)
+    }
+  }
 }
 
 async function connectWithServerHandshake(): Promise<{
@@ -297,6 +335,117 @@ describe('relay websocket connect', () => {
   })
 })
 
+describe('relay websocket integration', () => {
+  test('connects through a real websocket upgrade path', async () => {
+    const pingData = new Uint8Array(8).fill(9)
+    const clientDatagrams = { endpointId, ecn: 2, contents: helloWorld } as const
+    const relayDatagrams = { endpointId, ecn: 3, segmentSize: 6, contents: helloWorld } as const
+    const authBytes = deferred<Uint8Array>()
+    const pongFrame = deferred<ReturnType<typeof decodeClientToRelayFrame>>()
+    const datagramsFrame = deferred<ReturnType<typeof decodeClientToRelayFrame>>()
+    const protocolHeader = deferred<string | null>()
+
+    const server = Bun.serve<{ confirmed: boolean }>({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch(request, server) {
+        const url = new URL(request.url)
+        if (url.pathname !== '/relay') {
+          return new Response('not found', { status: 404 })
+        }
+        protocolHeader.resolve(request.headers.get('sec-websocket-protocol'))
+        const upgraded = server.upgrade(request, {
+          headers: { 'Sec-WebSocket-Protocol': 'iroh-relay-v2' },
+          data: { confirmed: false },
+        })
+        if (upgraded) {
+          return
+        }
+        return new Response('upgrade failed', { status: 400 })
+      },
+      websocket: {
+        open(ws) {
+          ws.send(encodeServerChallengeFrame({ challenge }))
+        },
+        message(ws, message) {
+          try {
+            if (typeof message === 'string') {
+              throw new TypeError('relay server expected bytes')
+            }
+            const bytes = new Uint8Array(
+              message.buffer.slice(message.byteOffset, message.byteOffset + message.byteLength),
+            )
+            if (!ws.data.confirmed) {
+              ws.data.confirmed = true
+              authBytes.resolve(bytes)
+              ws.send(encodeServerConfirmsAuthFrame())
+              setTimeout(() => {
+                ws.send(encodeRelayToClientFrame({ type: 'ping', data: pingData }))
+              }, 0)
+              return
+            }
+
+            const frame = decodeClientToRelayFrame(bytes)
+            if (frame.type === 'pong') {
+              pongFrame.resolve(frame)
+              ws.send(encodeRelayToClientFrame({ type: 'datagrams', datagrams: relayDatagrams }))
+              return
+            }
+            datagramsFrame.resolve(frame)
+            setTimeout(() => {
+              ws.close(1000, 'done')
+            }, 0)
+          } catch (error) {
+            authBytes.reject(error)
+            pongFrame.reject(error)
+            datagramsFrame.reject(error)
+            ws.close(1011, 'test failure')
+          }
+        },
+      },
+    })
+
+    try {
+      const client = await withTestTimeout(
+        connectRelayWebSocket({
+          url: `${server.url}ignored?query=removed`,
+          secretKey,
+        }),
+        'connect',
+      )
+
+      expect(await withTestTimeout(protocolHeader.promise, 'protocol header')).toBe(
+        'iroh-relay-v2, iroh-relay-v1',
+      )
+      expect(await withTestTimeout(authBytes.promise, 'auth')).toEqual(clientAuth)
+      const expectedClientUrl = new URL(server.url)
+      expectedClientUrl.protocol = 'ws:'
+      expectedClientUrl.pathname = '/relay'
+      expect(client.url.toString()).toBe(expectedClientUrl.toString())
+      expect(client.protocol).toBe('iroh-relay-v2')
+      expect(client.endpointId).toEqual(endpointId)
+
+      const received = client.receive()
+      await expect(withTestTimeout(pongFrame.promise, 'pong')).resolves.toEqual({
+        type: 'pong',
+        data: pingData,
+      })
+      await expect(received).resolves.toEqual({ type: 'datagrams', datagrams: relayDatagrams })
+
+      const closed = client.receive()
+      client.sendDatagrams(clientDatagrams)
+      await expect(withTestTimeout(datagramsFrame.promise, 'datagrams')).resolves.toEqual({
+        type: 'datagrams',
+        datagrams: clientDatagrams,
+      })
+      await expect(withTestTimeout(closed, 'close')).resolves.toBeNull()
+      client.close()
+    } finally {
+      void server.stop(true)
+    }
+  })
+})
+
 describe('relay websocket frames', () => {
   test('replies to ping and exposes incoming pong', async () => {
     const { client, socket } = await connectWithServerHandshake()
@@ -403,6 +552,28 @@ describe('relay websocket frames', () => {
     await expect(received).rejects.toThrow('relay websocket message must be binary')
   })
 
+  test('rejects websocket messages over frame limit', async () => {
+    const { client, socket } = await connectWithServerHandshake()
+    const received = client.receive()
+
+    socket.messageData(new Uint8Array(MAX_FRAME_SIZE + 1))
+
+    await expect(received).rejects.toThrow(
+      `relay websocket message exceeds ${MAX_FRAME_SIZE} bytes`,
+    )
+  })
+
+  test('rejects blobs over frame limit', async () => {
+    const { client, socket } = await connectWithServerHandshake()
+    const received = client.receive()
+
+    socket.messageData(new Blob([new Uint8Array(MAX_FRAME_SIZE + 1)]))
+
+    await expect(received).rejects.toThrow(
+      `relay websocket message exceeds ${MAX_FRAME_SIZE} bytes`,
+    )
+  })
+
   test('throws when sending after close', async () => {
     const { client } = await connectWithServerHandshake()
 
@@ -423,5 +594,12 @@ describe('relay websocket frames', () => {
     const { client } = await connectWithServerHandshake()
 
     expect(() => client.sendPing(new Uint8Array())).toThrow('ping/pong payload must be 8 bytes')
+    expect(() =>
+      client.sendDatagrams({
+        endpointId,
+        ecn: null,
+        contents: new Uint8Array(),
+      }),
+    ).toThrow('relay datagram contents must not be empty')
   })
 })

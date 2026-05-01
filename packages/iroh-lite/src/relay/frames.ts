@@ -65,9 +65,9 @@ export type ClientRelayFrame =
   | { readonly type: 'pong'; readonly data: Uint8Array }
   | { readonly type: 'datagrams'; readonly datagrams: Datagrams }
 
-function assertPayloadLimit(payloadLength: number): void {
-  if (payloadLength > MAX_PACKET_SIZE) {
-    throw new RangeError(`relay frame payload exceeds ${MAX_PACKET_SIZE} bytes`)
+function assertPayloadLimit(length: number): void {
+  if (length > MAX_PACKET_SIZE) {
+    throw new RangeError(`relay frame exceeds ${MAX_PACKET_SIZE} bytes`)
   }
 }
 
@@ -105,11 +105,12 @@ function encodeDatagrams(
   }
 
   const tag = hasSegmentSize ? batchTag : singleTag
+  const tagBytes = frameTag(tag)
   const payload = hasSegmentSize
     ? concatBytes([endpointId, new Uint8Array([ecn]), writeU16BE(segmentSize), datagrams.contents])
     : concatBytes([endpointId, new Uint8Array([ecn]), datagrams.contents])
-  assertPayloadLimit(payload.length)
-  return concatBytes([frameTag(tag), payload])
+  assertPayloadLimit(tagBytes.length + payload.length)
+  return concatBytes([tagBytes, payload])
 }
 
 function decodeDatagrams(payload: Uint8Array, isBatch: boolean): Datagrams {
@@ -215,6 +216,9 @@ export function encodeClientToRelayFrame(frame: ClientRelayFrame): Uint8Array {
     case 'pong':
       return encodePingPong(FrameType.Pong, frame.data)
     case 'datagrams':
+      if (frame.datagrams.contents.length === 0) {
+        throw new RangeError('relay datagram contents must not be empty')
+      }
       return encodeDatagrams(
         FrameType.ClientToRelayDatagram,
         FrameType.ClientToRelayDatagramBatch,

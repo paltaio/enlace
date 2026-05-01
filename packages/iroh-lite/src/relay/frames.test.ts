@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import { bytesToHex, hexToBytes } from '../testing/hex'
 import {
   FrameType,
+  MAX_PACKET_SIZE,
   decodeClientToRelayFrame,
   decodeRelayToClientFrame,
   encodeClientToRelayFrame,
@@ -142,5 +143,25 @@ describe('client-to-relay frames', () => {
       type: 'datagrams',
       datagrams: { endpointId, ecn: 3, contents: helloWorld },
     })
+  })
+
+  test('rejects empty datagrams', () => {
+    expect(() =>
+      encodeClientToRelayFrame({
+        type: 'datagrams',
+        datagrams: { endpointId, ecn: null, contents: new Uint8Array() },
+      }),
+    ).toThrow('relay datagram contents must not be empty')
+  })
+
+  test('rejects encoded frames over packet limit', () => {
+    const contents = new Uint8Array(MAX_PACKET_SIZE)
+
+    expect(() =>
+      encodeClientToRelayFrame({
+        type: 'datagrams',
+        datagrams: { endpointId, ecn: null, contents },
+      }),
+    ).toThrow(`relay frame exceeds ${MAX_PACKET_SIZE} bytes`)
   })
 })
