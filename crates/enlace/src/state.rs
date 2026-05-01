@@ -14,29 +14,43 @@
 //! across restarts.
 
 use std::collections::HashMap;
+#[cfg(feature = "sled")]
 use std::convert::TryInto;
 use std::error::Error as StdError;
 use std::fmt;
+#[cfg(feature = "sled")]
 use std::net::SocketAddr;
+#[cfg(feature = "sled")]
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
+#[cfg(feature = "sled")]
+use ed25519_dalek::VerifyingKey;
+#[cfg(feature = "sled")]
 use url::Url;
 use x25519_dalek::StaticSecret;
 use zeroize::Zeroizing;
 
+#[cfg(feature = "sled")]
 use crate::config::IrohEndpointAddr;
 use crate::peer::{
     GroupId, GroupKey, GroupKeyId, PeerCard, PeerId, PeerIdentity, TrustError, TrustedPeer,
 };
 
+#[cfg(feature = "sled")]
 const LOCAL_SLOT_PREFIX: &[u8] = b"local-slot\0";
+#[cfg(feature = "sled")]
 const SEEN_SLOT_PREFIX: &[u8] = b"seen-slot\0";
+#[cfg(feature = "sled")]
 const IROH_KEYPAIR_KEY: &[u8] = b"iroh-keypair";
+#[cfg(feature = "sled")]
 const PEER_IDENTITY_KEY: &[u8] = b"peer-identity";
+#[cfg(feature = "sled")]
 const TRUSTED_PEER_PREFIX: &[u8] = b"trusted-peer\0";
+#[cfg(feature = "sled")]
 const GROUP_KEY_PREFIX: &[u8] = b"group-key\0";
+#[cfg(feature = "sled")]
 const RECORD_VERSION: u8 = 1;
 
 /// Failure modes for a [`StateStore`] backend.
@@ -89,6 +103,7 @@ impl State {
     }
 
     /// Open persistent state rooted at `path`.
+    #[cfg(feature = "sled")]
     pub fn file(path: impl AsRef<Path>) -> Result<Self, StateError> {
         Ok(Self::custom(Arc::new(FileStateStore::open(path)?)))
     }
@@ -404,10 +419,12 @@ impl StoredPeerIdentity {
     }
 }
 
+#[cfg(feature = "sled")]
 struct FileStateStore {
     db: sled::Db,
 }
 
+#[cfg(feature = "sled")]
 impl FileStateStore {
     fn open(path: impl AsRef<Path>) -> Result<Self, StateError> {
         let db = sled::open(path).map_err(backend_error)?;
@@ -448,6 +465,7 @@ impl FileStateStore {
     }
 }
 
+#[cfg(feature = "sled")]
 impl StateStore for FileStateStore {
     fn next_local_slot_version(&self, slot: &str) -> Result<u64, StateError> {
         let key = Self::slot_key(LOCAL_SLOT_PREFIX, slot);
@@ -599,6 +617,7 @@ impl StateStore for FileStateStore {
     }
 }
 
+#[cfg(feature = "sled")]
 fn encode_peer_identity(identity: &PeerIdentity) -> Vec<u8> {
     let has_iroh = u8::from(identity.iroh_secret.is_some());
     let mut out = Vec::with_capacity(66 + usize::from(has_iroh) * 32);
@@ -612,6 +631,7 @@ fn encode_peer_identity(identity: &PeerIdentity) -> Vec<u8> {
     out
 }
 
+#[cfg(feature = "sled")]
 fn decode_peer_identity(bytes: &[u8]) -> Result<PeerIdentity, StateError> {
     let mut cursor = Decoder::new(bytes, "peer identity");
     cursor.version()?;
@@ -635,6 +655,7 @@ fn decode_peer_identity(bytes: &[u8]) -> Result<PeerIdentity, StateError> {
     ))
 }
 
+#[cfg(feature = "sled")]
 fn encode_trusted_peer(peer: &TrustedPeer) -> Vec<u8> {
     let card = &peer.card;
     let mut out = Vec::new();
@@ -646,6 +667,7 @@ fn encode_trusted_peer(peer: &TrustedPeer) -> Vec<u8> {
     out
 }
 
+#[cfg(feature = "sled")]
 fn decode_trusted_peer(bytes: &[u8]) -> Result<TrustedPeer, StateError> {
     let mut cursor = Decoder::new(bytes, "trusted peer");
     cursor.version()?;
@@ -665,6 +687,7 @@ fn decode_trusted_peer(bytes: &[u8]) -> Result<TrustedPeer, StateError> {
         .map_err(|err| StateError::Corrupted(format!("trusted peer card is invalid: {err}")))
 }
 
+#[cfg(feature = "sled")]
 fn encode_group_key(key: &GroupKey) -> Vec<u8> {
     let mut out = Vec::with_capacity(65);
     out.push(RECORD_VERSION);
@@ -673,6 +696,7 @@ fn encode_group_key(key: &GroupKey) -> Vec<u8> {
     out
 }
 
+#[cfg(feature = "sled")]
 fn decode_group_key(bytes: &[u8]) -> Result<GroupKey, StateError> {
     let mut cursor = Decoder::new(bytes, "group key");
     cursor.version()?;
@@ -682,6 +706,7 @@ fn decode_group_key(bytes: &[u8]) -> Result<GroupKey, StateError> {
     Ok(GroupKey::new(id, secret))
 }
 
+#[cfg(feature = "sled")]
 fn write_endpoint(out: &mut Vec<u8>, endpoint: Option<&IrohEndpointAddr>) {
     let Some(endpoint) = endpoint else {
         out.push(0);
@@ -693,6 +718,7 @@ fn write_endpoint(out: &mut Vec<u8>, endpoint: Option<&IrohEndpointAddr>) {
     write_string_list(out, endpoint.direct_addrs.iter().map(ToString::to_string));
 }
 
+#[cfg(feature = "sled")]
 fn read_endpoint(cursor: &mut Decoder<'_>) -> Result<Option<IrohEndpointAddr>, StateError> {
     match cursor.u8("iroh endpoint flag")? {
         0 => Ok(None),
@@ -724,6 +750,7 @@ fn read_endpoint(cursor: &mut Decoder<'_>) -> Result<Option<IrohEndpointAddr>, S
     }
 }
 
+#[cfg(feature = "sled")]
 fn write_string_list<'a>(out: &mut Vec<u8>, values: impl Iterator<Item = impl AsRef<str> + 'a>) {
     let start = out.len();
     out.extend_from_slice(&0u32.to_be_bytes());
@@ -737,6 +764,7 @@ fn write_string_list<'a>(out: &mut Vec<u8>, values: impl Iterator<Item = impl As
     out[start..start + 4].copy_from_slice(&count.to_be_bytes());
 }
 
+#[cfg(feature = "sled")]
 fn read_string_list(cursor: &mut Decoder<'_>, field: &str) -> Result<Vec<String>, StateError> {
     let count = cursor.u32(field)?;
     let count = usize::try_from(count)
@@ -750,18 +778,21 @@ fn read_string_list(cursor: &mut Decoder<'_>, field: &str) -> Result<Vec<String>
         .collect()
 }
 
+#[cfg(feature = "sled")]
 fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     let len = u32::try_from(bytes.len()).expect("state record field length overflowed u32");
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(bytes);
 }
 
+#[cfg(feature = "sled")]
 struct Decoder<'a> {
     bytes: &'a [u8],
     offset: usize,
     record: &'static str,
 }
 
+#[cfg(feature = "sled")]
 impl<'a> Decoder<'a> {
     const fn new(bytes: &'a [u8], record: &'static str) -> Self {
         Self {
@@ -829,6 +860,7 @@ impl<'a> Decoder<'a> {
     }
 }
 
+#[cfg(feature = "sled")]
 fn decode_u64(bytes: &[u8], field: &str) -> Result<u64, StateError> {
     let array: [u8; 8] = bytes
         .try_into()
@@ -836,12 +868,14 @@ fn decode_u64(bytes: &[u8], field: &str) -> Result<u64, StateError> {
     Ok(u64::from_be_bytes(array))
 }
 
+#[cfg(feature = "sled")]
 fn decode_iroh_keypair(bytes: &[u8]) -> Result<[u8; 32], StateError> {
     bytes
         .try_into()
         .map_err(|_| StateError::Corrupted("iroh keypair has invalid length".to_owned()))
 }
 
+#[cfg(feature = "sled")]
 fn backend_error(err: impl StdError + Send + Sync + 'static) -> StateError {
     StateError::Backend(Box::new(err))
 }

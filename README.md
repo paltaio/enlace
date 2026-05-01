@@ -15,8 +15,8 @@ transports.
 
 ## Features
 
-Default features enable all built-in transports. For smaller builds, disable
-defaults and select only what you use:
+Default features enable `http`, `pkarr`, `iroh`, and `sled` (file-backed state).
+The `dht` transport is opt-in. Each transport is independent; pick any subset:
 
 ```toml
 enlace = { version = "0.1", default-features = false, features = ["http"] }
@@ -24,7 +24,11 @@ enlace = { version = "0.1", default-features = false, features = ["dht"] }
 enlace = { version = "0.1", default-features = false, features = ["pkarr"] }
 enlace = { version = "0.1", default-features = false, features = ["iroh"] }
 enlace = { version = "0.1", default-features = false, features = ["http", "iroh"] }
+enlace = { version = "0.1", default-features = false, features = ["all-transports"] }
 ```
+
+`sled` is a separate feature for file-backed `State::file(path)`. Builds without
+`sled` keep `State::memory()` and any custom `StateStore` implementation.
 
 ## Modes
 

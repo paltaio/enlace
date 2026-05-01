@@ -2960,7 +2960,6 @@ dependencies = [
  "getrandom 0.4.2",
  "log",
  "lru 0.16.4",
- "mainline",
  "ntimestamp",
  "reqwest",
  "self_cell",
