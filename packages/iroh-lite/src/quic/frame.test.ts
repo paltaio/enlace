@@ -11,6 +11,7 @@ import {
 } from '../testing/rfc9001-quic'
 import { deriveQuicInitialKeys } from './crypto'
 import {
+  encodeQuicAckFrame,
   encodeQuicApplicationConnectionCloseFrame,
   encodeQuicMaxDataFrame,
   encodeQuicMaxStreamDataFrame,
@@ -21,6 +22,7 @@ import {
   parseQuicFrames,
 } from './frame'
 import { decryptQuicInitialPacket } from './initial'
+import { QUIC_MAX_PACKET_NUMBER } from './packet'
 
 describe('QUIC frame parsing', () => {
   test('parses CRYPTO and PADDING from client Initial payload vector', () => {
@@ -65,9 +67,9 @@ describe('QUIC frame parsing', () => {
     if (ack?.type !== 'ack') {
       throw new Error('expected ACK frame')
     }
-    expect(ack.largestAcknowledged).toBe(0)
+    expect(ack.largestAcknowledged).toBe(0n)
     expect(ack.ackDelay).toBe(0)
-    expect(ack.firstAckRange).toBe(0)
+    expect(ack.firstAckRange).toBe(0n)
     expect(ack.ranges).toEqual([])
     expect(ack.offset).toBe(0)
     expect(ack.endOffset).toBe(5)
@@ -88,10 +90,10 @@ describe('QUIC frame parsing', () => {
     expect(result.frames).toEqual([
       {
         type: 'ack-ecn',
-        largestAcknowledged: 20,
+        largestAcknowledged: 20n,
         ackDelay: 1,
-        firstAckRange: 5,
-        ranges: [{ gap: 3, length: 7 }],
+        firstAckRange: 5n,
+        ranges: [{ gap: 3n, length: 7n }],
         ecnCounts: { ect0: 0, ect1: 4, ce: 5 },
         offset: 0,
         endOffset: 10,
@@ -194,6 +196,92 @@ describe('QUIC frame parsing', () => {
     )
   })
 
+  test('encodes ACK for a single received packet', () => {
+    const encoded = encodeQuicAckFrame([7])
+
+    expect(bytesToHex(encoded)).toBe('0207000000')
+    expect(parseQuicFrames(encoded).frames).toEqual([
+      {
+        type: 'ack',
+        largestAcknowledged: 7n,
+        ackDelay: 0,
+        firstAckRange: 0n,
+        ranges: [],
+        offset: 0,
+        endOffset: encoded.length,
+      },
+    ])
+  })
+
+  test('encodes contiguous ACK packets as one range', () => {
+    const encoded = encodeQuicAckFrame([5, 6, 7])
+
+    expect(bytesToHex(encoded)).toBe('0207000002')
+    expect(parseQuicFrames(encoded).frames).toEqual([
+      {
+        type: 'ack',
+        largestAcknowledged: 7n,
+        ackDelay: 0,
+        firstAckRange: 2n,
+        ranges: [],
+        offset: 0,
+        endOffset: encoded.length,
+      },
+    ])
+  })
+
+  test('encodes sparse ACK packets with gaps and extra ranges', () => {
+    const encoded = encodeQuicAckFrame([1, 2, 5, 8, 9, 10])
+
+    expect(bytesToHex(encoded)).toBe('020a00020201000101')
+    expect(parseQuicFrames(encoded).frames).toEqual([
+      {
+        type: 'ack',
+        largestAcknowledged: 10n,
+        ackDelay: 0,
+        firstAckRange: 2n,
+        ranges: [
+          { gap: 1n, length: 0n },
+          { gap: 1n, length: 1n },
+        ],
+        offset: 0,
+        endOffset: encoded.length,
+      },
+    ])
+  })
+
+  test('sorts and deduplicates ACK packet numbers before encoding', () => {
+    const encoded = encodeQuicAckFrame([10n, 7, 8, 10, 9, 7])
+
+    expect(parseQuicFrames(encoded).frames).toEqual([
+      {
+        type: 'ack',
+        largestAcknowledged: 10n,
+        ackDelay: 0,
+        firstAckRange: 3n,
+        ranges: [],
+        offset: 0,
+        endOffset: encoded.length,
+      },
+    ])
+  })
+
+  test('encodes ACK packet numbers up to the QUIC maximum', () => {
+    const encoded = encodeQuicAckFrame([QUIC_MAX_PACKET_NUMBER])
+
+    expect(parseQuicFrames(encoded).frames).toEqual([
+      {
+        type: 'ack',
+        largestAcknowledged: QUIC_MAX_PACKET_NUMBER,
+        ackDelay: 0,
+        firstAckRange: 0n,
+        ranges: [],
+        offset: 0,
+        endOffset: encoded.length,
+      },
+    ])
+  })
+
   test('rejects unsupported frame type', () => {
     expect(() => parseQuicFrames(hexToBytes('04'))).toThrow('unsupported QUIC frame type 0x4')
   })
@@ -229,6 +317,15 @@ describe('QUIC frame parsing', () => {
   test('encodes PADDING frames with validated length', () => {
     expect(encodeQuicPaddingFrame(3)).toEqual(hexToBytes('000000'))
     expect(() => encodeQuicPaddingFrame(-1)).toThrow('QUIC PADDING length out of range')
+  })
+
+  test('rejects invalid ACK packet numbers', () => {
+    expect(() => encodeQuicAckFrame([])).toThrow('QUIC ACK requires at least one packet number')
+    expect(() => encodeQuicAckFrame([-1])).toThrow('QUIC packet number out of range')
+    expect(() => encodeQuicAckFrame([QUIC_MAX_PACKET_NUMBER + 1n])).toThrow(
+      'QUIC packet number out of range',
+    )
+    expect(() => encodeQuicAckFrame([1], -1)).toThrow('QUIC ACK delay out of range')
   })
 
   test('rejects ACK first range underflow', () => {

@@ -1,5 +1,6 @@
 import { concatBytes, copyBytes, readU8 } from '../bytes'
-import { decodeVarIntNumber, encodeVarInt } from '../varint'
+import { decodeVarInt, decodeVarIntNumber, encodeVarInt } from '../varint'
+import { quicPacketNumberToBigInt } from './packet'
 
 export const QuicFrameType = {
   Padding: 0x00,
@@ -39,8 +40,8 @@ export interface QuicPingFrame {
 }
 
 export interface QuicAckRange {
-  readonly gap: number
-  readonly length: number
+  readonly gap: bigint
+  readonly length: bigint
 }
 
 export interface QuicAckEcnCounts {
@@ -51,9 +52,9 @@ export interface QuicAckEcnCounts {
 
 export interface QuicAckFrame {
   readonly type: 'ack'
-  readonly largestAcknowledged: number
+  readonly largestAcknowledged: bigint
   readonly ackDelay: number
-  readonly firstAckRange: number
+  readonly firstAckRange: bigint
   readonly ranges: readonly QuicAckRange[]
   readonly offset: number
   readonly endOffset: number
@@ -126,6 +127,11 @@ export interface QuicFramesParseResult {
   readonly endOffset: number
 }
 
+interface QuicAckPacketRange {
+  readonly smallest: bigint
+  readonly largest: bigint
+}
+
 export function encodeQuicPaddingFrame(length: number): Uint8Array {
   if (!Number.isSafeInteger(length) || length < 0) {
     throw new RangeError('QUIC PADDING length out of range')
@@ -135,6 +141,41 @@ export function encodeQuicPaddingFrame(length: number): Uint8Array {
 
 export function encodeQuicPingFrame(): Uint8Array {
   return new Uint8Array([QuicFrameType.Ping])
+}
+
+export function encodeQuicAckFrame(
+  receivedPacketNumbers: readonly (number | bigint)[],
+  ackDelay = 0,
+): Uint8Array {
+  const ranges = buildAckPacketRanges(receivedPacketNumbers)
+  if (ranges.length === 0) {
+    throw new RangeError('QUIC ACK requires at least one packet number')
+  }
+  if (!Number.isSafeInteger(ackDelay) || ackDelay < 0) {
+    throw new RangeError('QUIC ACK delay out of range')
+  }
+
+  const firstRange = ranges[0]
+  if (firstRange === undefined) {
+    throw new RangeError('QUIC ACK requires at least one packet number')
+  }
+
+  const fields = [
+    new Uint8Array([QuicFrameType.Ack]),
+    encodeVarInt(firstRange.largest),
+    encodeVarInt(ackDelay),
+    encodeVarInt(ranges.length - 1),
+    encodeVarInt(firstRange.largest - firstRange.smallest),
+  ]
+
+  let previousSmallest = firstRange.smallest
+  for (const range of ranges.slice(1)) {
+    fields.push(encodeVarInt(previousSmallest - range.largest - 2n))
+    fields.push(encodeVarInt(range.largest - range.smallest))
+    previousSmallest = range.smallest
+  }
+
+  return concatBytes(fields)
 }
 
 export function encodeQuicStreamFrame(
@@ -307,22 +348,22 @@ function parseAckFrame(
   frameType: typeof QuicFrameType.Ack | typeof QuicFrameType.AckEcn,
 ): QuicAckFrame | QuicAckEcnFrame {
   let pos = offset + 1
-  const largestAcknowledged = decodeVarIntNumber(bytes, pos)
+  const largestAcknowledged = decodeVarInt(bytes, pos)
   pos += largestAcknowledged.bytesRead
   const ackDelay = decodeVarIntNumber(bytes, pos)
   pos += ackDelay.bytesRead
   const ackRangeCount = decodeVarIntNumber(bytes, pos)
   pos += ackRangeCount.bytesRead
-  const firstAckRange = decodeVarIntNumber(bytes, pos)
+  const firstAckRange = decodeVarInt(bytes, pos)
   pos += firstAckRange.bytesRead
   const ranges: QuicAckRange[] = []
   validateFirstAckRange(largestAcknowledged.value, firstAckRange.value)
   let smallestAcknowledged = largestAcknowledged.value - firstAckRange.value
 
   for (let index = 0; index < ackRangeCount.value; index += 1) {
-    const gap = decodeVarIntNumber(bytes, pos)
+    const gap = decodeVarInt(bytes, pos)
     pos += gap.bytesRead
-    const length = decodeVarIntNumber(bytes, pos)
+    const length = decodeVarInt(bytes, pos)
     pos += length.bytesRead
     smallestAcknowledged = validateAckRange(smallestAcknowledged, gap.value, length.value)
     ranges.push({ gap: gap.value, length: length.value })
@@ -457,25 +498,53 @@ function parseConnectionCloseFrame(
   }
 }
 
-function validateFirstAckRange(largestAcknowledged: number, firstAckRange: number): void {
+function validateFirstAckRange(largestAcknowledged: bigint, firstAckRange: bigint): void {
   if (firstAckRange > largestAcknowledged) {
     throw new RangeError('QUIC ACK first range exceeds largest acknowledged')
   }
 }
 
 function validateAckRange(
-  previousSmallestAcknowledged: number,
-  gap: number,
-  length: number,
-): number {
-  if (previousSmallestAcknowledged < gap + 2) {
+  previousSmallestAcknowledged: bigint,
+  gap: bigint,
+  length: bigint,
+): bigint {
+  if (previousSmallestAcknowledged < gap + 2n) {
     throw new RangeError('QUIC ACK range gap underflows packet number')
   }
-  const largestAcknowledged = previousSmallestAcknowledged - gap - 2
+  const largestAcknowledged = previousSmallestAcknowledged - gap - 2n
   if (length > largestAcknowledged) {
     throw new RangeError('QUIC ACK range length underflows packet number')
   }
   return largestAcknowledged - length
+}
+
+function buildAckPacketRanges(
+  receivedPacketNumbers: readonly (number | bigint)[],
+): readonly QuicAckPacketRange[] {
+  const sorted = Array.from(
+    new Set(receivedPacketNumbers.map((packetNumber) => quicPacketNumberToBigInt(packetNumber))),
+  ).sort((left, right) => {
+    if (left > right) {
+      return -1
+    }
+    if (left < right) {
+      return 1
+    }
+    return 0
+  })
+  const ranges: QuicAckPacketRange[] = []
+
+  for (const packetNumber of sorted) {
+    const current = ranges.at(-1)
+    if (current !== undefined && packetNumber + 1n === current.smallest) {
+      ranges[ranges.length - 1] = { ...current, smallest: packetNumber }
+      continue
+    }
+    ranges.push({ smallest: packetNumber, largest: packetNumber })
+  }
+
+  return ranges
 }
 
 function parseAckEcnCounts(
