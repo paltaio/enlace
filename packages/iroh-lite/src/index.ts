@@ -1,5 +1,19 @@
 export { RELAY_CHALLENGE_DOMAIN, deriveRelayChallengeKey } from './crypto/blake3'
 export {
+  IrohBidiStream,
+  IrohConnection,
+  IrohEndpoint,
+  IrohUniStream,
+  createEndpoint,
+} from './endpoint'
+export type {
+  IrohEndpointAcceptOptions,
+  IrohEndpointAddress,
+  IrohEndpointConnectOptions,
+  IrohEndpointOptions,
+  IrohStreamRead,
+} from './endpoint'
+export {
   ENDPOINT_ID_LENGTH,
   SECRET_KEY_LENGTH,
   SIGNATURE_LENGTH,

@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./endpoint": "./src/endpoint.ts",
     "./varint": "./src/varint.ts",
     "./relay/client": "./src/relay/client.ts",
     "./relay/frames": "./src/relay/frames.ts",
