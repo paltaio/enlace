@@ -19,6 +19,16 @@ export interface NativeIrohEchoClientResult {
   readonly payload: Uint8Array
 }
 
+export interface NativeIrohGossipSendOptions {
+  readonly relayUrl: string
+  readonly serverEndpointId: Uint8Array
+}
+
+export interface NativeIrohGossipSendResult {
+  readonly topicId: Uint8Array
+  readonly payload: Uint8Array
+}
+
 export async function startNativeIrohEchoServer(relayUrl: string): Promise<NativeIrohEchoServer> {
   const proc = Bun.spawn(
     ['cargo', 'run', '--quiet', '--manifest-path', nativeIrohEchoManifestPath()],
@@ -96,6 +106,46 @@ export async function runNativeIrohEchoClient(
   }
 
   return parseClientResult(output)
+}
+
+export async function runNativeIrohGossipSender(
+  options: NativeIrohGossipSendOptions,
+): Promise<NativeIrohGossipSendResult> {
+  const proc = Bun.spawn(
+    [
+      'cargo',
+      'run',
+      '--quiet',
+      '--manifest-path',
+      nativeIrohEchoManifestPath(),
+      '--',
+      'gossip-send',
+    ],
+    {
+      env: {
+        ...Bun.env,
+        CARGO_TARGET_DIR: Bun.env.IROH_NATIVE_ECHO_TARGET_DIR ?? nativeIrohEchoTargetDir(),
+        IROH_RELAY_URL: options.relayUrl,
+        IROH_SERVER_ENDPOINT_ID_HEX: bytesToHex(options.serverEndpointId),
+        RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  )
+  const stdout = streamToText(proc.stdout)
+  const stderr = streamToText(proc.stderr)
+  const exitCode = await waitForProcessExit(proc, 'native iroh gossip sender', 120_000)
+  const output = await stdout
+  const errorOutput = await stderr
+
+  if (exitCode !== 0) {
+    throw new Error(
+      `native iroh gossip sender exited with code ${exitCode}${processOutput(errorOutput)}`,
+    )
+  }
+
+  return parseGossipSendResult(output)
 }
 
 async function readReadyEndpointId(
@@ -178,6 +228,16 @@ function parseClientResult(output: string): NativeIrohEchoClientResult {
   throw new Error(`native iroh echo client did not report success${processOutput(output)}`)
 }
 
+function parseGossipSendResult(output: string): NativeIrohGossipSendResult {
+  for (const line of output.split('\n')) {
+    const result = parseGossipSendResultLine(line)
+    if (result !== null) {
+      return result
+    }
+  }
+  throw new Error(`native iroh gossip sender did not report success${processOutput(output)}`)
+}
+
 function parseClientResultLine(line: string): NativeIrohEchoClientResult | null {
   const prefix = 'IROH_NATIVE_ECHO_CLIENT_OK payload_hex='
   if (!line.startsWith(prefix)) {
@@ -188,6 +248,22 @@ function parseClientResultLine(line: string): NativeIrohEchoClientResult | null 
     throw new Error(`native iroh echo client printed invalid payload hex: ${payloadHex}`)
   }
   return {
+    payload: hexToBytes(payloadHex),
+  }
+}
+
+function parseGossipSendResultLine(line: string): NativeIrohGossipSendResult | null {
+  const match =
+    /^IROH_NATIVE_GOSSIP_SEND_OK topic_id_hex=([0-9a-f]{64}) payload_hex=([0-9a-f]*)$/.exec(line)
+  if (match === null) {
+    return null
+  }
+  const [, topicIdHex, payloadHex] = match
+  if (topicIdHex === undefined || payloadHex === undefined || payloadHex.length % 2 !== 0) {
+    throw new Error(`native iroh gossip sender printed invalid result: ${line}`)
+  }
+  return {
+    topicId: hexToBytes(topicIdHex),
     payload: hexToBytes(payloadHex),
   }
 }

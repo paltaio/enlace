@@ -50,6 +50,8 @@ export interface BidiStreamWriteOptions {
   readonly fin?: boolean
 }
 
+type EndpointStream = BidiStream | UniStream
+
 export class Endpoint {
   readonly relayUrl: URL
   readonly endpointId: Uint8Array
@@ -138,9 +140,11 @@ export class Endpoint {
 export class Connection {
   readonly #relayClient: RelayWebSocketClient
   readonly #driver: EndpointConnectionDriver
-  readonly #streams = new Map<number, BidiStream>()
-  readonly #acceptedStreams: BidiStream[] = []
+  readonly #streams = new Map<number, EndpointStream>()
+  readonly #acceptedBidiStreams: BidiStream[] = []
+  readonly #acceptedUniStreams: UniStream[] = []
   #nextBidiStreamId: number | null = null
+  #nextUniStreamId: number | null = null
 
   constructor(relayClient: RelayWebSocketClient, driver: EndpointConnectionDriver) {
     this.#relayClient = relayClient
@@ -155,9 +159,27 @@ export class Connection {
     return stream
   }
 
+  openUniStream(): UniStream {
+    const streamId = this.nextOpenUniStreamId()
+    const stream = new UniStream(this, streamId)
+    this.#streams.set(streamId, stream)
+    this.#nextUniStreamId = streamId + 4
+    return stream
+  }
+
   async acceptBidiStream(): Promise<BidiStream> {
     while (true) {
-      const stream = this.#acceptedStreams.shift()
+      const stream = this.#acceptedBidiStreams.shift()
+      if (stream !== undefined) {
+        return stream
+      }
+      await this.receiveRelayDatagrams()
+    }
+  }
+
+  async acceptUniStream(): Promise<UniStream> {
+    while (true) {
+      const stream = this.#acceptedUniStreams.shift()
       if (stream !== undefined) {
         return stream
       }
@@ -218,10 +240,17 @@ export class Connection {
         existing.enqueueOutput(output)
         continue
       }
+      if (isUnidirectionalStream(output.streamId)) {
+        const uniStream = new UniStream(this, output.streamId)
+        uniStream.enqueueOutput(output)
+        this.#streams.set(output.streamId, uniStream)
+        this.#acceptedUniStreams.push(uniStream)
+        continue
+      }
       const stream = new BidiStream(this, output.streamId)
       stream.enqueueOutput(output)
       this.#streams.set(output.streamId, stream)
-      this.#acceptedStreams.push(stream)
+      this.#acceptedBidiStreams.push(stream)
     }
   }
 
@@ -235,31 +264,81 @@ export class Connection {
     return this.#nextBidiStreamId
   }
 
+  private nextOpenUniStreamId(): number {
+    if (this.#nextUniStreamId === null) {
+      this.setInitialStreamId()
+    }
+    if (this.#nextUniStreamId === null) {
+      throw new RangeError('connection is not ready to open streams')
+    }
+    return this.#nextUniStreamId
+  }
+
   private setInitialStreamId(): void {
-    if (this.#nextBidiStreamId !== null) {
+    if (this.#nextBidiStreamId !== null && this.#nextUniStreamId !== null) {
       return
     }
     const role = this.#driver.connection?.role
     if (role === QuicEndpointRole.Client) {
       this.#nextBidiStreamId = 0
+      this.#nextUniStreamId = 2
       return
     }
     if (role === QuicEndpointRole.Server) {
       this.#nextBidiStreamId = 1
+      this.#nextUniStreamId = 3
       return
     }
   }
 
-  private requireStream(streamId: number): BidiStream {
+  private requireStream(streamId: number): EndpointStream {
     const stream = this.#streams.get(streamId)
     if (stream === undefined) {
-      throw new RangeError('unknown bidirectional stream')
+      throw new RangeError('unknown stream')
     }
     return stream
   }
 }
 
 export class BidiStream {
+  readonly #connection: Connection
+  readonly #outputs: QuicStreamReceiveOutput[] = []
+  readonly streamId: number
+
+  constructor(connection: Connection, streamId: number) {
+    this.#connection = connection
+    this.streamId = streamId
+  }
+
+  write(data: Uint8Array, options: BidiStreamWriteOptions = {}): void {
+    this.#connection.sendStream(this.streamId, data, options.fin ?? false)
+  }
+
+  async read(): Promise<QuicStreamReceiveOutput> {
+    return await this.#connection.readStreamOutput(this.streamId)
+  }
+
+  async readToEnd(): Promise<Uint8Array> {
+    const chunks: Uint8Array[] = []
+    while (true) {
+      const output = await this.read()
+      chunks.push(output.data)
+      if (output.complete) {
+        return concatBytes(chunks)
+      }
+    }
+  }
+
+  enqueueOutput(output: QuicStreamReceiveOutput): void {
+    this.#outputs.push(output)
+  }
+
+  dequeueOutput(): QuicStreamReceiveOutput | null {
+    return this.#outputs.shift() ?? null
+  }
+}
+
+export class UniStream {
   readonly #connection: Connection
   readonly #outputs: QuicStreamReceiveOutput[] = []
   readonly streamId: number
@@ -370,4 +449,8 @@ function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
     diff |= (left[index] ?? 0) ^ (right[index] ?? 0)
   }
   return diff === 0
+}
+
+function isUnidirectionalStream(streamId: number): boolean {
+  return (streamId & 0x02) === 0x02
 }
