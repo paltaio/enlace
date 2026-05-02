@@ -1,5 +1,5 @@
 import { copyBytes, readU8, readU32BE } from '../bytes'
-import { decodeVarIntNumber } from '../relay/varint'
+import { decodeVarIntNumber } from '../varint'
 
 export const QUIC_VERSION_1 = 0x00000001
 

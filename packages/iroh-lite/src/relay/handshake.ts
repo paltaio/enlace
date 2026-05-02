@@ -14,7 +14,7 @@ import {
 } from '../crypto/ed25519'
 import { deriveRelayChallengeKey } from '../crypto/blake3'
 import { FrameType } from './frames'
-import { decodeVarIntNumber, encodeVarInt } from './varint'
+import { decodeVarIntNumber, encodeVarInt } from '../varint'
 
 export {
   RELAY_PATH,

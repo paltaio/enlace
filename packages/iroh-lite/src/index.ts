@@ -63,5 +63,5 @@ export {
   relayUrlToWebSocketUrl,
 } from './relay/url'
 export type { RelayUrlInput } from './relay/url'
-export { MAX_QUIC_VARINT, decodeVarInt, decodeVarIntNumber, encodeVarInt } from './relay/varint'
-export type { VarIntDecodeResult } from './relay/varint'
+export { MAX_QUIC_VARINT, decodeVarInt, decodeVarIntNumber, encodeVarInt } from './varint'
+export type { VarIntDecodeResult } from './varint'

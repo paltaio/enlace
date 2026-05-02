@@ -9,7 +9,7 @@ import {
   writeU32BE,
 } from '../bytes'
 import { ENDPOINT_ID_LENGTH, validateEndpointId } from '../crypto/ed25519'
-import { decodeVarIntNumber, encodeVarInt } from './varint'
+import { decodeVarIntNumber, encodeVarInt } from '../varint'
 
 export const MAX_PACKET_SIZE = 64 * 1024
 export const MAX_FRAME_SIZE = 1024 * 1024
