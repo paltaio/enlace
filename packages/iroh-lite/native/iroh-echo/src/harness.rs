@@ -7,12 +7,15 @@ use iroh::{
 };
 use tokio::io;
 
+mod gossip_vectors;
+
 const ALPN: &[u8] = b"/iroh/echo/1";
 
 pub async fn run_from_args(mut args: impl Iterator<Item = String>) -> Result<()> {
     let _program = args.next();
     match args.next().as_deref() {
         Some("client") => run_client().await,
+        Some("gossip-vectors") => gossip_vectors::run(),
         _ => run_server().await,
     }
 }

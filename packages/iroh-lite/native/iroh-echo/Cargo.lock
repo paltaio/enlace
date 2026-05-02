@@ -363,6 +363,9 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "cc"
@@ -1283,6 +1286,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
 name = "hickory-net"
 version = "0.26.0-beta.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1763,11 +1772,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "iroh-gossip"
+version = "0.98.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b349a9ab58e3b56cf41df693bc1812add192ad70ce7c8d0dbdc7d0319d71b11f"
+dependencies = [
+ "blake3",
+ "bytes",
+ "constant_time_eq",
+ "data-encoding",
+ "derive_more",
+ "ed25519-dalek",
+ "hex",
+ "indexmap",
+ "iroh-base",
+ "iroh-metrics",
+ "n0-error",
+ "n0-future",
+ "postcard",
+ "rand 0.10.1",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "iroh-lite-native-echo"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "iroh",
+ "iroh-gossip",
+ "n0-future",
+ "postcard",
+ "rand 0.10.1",
  "tokio",
 ]
 
@@ -2102,6 +2140,7 @@ version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af4782b4baf92d686d161c15460c83d16ebcfd215918763903e9619842665cae"
 dependencies = [
+ "anyhow",
  "n0-error-macros",
  "spez",
 ]
