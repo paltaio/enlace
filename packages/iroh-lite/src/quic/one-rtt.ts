@@ -1,8 +1,8 @@
 import { concatBytes, copyBytes, readU8 } from '../bytes'
 import {
+  QuicAckReceiveTracker,
   receiveQuicOneRttPlaintextFrames,
   type QuicAckReceiveSnapshot,
-  type QuicAckReceiveTracker,
 } from './ack'
 import {
   createQuicHeaderProtectionMask,
@@ -57,6 +57,47 @@ export interface QuicOneRttPacketProtectionOptions {
   readonly packetNumber: number | bigint
   readonly packetNumberLength: number
   readonly payload: Uint8Array
+}
+
+export class QuicOneRttReceiveState {
+  readonly #ackTracker = new QuicAckReceiveTracker()
+  #largestReceivedPacketNumber: bigint | null
+
+  constructor(largestReceivedPacketNumber: number | bigint | null = null) {
+    this.#largestReceivedPacketNumber =
+      largestReceivedPacketNumber === null
+        ? null
+        : quicPacketNumberToBigInt(largestReceivedPacketNumber)
+  }
+
+  get largestReceivedPacketNumber(): bigint | null {
+    return this.#largestReceivedPacketNumber
+  }
+
+  ackSnapshot(): QuicAckReceiveSnapshot {
+    return this.#ackTracker.snapshot()
+  }
+
+  receive(
+    packet: Uint8Array,
+    keys: QuicDirectionalKeys,
+    destinationConnectionIdLength: number,
+    offset = 0,
+    ackDelay = 0,
+  ): QuicOneRttPacketFrameReceiveResult {
+    const result = receiveQuicOneRttPacketFrames(
+      packet,
+      keys,
+      destinationConnectionIdLength,
+      this.#largestReceivedPacketNumber,
+      this.#ackTracker,
+      offset,
+      ackDelay,
+    )
+
+    this.#largestReceivedPacketNumber = result.largestReceivedPacketNumber
+    return result
+  }
 }
 
 export function encryptQuicOneRttPacket(
