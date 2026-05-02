@@ -20,6 +20,8 @@ import {
   parseTlsServerSupportedVersion,
   TLS_VERSION_1_3,
   TlsExtensionType,
+  TlsHandshakeKind,
+  TlsHandshakeType,
   TlsNamedGroup,
   type TlsExtension,
 } from './tls'
@@ -102,13 +104,26 @@ describe('TLS handshake parsing', () => {
     expect(keyShare.keyExchange).toHaveLength(32)
   })
 
-  test('keeps unknown handshake bodies as raw bytes', () => {
+  test('keeps encrypted handshake bodies as opaque raw bytes', () => {
     const result = parseTlsHandshakes(hexToBytes('08000003aabbcc'))
 
     expect(result.handshakes).toHaveLength(1)
     expect(result.handshakes[0]).toEqual({
+      kind: TlsHandshakeKind.EncryptedExtensions,
+      handshakeType: TlsHandshakeType.EncryptedExtensions,
+      body: hexToBytes('aabbcc'),
+      offset: 0,
+      endOffset: 7,
+    })
+  })
+
+  test('keeps unknown handshake bodies as raw bytes', () => {
+    const result = parseTlsHandshakes(hexToBytes('fe000003aabbcc'))
+
+    expect(result.handshakes).toHaveLength(1)
+    expect(result.handshakes[0]).toEqual({
       kind: 'unknown',
-      handshakeType: 8,
+      handshakeType: 0xfe,
       body: hexToBytes('aabbcc'),
       offset: 0,
       endOffset: 7,

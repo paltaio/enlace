@@ -3,7 +3,20 @@ import { copyBytes, readU8, readU16BE } from '../bytes'
 export const TlsHandshakeKind = {
   ClientHello: 'client-hello',
   ServerHello: 'server-hello',
+  EncryptedExtensions: 'encrypted-extensions',
+  Certificate: 'certificate',
+  CertificateVerify: 'certificate-verify',
+  Finished: 'finished',
   Unknown: 'unknown',
+} as const
+
+export const TlsHandshakeType = {
+  ClientHello: 0x01,
+  ServerHello: 0x02,
+  EncryptedExtensions: 0x08,
+  Certificate: 0x0b,
+  CertificateVerify: 0x0f,
+  Finished: 0x14,
 } as const
 
 export const TlsExtensionType = {
@@ -20,7 +33,17 @@ export const TlsNamedGroup = {
 
 export const TLS_VERSION_1_3 = 0x0304
 
-export type TlsHandshake = TlsClientHelloHandshake | TlsServerHelloHandshake | TlsUnknownHandshake
+export type TlsHandshake =
+  | TlsClientHelloHandshake
+  | TlsServerHelloHandshake
+  | TlsOpaqueHandshake
+  | TlsUnknownHandshake
+
+export type TlsOpaqueHandshakeKind =
+  | typeof TlsHandshakeKind.EncryptedExtensions
+  | typeof TlsHandshakeKind.Certificate
+  | typeof TlsHandshakeKind.CertificateVerify
+  | typeof TlsHandshakeKind.Finished
 
 export interface TlsExtension {
   readonly extensionType: number
@@ -57,6 +80,14 @@ export interface TlsClientHelloHandshake {
 export interface TlsServerHelloHandshake {
   readonly kind: typeof TlsHandshakeKind.ServerHello
   readonly body: TlsServerHello
+  readonly offset: number
+  readonly endOffset: number
+}
+
+export interface TlsOpaqueHandshake {
+  readonly kind: TlsOpaqueHandshakeKind
+  readonly handshakeType: number
+  readonly body: Uint8Array
   readonly offset: number
   readonly endOffset: number
 }
@@ -190,7 +221,7 @@ function parseTlsHandshake(bytes: Uint8Array, offset: number): TlsHandshake {
   }
   const body = bytes.subarray(bodyOffset, endOffset)
 
-  if (handshakeType === 0x01) {
+  if (handshakeType === TlsHandshakeType.ClientHello) {
     return {
       kind: TlsHandshakeKind.ClientHello,
       body: parseClientHello(body),
@@ -198,10 +229,21 @@ function parseTlsHandshake(bytes: Uint8Array, offset: number): TlsHandshake {
       endOffset,
     }
   }
-  if (handshakeType === 0x02) {
+  if (handshakeType === TlsHandshakeType.ServerHello) {
     return {
       kind: TlsHandshakeKind.ServerHello,
       body: parseServerHello(body),
+      offset,
+      endOffset,
+    }
+  }
+
+  const opaqueKind = opaqueTlsHandshakeKind(handshakeType)
+  if (opaqueKind !== null) {
+    return {
+      kind: opaqueKind,
+      handshakeType,
+      body: copyBytes(body),
       offset,
       endOffset,
     }
@@ -213,6 +255,21 @@ function parseTlsHandshake(bytes: Uint8Array, offset: number): TlsHandshake {
     body: copyBytes(body),
     offset,
     endOffset,
+  }
+}
+
+function opaqueTlsHandshakeKind(handshakeType: number): TlsOpaqueHandshakeKind | null {
+  switch (handshakeType) {
+    case TlsHandshakeType.EncryptedExtensions:
+      return TlsHandshakeKind.EncryptedExtensions
+    case TlsHandshakeType.Certificate:
+      return TlsHandshakeKind.Certificate
+    case TlsHandshakeType.CertificateVerify:
+      return TlsHandshakeKind.CertificateVerify
+    case TlsHandshakeType.Finished:
+      return TlsHandshakeKind.Finished
+    default:
+      return null
   }
 }
 
