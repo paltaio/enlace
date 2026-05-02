@@ -2,6 +2,7 @@ import { concatBytes, readU8, readU16BE, writeU16BE } from '../bytes'
 import { endpointIdFromSecretKey, sign } from '../crypto/ed25519'
 import { hexToBytes } from './hex'
 import {
+  rfc8448ClientPrivateKey,
   rfc8448ClientHandshakeTrafficSecret,
   rfc8448ClientHello,
   rfc8448ServerHandshakeTrafficSecret,
@@ -13,8 +14,15 @@ import {
   TlsExtensionType,
   TlsHandshakeKind,
   TlsHandshakeType,
+  type TlsClientHelloHandshake,
   type TlsHandshake,
+  type TlsServerHelloHandshake,
 } from '../quic/tls'
+import {
+  deriveTls13X25519HandshakeSecrets,
+  TlsHandshakeRole,
+  type Tls13X25519HandshakeSecrets,
+} from '../quic/tls-handshake'
 import { ed25519SpkiFromEndpointId } from '../quic/tls-certificate'
 import {
   buildTls13CertificateVerifyMessage,
@@ -47,6 +55,13 @@ export interface ServerEncryptedHandshakeFixtureOptions {
 
 export interface ClientEncryptedHandshakeFixtureOptions {
   readonly clientHandshakeTrafficSecret?: Uint8Array
+}
+
+export interface TlsHandshakeStateFixture {
+  readonly handshake: Tls13X25519HandshakeSecrets
+  readonly server: EncryptedHandshakeFixture
+  readonly client: EncryptedHandshakeFixture | null
+  readonly messages: readonly QuicTlsHandshakeMessage[]
 }
 
 export async function serverEncryptedHandshakeFixture(
@@ -130,6 +145,52 @@ export async function clientEncryptedHandshakeFixture(): Promise<EncryptedHandsh
   return clientEncryptedHandshakeFixtureFromServer(
     await serverEncryptedHandshakeFixture({ certificateRequest: true }),
   )
+}
+
+export async function tlsHandshakeStateFixture(options: {
+  readonly certificateRequest: boolean
+  readonly offerAlpn?: boolean
+  readonly selectedAlpn?: Uint8Array | null
+}): Promise<TlsHandshakeStateFixture> {
+  const clientHello =
+    options.offerAlpn === false
+      ? rfc8448ClientHello
+      : appendTlsExtensionToClientHello(rfc8448ClientHello, {
+          type: TlsExtensionType.ApplicationLayerProtocolNegotiation,
+          data: tlsAlpnExtensionData([tlsTestAlpn]),
+        })
+  const serverHello = rfc8448ServerHello
+  const handshake = await deriveTls13X25519HandshakeSecrets({
+    role: TlsHandshakeRole.Client,
+    privateKey: rfc8448ClientPrivateKey,
+    clientHello: parseClientHello(clientHello),
+    serverHello: parseServerHello(serverHello),
+    clientHelloMessage: clientHello,
+    serverHelloMessage: serverHello,
+  })
+  const server = await serverEncryptedHandshakeFixture({
+    certificateRequest: options.certificateRequest,
+    clientHelloMessage: clientHello,
+    serverHelloMessage: serverHello,
+    serverHandshakeTrafficSecret: handshake.secrets.serverHandshakeTrafficSecret,
+    ...(options.selectedAlpn === null
+      ? {}
+      : {
+          selectedAlpn: options.selectedAlpn ?? tlsTestAlpn,
+        }),
+  })
+  const client = options.certificateRequest
+    ? await clientEncryptedHandshakeFixtureFromServer(server, {
+        clientHandshakeTrafficSecret: handshake.secrets.clientHandshakeTrafficSecret,
+      })
+    : null
+
+  return {
+    handshake,
+    server,
+    client,
+    messages: client?.messages ?? server.messages,
+  }
 }
 
 export async function clientEncryptedHandshakeFixtureFromServer(
@@ -291,6 +352,22 @@ function parseSingleHandshake(message: Uint8Array): TlsHandshake {
   const handshake = result.handshakes[0]
   if (handshake === undefined) {
     throw new Error('expected TLS handshake')
+  }
+  return handshake
+}
+
+function parseClientHello(message: Uint8Array): TlsClientHelloHandshake {
+  const handshake = parseSingleHandshake(message)
+  if (handshake.kind !== TlsHandshakeKind.ClientHello) {
+    throw new Error('expected ClientHello')
+  }
+  return handshake
+}
+
+function parseServerHello(message: Uint8Array): TlsServerHelloHandshake {
+  const handshake = parseSingleHandshake(message)
+  if (handshake.kind !== TlsHandshakeKind.ServerHello) {
+    throw new Error('expected ServerHello')
   }
   return handshake
 }

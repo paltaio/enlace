@@ -39,6 +39,7 @@ export interface Tls13HandshakeTranscriptBoundaries {
   readonly serverHello: Uint8Array
   readonly serverCertificateVerify: Uint8Array
   readonly serverFinished: Uint8Array
+  readonly serverApplicationTraffic: Uint8Array
   readonly clientCertificateVerify: Uint8Array | null
   readonly clientFinished: Uint8Array | null
 }
@@ -241,6 +242,7 @@ function transcriptBoundaries(
     serverHello: copyBytes(handshake.transcriptHash),
     serverCertificateVerify: copyBytes(server.certificateVerifyTranscriptHash),
     serverFinished: copyBytes(server.finishedTranscriptHash),
+    serverApplicationTraffic: copyBytes(server.applicationTrafficTranscriptHash),
     clientCertificateVerify:
       client === null ? null : copyBytes(client.certificateVerifyTranscriptHash),
     clientFinished: client === null ? null : copyBytes(client.finishedTranscriptHash),

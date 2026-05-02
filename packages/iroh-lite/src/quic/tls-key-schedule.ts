@@ -13,6 +13,8 @@ export const TLS13_X25519_SHARED_SECRET_LENGTH = 32
 const TLS13_DERIVED_LABEL = 'derived'
 const TLS13_CLIENT_HANDSHAKE_TRAFFIC_LABEL = 'c hs traffic'
 const TLS13_SERVER_HANDSHAKE_TRAFFIC_LABEL = 's hs traffic'
+const TLS13_CLIENT_APPLICATION_TRAFFIC_LABEL = 'c ap traffic'
+const TLS13_SERVER_APPLICATION_TRAFFIC_LABEL = 's ap traffic'
 const TLS13_TRAFFIC_KEY_LABEL = 'key'
 const TLS13_TRAFFIC_IV_LABEL = 'iv'
 const TLS13_FINISHED_LABEL = 'finished'
@@ -29,6 +31,12 @@ export interface Tls13HandshakeSecrets {
 export interface Tls13TrafficKeys {
   readonly key: Uint8Array
   readonly iv: Uint8Array
+}
+
+export interface Tls13ApplicationTrafficSecrets {
+  readonly masterSecret: Uint8Array
+  readonly clientApplicationTrafficSecret: Uint8Array
+  readonly serverApplicationTrafficSecret: Uint8Array
 }
 
 export class Tls13Transcript {
@@ -96,6 +104,34 @@ export function deriveTls13Secret(
 ): Uint8Array {
   requireLength(transcriptHash, TLS13_SHA256_SECRET_LENGTH, 'TLS transcript hash')
   return hkdfExpandTls13LabelSha256(secret, label, transcriptHash, TLS13_SHA256_SECRET_LENGTH)
+}
+
+export function deriveTls13ApplicationTrafficSecrets(
+  handshakeSecret: Uint8Array,
+  transcriptHash: Uint8Array,
+): Tls13ApplicationTrafficSecrets {
+  requireLength(handshakeSecret, TLS13_SHA256_SECRET_LENGTH, 'TLS handshake secret')
+  requireLength(transcriptHash, TLS13_SHA256_SECRET_LENGTH, 'TLS transcript hash')
+  const derivedSecret = deriveTls13Secret(
+    handshakeSecret,
+    TLS13_DERIVED_LABEL,
+    tls13EmptyTranscriptHash(),
+  )
+  const masterSecret = extract(sha256, ZERO_SHA256_SECRET, derivedSecret)
+
+  return {
+    masterSecret,
+    clientApplicationTrafficSecret: deriveTls13Secret(
+      masterSecret,
+      TLS13_CLIENT_APPLICATION_TRAFFIC_LABEL,
+      transcriptHash,
+    ),
+    serverApplicationTrafficSecret: deriveTls13Secret(
+      masterSecret,
+      TLS13_SERVER_APPLICATION_TRAFFIC_LABEL,
+      transcriptHash,
+    ),
+  }
 }
 
 export function deriveTls13Aes128GcmTrafficKeys(trafficSecret: Uint8Array): Tls13TrafficKeys {

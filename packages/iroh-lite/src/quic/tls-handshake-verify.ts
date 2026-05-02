@@ -41,6 +41,7 @@ export interface Tls13ServerEncryptedHandshakeVerification {
   readonly endpointId: Uint8Array
   readonly certificateVerifyTranscriptHash: Uint8Array
   readonly finishedTranscriptHash: Uint8Array
+  readonly applicationTrafficTranscriptHash: Uint8Array
 }
 
 export interface Tls13ClientEncryptedHandshakeVerification {
@@ -135,6 +136,10 @@ export async function verifyTls13ServerEncryptedHandshakeMessages(
     endpointId,
     certificateVerifyTranscriptHash,
     finishedTranscriptHash,
+    applicationTrafficTranscriptHash: transcriptHashThrough(
+      options.messages,
+      sequence.finished.index,
+    ),
   }
 }
 
@@ -281,6 +286,17 @@ function transcriptHashBefore(
   endIndex: number,
 ): Uint8Array {
   const hash = tls13TranscriptHash(messages.slice(0, endIndex).map((message) => message.message))
+  requireLength(hash, TLS13_SHA256_SECRET_LENGTH, 'TLS transcript hash')
+  return copyBytes(hash)
+}
+
+function transcriptHashThrough(
+  messages: readonly QuicTlsHandshakeMessage[],
+  endIndex: number,
+): Uint8Array {
+  const hash = tls13TranscriptHash(
+    messages.slice(0, endIndex + 1).map((message) => message.message),
+  )
   requireLength(hash, TLS13_SHA256_SECRET_LENGTH, 'TLS transcript hash')
   return copyBytes(hash)
 }

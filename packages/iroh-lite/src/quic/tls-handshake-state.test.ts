@@ -2,32 +2,8 @@ import { describe, expect, test } from 'bun:test'
 
 import { endpointIdFromSecretKey } from '../crypto/ed25519'
 import { bytesToHex, hexToBytes } from '../testing/hex'
-import {
-  appendTlsExtensionToClientHello,
-  clientEncryptedHandshakeFixtureFromServer,
-  serverEncryptedHandshakeFixture,
-  tlsAlpnExtensionData,
-  tlsTestAlpn,
-  type EncryptedHandshakeFixture,
-} from '../testing/tls-handshake-fixtures'
-import {
-  rfc8448ClientHello,
-  rfc8448ClientPrivateKey,
-  rfc8448ServerHello,
-  rfc8448ServerPrivateKey,
-} from '../testing/rfc8448-tls'
-import {
-  parseTlsHandshakes,
-  TlsExtensionType,
-  TlsHandshakeKind,
-  type TlsClientHelloHandshake,
-  type TlsServerHelloHandshake,
-} from './tls'
-import {
-  deriveTls13X25519HandshakeSecrets,
-  TlsHandshakeRole,
-  type Tls13X25519HandshakeSecrets,
-} from './tls-handshake'
+import { tlsHandshakeStateFixture, tlsTestAlpn } from '../testing/tls-handshake-fixtures'
+import { rfc8448ClientPrivateKey, rfc8448ServerPrivateKey } from '../testing/rfc8448-tls'
 import {
   verifyTls13ClientHandshakeState,
   verifyTls13ServerHandshakeState,
@@ -36,7 +12,7 @@ import type { QuicTlsHandshakeMessage } from './tls-crypto-stream'
 
 describe('TLS 1.3 handshake state bridge', () => {
   test('verifies client-side state with negotiated ALPN and client auth', async () => {
-    const fixture = await handshakeStateFixture({ certificateRequest: true })
+    const fixture = await tlsHandshakeStateFixture({ certificateRequest: true })
     const state = await verifyTls13ClientHandshakeState({
       x25519PrivateKey: rfc8448ClientPrivateKey,
       expectedServerEndpointId: fixture.server.endpointId,
@@ -74,7 +50,7 @@ describe('TLS 1.3 handshake state bridge', () => {
   })
 
   test('verifies server-side state and client endpoint id when requested', async () => {
-    const fixture = await handshakeStateFixture({ certificateRequest: true })
+    const fixture = await tlsHandshakeStateFixture({ certificateRequest: true })
     const state = await verifyTls13ServerHandshakeState({
       x25519PrivateKey: rfc8448ServerPrivateKey,
       localServerEndpointId: fixture.server.endpointId,
@@ -93,7 +69,7 @@ describe('TLS 1.3 handshake state bridge', () => {
   })
 
   test('skips client auth verification when no CertificateRequest is present', async () => {
-    const fixture = await handshakeStateFixture({ certificateRequest: false })
+    const fixture = await tlsHandshakeStateFixture({ certificateRequest: false })
     const state = await verifyTls13ServerHandshakeState({
       x25519PrivateKey: rfc8448ServerPrivateKey,
       localServerEndpointId: fixture.server.endpointId,
@@ -108,7 +84,7 @@ describe('TLS 1.3 handshake state bridge', () => {
   })
 
   test('client-side state also skips client auth without CertificateRequest', async () => {
-    const fixture = await handshakeStateFixture({ certificateRequest: false })
+    const fixture = await tlsHandshakeStateFixture({ certificateRequest: false })
     const state = await verifyTls13ClientHandshakeState({
       x25519PrivateKey: rfc8448ClientPrivateKey,
       expectedServerEndpointId: fixture.server.endpointId,
@@ -122,7 +98,7 @@ describe('TLS 1.3 handshake state bridge', () => {
   })
 
   test('requires server endpoint id from caller', async () => {
-    const fixture = await handshakeStateFixture({ certificateRequest: false })
+    const fixture = await tlsHandshakeStateFixture({ certificateRequest: false })
     const otherEndpointId = await endpointIdFromSecretKey(
       hexToBytes('303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f'),
     )
@@ -138,7 +114,7 @@ describe('TLS 1.3 handshake state bridge', () => {
   })
 
   test('requires ALPN to be offered and selected', async () => {
-    const withoutSelectedAlpn = await handshakeStateFixture({
+    const withoutSelectedAlpn = await tlsHandshakeStateFixture({
       certificateRequest: false,
       selectedAlpn: null,
     })
@@ -151,7 +127,7 @@ describe('TLS 1.3 handshake state bridge', () => {
       'TLS EncryptedExtensions must select ALPN',
     )
 
-    const notOffered = await handshakeStateFixture({
+    const notOffered = await tlsHandshakeStateFixture({
       certificateRequest: false,
       selectedAlpn: hexToBytes('6833'),
     })
@@ -166,7 +142,7 @@ describe('TLS 1.3 handshake state bridge', () => {
   })
 
   test('rejects missing ClientHello ALPN and selected ALPN mismatch', async () => {
-    const withoutClientAlpn = await handshakeStateFixture({
+    const withoutClientAlpn = await tlsHandshakeStateFixture({
       certificateRequest: false,
       offerAlpn: false,
     })
@@ -179,7 +155,7 @@ describe('TLS 1.3 handshake state bridge', () => {
       'TLS ClientHello must offer ALPN',
     )
 
-    const fixture = await handshakeStateFixture({ certificateRequest: false })
+    const fixture = await tlsHandshakeStateFixture({ certificateRequest: false })
     await expectRejects(
       verifyTls13ClientHandshakeState({
         x25519PrivateKey: rfc8448ClientPrivateKey,
@@ -192,7 +168,7 @@ describe('TLS 1.3 handshake state bridge', () => {
   })
 
   test('requires ClientHello then ServerHello at transcript start', async () => {
-    const fixture = await handshakeStateFixture({ certificateRequest: false })
+    const fixture = await tlsHandshakeStateFixture({ certificateRequest: false })
 
     await expectRejects(
       verifyTls13ClientHandshakeState({
@@ -213,7 +189,7 @@ describe('TLS 1.3 handshake state bridge', () => {
   })
 
   test('uses ServerHello transcript boundary before encrypted messages', async () => {
-    const fixture = await handshakeStateFixture({ certificateRequest: true })
+    const fixture = await tlsHandshakeStateFixture({ certificateRequest: true })
     const state = await verifyTls13ClientHandshakeState({
       x25519PrivateKey: rfc8448ClientPrivateKey,
       expectedServerEndpointId: fixture.server.endpointId,
@@ -228,77 +204,6 @@ describe('TLS 1.3 handshake state bridge', () => {
     )
   })
 })
-
-interface HandshakeStateFixture {
-  readonly handshake: Tls13X25519HandshakeSecrets
-  readonly server: EncryptedHandshakeFixture
-  readonly client: EncryptedHandshakeFixture | null
-  readonly messages: readonly QuicTlsHandshakeMessage[]
-}
-
-async function handshakeStateFixture(options: {
-  readonly certificateRequest: boolean
-  readonly offerAlpn?: boolean
-  readonly selectedAlpn?: Uint8Array | null
-}): Promise<HandshakeStateFixture> {
-  const clientHello =
-    options.offerAlpn === false
-      ? rfc8448ClientHello
-      : appendTlsExtensionToClientHello(rfc8448ClientHello, {
-          type: TlsExtensionType.ApplicationLayerProtocolNegotiation,
-          data: tlsAlpnExtensionData([tlsTestAlpn]),
-        })
-  const serverHello = rfc8448ServerHello
-  const handshake = await deriveTls13X25519HandshakeSecrets({
-    role: TlsHandshakeRole.Client,
-    privateKey: rfc8448ClientPrivateKey,
-    clientHello: parseClientHello(clientHello),
-    serverHello: parseServerHello(serverHello),
-    clientHelloMessage: clientHello,
-    serverHelloMessage: serverHello,
-  })
-  const server = await serverEncryptedHandshakeFixture({
-    certificateRequest: options.certificateRequest,
-    clientHelloMessage: clientHello,
-    serverHelloMessage: serverHello,
-    serverHandshakeTrafficSecret: handshake.secrets.serverHandshakeTrafficSecret,
-    ...(options.selectedAlpn === null
-      ? {}
-      : {
-          selectedAlpn: options.selectedAlpn ?? tlsTestAlpn,
-        }),
-  })
-  const client = options.certificateRequest
-    ? await clientEncryptedHandshakeFixtureFromServer(server, {
-        clientHandshakeTrafficSecret: handshake.secrets.clientHandshakeTrafficSecret,
-      })
-    : null
-
-  return {
-    handshake,
-    server,
-    client,
-    messages: client?.messages ?? server.messages,
-  }
-}
-
-function parseClientHello(message: Uint8Array): TlsClientHelloHandshake {
-  const result = parseTlsHandshakes(message)
-  const handshake = result.handshakes[0]
-  if (handshake?.kind !== TlsHandshakeKind.ClientHello) {
-    throw new Error('expected ClientHello')
-  }
-  return handshake
-}
-
-function parseServerHello(message: Uint8Array): TlsServerHelloHandshake {
-  const result = parseTlsHandshakes(message)
-  const handshake = result.handshakes[0]
-  if (handshake?.kind !== TlsHandshakeKind.ServerHello) {
-    throw new Error('expected ServerHello')
-  }
-  return handshake
-}
 
 function requireBytes(value: Uint8Array | null): Uint8Array {
   if (value === null) {
