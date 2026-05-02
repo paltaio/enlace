@@ -21,6 +21,12 @@ import {
   recoverQuicPacketNumber,
   updateLargestReceivedQuicPacketNumber,
 } from './packet'
+import {
+  QuicStreamState,
+  type QuicStreamReceiveOutput,
+  type QuicStreamReceiveSnapshot,
+  type QuicStreamSendResult,
+} from './streams'
 
 export interface QuicOneRttPacketHeaderPrefix {
   readonly firstByte: number
@@ -53,6 +59,10 @@ export interface QuicOneRttPacketFrameReceiveResult extends QuicOneRttPacketRece
   readonly ackFrame: Uint8Array | null
 }
 
+export interface QuicOneRttPacketStreamReceiveResult extends QuicOneRttPacketFrameReceiveResult {
+  readonly streamOutputs: readonly QuicStreamReceiveOutput[]
+}
+
 export interface QuicOneRttPacketProtectionOptions {
   readonly destinationConnectionId: Uint8Array
   readonly packetNumber: number | bigint
@@ -64,6 +74,10 @@ export interface QuicOneRttPacketSendResult {
   readonly packet: Uint8Array
   readonly packetNumber: bigint
   readonly nextPacketNumber: bigint
+}
+
+export interface QuicOneRttStreamPacketSendResult extends QuicOneRttPacketSendResult {
+  readonly stream: QuicStreamSendResult
 }
 
 export class QuicOneRttSendState {
@@ -106,6 +120,7 @@ export class QuicOneRttSendState {
 export class QuicOneRttState {
   readonly #sendState: QuicOneRttSendState
   readonly #receiveState: QuicOneRttReceiveState
+  readonly #streamState = new QuicStreamState()
 
   constructor(
     nextPacketNumber: number | bigint = 0,
@@ -127,6 +142,18 @@ export class QuicOneRttState {
     return this.#receiveState.ackSnapshot()
   }
 
+  streamSnapshot(streamId: number): QuicStreamReceiveSnapshot {
+    return this.#streamState.receiveSnapshot(streamId)
+  }
+
+  streamSendOffset(streamId: number): number {
+    return this.#streamState.sendOffset(streamId)
+  }
+
+  applyStreamFlowControl(frames: readonly QuicFrame[]): void {
+    this.#streamState.applyFlowControlFrames(frames)
+  }
+
   send(
     keys: QuicDirectionalKeys,
     destinationConnectionId: Uint8Array,
@@ -135,14 +162,43 @@ export class QuicOneRttState {
     return this.#sendState.send(keys, destinationConnectionId, payload)
   }
 
+  sendStream(
+    keys: QuicDirectionalKeys,
+    destinationConnectionId: Uint8Array,
+    streamId: number,
+    data: Uint8Array,
+    fin = false,
+  ): QuicOneRttStreamPacketSendResult {
+    if (this.#sendState.nextPacketNumber === QUIC_MAX_PACKET_NUMBER) {
+      throw new RangeError('QUIC next packet number out of range')
+    }
+    const stream = this.#streamState.send(streamId, data, fin)
+    const sent = this.send(keys, destinationConnectionId, stream.frameBytes)
+
+    return {
+      ...sent,
+      stream,
+    }
+  }
+
   receive(
     packet: Uint8Array,
     keys: QuicDirectionalKeys,
     destinationConnectionIdLength: number,
     offset = 0,
     ackDelay = 0,
-  ): QuicOneRttPacketFrameReceiveResult {
-    return this.#receiveState.receive(packet, keys, destinationConnectionIdLength, offset, ackDelay)
+  ): QuicOneRttPacketStreamReceiveResult {
+    const result = this.#receiveState.receive(
+      packet,
+      keys,
+      destinationConnectionIdLength,
+      offset,
+      ackDelay,
+    )
+    return {
+      ...result,
+      streamOutputs: this.#streamState.receiveFrames(result.frames),
+    }
   }
 }
 

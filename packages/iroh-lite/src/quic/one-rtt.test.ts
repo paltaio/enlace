@@ -9,6 +9,8 @@ import type { QuicDirectionalKeys } from './crypto'
 import {
   encodeQuicAckFrame,
   encodeQuicApplicationConnectionCloseFrame,
+  encodeQuicMaxDataFrame,
+  encodeQuicMaxStreamDataFrame,
   encodeQuicPaddingFrame,
   encodeQuicPingFrame,
   encodeQuicStreamFrame,
@@ -741,6 +743,135 @@ describe('QUIC 1-RTT packet state', () => {
     expect(sent.packetNumber).toBe(4n)
     expect(state.nextPacketNumber).toBe(5n)
   })
+
+  test('sends stream data as protected packets and tracks stream offsets', async () => {
+    const keys = await applicationTrafficKeys()
+    const destinationConnectionId = hexToBytes('01020304')
+    const state = new QuicOneRttState()
+
+    const sent = state.sendStream(keys.client, destinationConnectionId, 0, hexToBytes('6869'), true)
+    const decrypted = decryptQuicOneRttPacket(
+      sent.packet,
+      keys.client,
+      destinationConnectionId.length,
+    )
+
+    expect(sent.packetNumber).toBe(0n)
+    expect(sent.stream.streamOffset).toBe(0)
+    expect(sent.stream.nextStreamOffset).toBe(2)
+    expect(state.nextPacketNumber).toBe(1n)
+    expect(state.streamSendOffset(0)).toBe(2)
+    expect(parseQuicFrames(decrypted.payload).frames).toEqual([
+      {
+        type: 'stream',
+        streamId: 0,
+        streamOffset: 0,
+        data: hexToBytes('6869'),
+        fin: true,
+        offset: 0,
+        endOffset: sent.stream.frameBytes.length,
+      },
+    ])
+  })
+
+  test('does not advance stream offsets when stream packet number rejects', async () => {
+    const keys = await applicationTrafficKeys()
+    const destinationConnectionId = hexToBytes('01020304')
+    const state = new QuicOneRttState(QUIC_MAX_PACKET_NUMBER)
+
+    expect(() =>
+      state.sendStream(keys.client, destinationConnectionId, 0, hexToBytes('6869'), true),
+    ).toThrow('QUIC next packet number out of range')
+    expect(state.streamSendOffset(0)).toBe(0)
+    expect(state.nextPacketNumber).toBe(QUIC_MAX_PACKET_NUMBER)
+  })
+
+  test('applies flow-control frames before sending stream packets', async () => {
+    const keys = await applicationTrafficKeys()
+    const destinationConnectionId = hexToBytes('01020304')
+    const state = new QuicOneRttState()
+    const frames = parseQuicFrames(
+      concatBytes([encodeQuicMaxDataFrame(2), encodeQuicMaxStreamDataFrame(0, 2)]),
+    ).frames
+
+    state.applyStreamFlowControl(frames)
+    const sent = state.sendStream(keys.client, destinationConnectionId, 0, hexToBytes('6869'), true)
+
+    expect(sent.stream.nextStreamOffset).toBe(2)
+    expect(state.streamSendOffset(0)).toBe(2)
+  })
+
+  test('receives protected stream packets into stream outputs', async () => {
+    const keys = await applicationTrafficKeys()
+    const destinationConnectionId = hexToBytes('01020304')
+    const client = new QuicOneRttState()
+    const server = new QuicOneRttState()
+
+    const sent = client.sendStream(
+      keys.client,
+      destinationConnectionId,
+      0,
+      hexToBytes('6869'),
+      true,
+    )
+    const received = server.receive(sent.packet, keys.client, destinationConnectionId.length)
+
+    expect(received.packetNumber).toBe(0n)
+    expect(received.ackEliciting).toBe(true)
+    expect(received.streamOutputs.map(streamOutputHex)).toEqual([
+      {
+        streamId: 0,
+        streamOffset: 0,
+        data: '6869',
+        fin: true,
+        finalSize: 2,
+        complete: true,
+      },
+    ])
+    expect(server.streamSnapshot(0)).toEqual({
+      streamId: 0,
+      readOffset: 2,
+      finalSize: 2,
+      complete: true,
+    })
+  })
+
+  test('buffers out-of-order protected stream packets until gaps fill', async () => {
+    const keys = await applicationTrafficKeys()
+    const destinationConnectionId = hexToBytes('01020304')
+    const client = new QuicOneRttState()
+    const server = new QuicOneRttState()
+
+    const first = client.sendStream(keys.client, destinationConnectionId, 0, hexToBytes('6865'))
+    const second = client.sendStream(
+      keys.client,
+      destinationConnectionId,
+      0,
+      hexToBytes('6c6c6f'),
+      true,
+    )
+    const outOfOrder = server.receive(second.packet, keys.client, destinationConnectionId.length)
+    const filled = server.receive(first.packet, keys.client, destinationConnectionId.length)
+
+    expect(outOfOrder.packetNumber).toBe(1n)
+    expect(outOfOrder.streamOutputs).toEqual([])
+    expect(filled.packetNumber).toBe(0n)
+    expect(filled.streamOutputs.map(streamOutputHex)).toEqual([
+      {
+        streamId: 0,
+        streamOffset: 0,
+        data: '68656c6c6f',
+        fin: true,
+        finalSize: 5,
+        complete: true,
+      },
+    ])
+    expect(server.largestReceivedPacketNumber).toBe(1n)
+    expect(server.ackSnapshot()).toEqual({
+      receivedPacketNumbers: [1n, 0n],
+      largestReceivedPacketNumber: 1n,
+    })
+  })
 })
 
 function encryptTestOneRttPacket(
@@ -755,6 +886,31 @@ function encryptTestOneRttPacket(
     packetNumberLength: 2,
     payload,
   })
+}
+
+function streamOutputHex(output: {
+  readonly streamId: number
+  readonly streamOffset: number
+  readonly data: Uint8Array
+  readonly fin: boolean
+  readonly finalSize: number | null
+  readonly complete: boolean
+}): {
+  readonly streamId: number
+  readonly streamOffset: number
+  readonly data: string
+  readonly fin: boolean
+  readonly finalSize: number | null
+  readonly complete: boolean
+} {
+  return {
+    streamId: output.streamId,
+    streamOffset: output.streamOffset,
+    data: bytesToHex(output.data),
+    fin: output.fin,
+    finalSize: output.finalSize,
+    complete: output.complete,
+  }
 }
 
 async function applicationTrafficKeys(): Promise<{
