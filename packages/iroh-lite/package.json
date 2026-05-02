@@ -11,7 +11,8 @@
     "fmt:check": "oxfmt --check .",
     "lint": "oxlint .",
     "lint:fix": "oxlint --fix .",
-    "test": "bun test"
+    "test": "bun test",
+    "test:relay-interop": "IROH_RELAY_INTEROP=1 bun test --timeout=180000 src/relay/iroh-relay.interop.test.ts"
   },
   "dependencies": {
     "@noble/ed25519": "3.1.0",
