@@ -4,6 +4,7 @@ import { RELAY_SUBPROTOCOLS, RelayConnectAbortedError } from '@paltaio/iroh-lite
 import { RelayAuthDeniedError } from '@paltaio/iroh-lite/relay/client'
 import { FrameType } from '@paltaio/iroh-lite/relay/frames'
 import { RELAY_PATH } from '@paltaio/iroh-lite/relay/handshake'
+import { normalizeRelayUrl } from '@paltaio/iroh-lite/relay/url'
 import { encodeVarInt } from '@paltaio/iroh-lite/relay/varint'
 
 describe('public relay API', () => {
@@ -13,6 +14,9 @@ describe('public relay API', () => {
     expect(new RelayAuthDeniedError('denied').reason).toBe('denied')
     expect(FrameType.Ping).toBe(9)
     expect(RELAY_PATH).toBe('/relay')
+    expect(normalizeRelayUrl('https://relay.example.com/ping').toString()).toBe(
+      'https://relay.example.com/',
+    )
     expect(encodeVarInt(FrameType.Ping)).toEqual(new Uint8Array([9]))
   })
 })

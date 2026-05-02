@@ -16,7 +16,15 @@ import { deriveRelayChallengeKey } from '../crypto/blake3'
 import { FrameType } from './frames'
 import { decodeVarIntNumber, encodeVarInt } from './varint'
 
-export const RELAY_PATH = '/relay'
+export {
+  RELAY_PATH,
+  normalizeRelayUrl,
+  normalizeRelayUrls,
+  relayHttpUrlToWebSocketUrl,
+  relayUrlToWebSocketUrl,
+} from './url'
+export type { RelayUrlInput } from './url'
+
 export const RELAY_SUBPROTOCOLS = ['iroh-relay-v2', 'iroh-relay-v1'] as const
 export const CLIENT_AUTH_HEADER = 'x-iroh-relay-client-auth-v1'
 export const SERVER_CHALLENGE_LENGTH = 16
@@ -35,21 +43,6 @@ export type HandshakeFrame =
   | { readonly type: 'server-confirms-auth' }
   | { readonly type: 'server-denies-auth'; readonly reason: string }
   | { readonly type: 'client-auth'; readonly auth: ClientAuth }
-
-export function relayHttpUrlToWebSocketUrl(input: string | URL): URL {
-  const url = new URL(input)
-  if (url.protocol === 'https:') {
-    url.protocol = 'wss:'
-  } else if (url.protocol === 'http:') {
-    url.protocol = 'ws:'
-  } else if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
-    throw new TypeError('relay URL must use http, https, ws, or wss')
-  }
-  url.pathname = RELAY_PATH
-  url.search = ''
-  url.hash = ''
-  return url
-}
 
 export function challengeMessageToSign(challenge: Uint8Array): Uint8Array {
   requireLength(challenge, SERVER_CHALLENGE_LENGTH, 'server challenge')

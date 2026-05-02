@@ -8,7 +8,6 @@ import {
   encodeClientAuthFrame,
   encodeServerChallengeFrame,
   encodeServerConfirmsAuthFrame,
-  relayHttpUrlToWebSocketUrl,
 } from './handshake'
 
 const secretKey = hexToBytes('2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a')
@@ -20,17 +19,6 @@ const challengeMessage = hexToBytes(
 const challengeSignature = hexToBytes(
   '425fda43adca848e71a65ded8c4fb4f4434ca7f248aa6aec7c547ff96aa0b33bd3245943b407b12a9d8a55522f1bd07fa03180b01793ed572a8068bc49319205',
 )
-
-describe('relay URL', () => {
-  test('converts relay HTTP URL to WebSocket /relay URL', () => {
-    expect(relayHttpUrlToWebSocketUrl('https://relay.example.com/ping?x=1').toString()).toBe(
-      'wss://relay.example.com/relay',
-    )
-    expect(relayHttpUrlToWebSocketUrl('http://127.0.0.1:3340').toString()).toBe(
-      'ws://127.0.0.1:3340/relay',
-    )
-  })
-})
 
 describe('challenge auth', () => {
   test('derives same challenge message as Rust', () => {

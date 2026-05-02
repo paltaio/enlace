@@ -6,8 +6,8 @@ import {
   createClientAuth,
   decodeHandshakeFrame,
   encodeClientAuth,
-  relayHttpUrlToWebSocketUrl,
 } from './handshake'
+import { relayUrlToWebSocketUrl } from './url'
 
 const WEBSOCKET_CONNECTING = 0
 const WEBSOCKET_OPEN = 1
@@ -239,7 +239,7 @@ export class RelayWebSocketClient {
 export async function connectRelayWebSocket(
   options: ConnectRelayWebSocketOptions,
 ): Promise<RelayWebSocketClient> {
-  const url = relayHttpUrlToWebSocketUrl(options.url)
+  const url = relayUrlToWebSocketUrl(options.url)
   const WebSocketCtor = options.WebSocket ?? defaultWebSocketConstructor()
   throwIfConnectAborted(options.signal)
   const socket = new WebSocketCtor(url, [...RELAY_SUBPROTOCOLS])
