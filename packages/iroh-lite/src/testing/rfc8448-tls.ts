@@ -20,6 +20,22 @@ export const rfc8448SharedSecret = hexToBytes(
   '8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d',
 )
 
+export const rfc8448ClientPrivateKey = hexToBytes(
+  '49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005',
+)
+
+export const rfc8448ClientPublicKey = hexToBytes(
+  '99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c',
+)
+
+export const rfc8448ServerPrivateKey = hexToBytes(
+  'b1580eeadf6dd589b8ef4f2d5652578cc810e9980191ec8d058308cea216a21e',
+)
+
+export const rfc8448ServerPublicKey = hexToBytes(
+  'c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f',
+)
+
 export const rfc8448EarlySecret = hexToBytes(
   '33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a',
 )
