@@ -1,4 +1,5 @@
 import { extract } from '@noble/hashes/hkdf.js'
+import { hmac } from '@noble/hashes/hmac.js'
 import { sha256 } from '@noble/hashes/sha2.js'
 
 import { copyBytes, requireLength } from '../bytes'
@@ -14,6 +15,7 @@ const TLS13_CLIENT_HANDSHAKE_TRAFFIC_LABEL = 'c hs traffic'
 const TLS13_SERVER_HANDSHAKE_TRAFFIC_LABEL = 's hs traffic'
 const TLS13_TRAFFIC_KEY_LABEL = 'key'
 const TLS13_TRAFFIC_IV_LABEL = 'iv'
+const TLS13_FINISHED_LABEL = 'finished'
 const ZERO_SHA256_SECRET = new Uint8Array(TLS13_SHA256_SECRET_LENGTH)
 
 export interface Tls13HandshakeSecrets {
@@ -112,6 +114,24 @@ export function deriveTls13Aes128GcmTrafficKeys(trafficSecret: Uint8Array): Tls1
       TLS13_AES_128_GCM_IV_LENGTH,
     ),
   }
+}
+
+export function deriveTls13FinishedKey(trafficSecret: Uint8Array): Uint8Array {
+  requireLength(trafficSecret, TLS13_SHA256_SECRET_LENGTH, 'TLS traffic secret')
+  return hkdfExpandTls13LabelSha256(
+    trafficSecret,
+    TLS13_FINISHED_LABEL,
+    new Uint8Array(),
+    TLS13_SHA256_SECRET_LENGTH,
+  )
+}
+
+export function computeTls13FinishedVerifyData(
+  trafficSecret: Uint8Array,
+  transcriptHash: Uint8Array,
+): Uint8Array {
+  requireLength(transcriptHash, TLS13_SHA256_SECRET_LENGTH, 'TLS transcript hash')
+  return hmac(sha256, deriveTls13FinishedKey(trafficSecret), transcriptHash)
 }
 
 function isAllZero(bytes: Uint8Array): boolean {

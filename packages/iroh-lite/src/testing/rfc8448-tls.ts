@@ -67,3 +67,11 @@ export const rfc8448ClientHandshakeTrafficIv = hexToBytes('5bd3c71b836e0b76bb732
 export const rfc8448ServerHandshakeTrafficKey = hexToBytes('3fce516009c21727d0f2e4e86ee403bc')
 
 export const rfc8448ServerHandshakeTrafficIv = hexToBytes('5d313eb2671276ee13000b30')
+
+export const rfc8448ClientHandshakeFinishedKey = hexToBytes(
+  'b80ad01015fb2f0bd65ff7d4da5d6bf83f84821d1f87fdc7d3c75b5a7b42d9c4',
+)
+
+export const rfc8448ServerHandshakeFinishedKey = hexToBytes(
+  '008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8',
+)

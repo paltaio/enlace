@@ -5,6 +5,7 @@ import {
   rfc8448ClientHandshakeTrafficIv,
   rfc8448ClientHandshakeTrafficKey,
   rfc8448ClientHandshakeTrafficSecret,
+  rfc8448ClientHandshakeFinishedKey,
   rfc8448ClientHello,
   rfc8448ClientServerHelloTranscriptHash,
   rfc8448DerivedSecretForHandshake,
@@ -13,13 +14,17 @@ import {
   rfc8448ServerHandshakeTrafficIv,
   rfc8448ServerHandshakeTrafficKey,
   rfc8448ServerHandshakeTrafficSecret,
+  rfc8448ServerHandshakeFinishedKey,
   rfc8448ServerHello,
   rfc8448SharedSecret,
 } from '../testing/rfc8448-tls'
 import {
+  computeTls13FinishedVerifyData,
   deriveTls13Aes128GcmTrafficKeys,
+  deriveTls13FinishedKey,
   deriveTls13HandshakeSecrets,
   deriveTls13Secret,
+  TLS13_SHA256_SECRET_LENGTH,
   tls13EmptyTranscriptHash,
   Tls13Transcript,
   tls13TranscriptHash,
@@ -72,6 +77,31 @@ describe('TLS 1.3 SHA-256 key schedule', () => {
     expect(bytesToHex(serverKeys.iv)).toBe(bytesToHex(rfc8448ServerHandshakeTrafficIv))
   })
 
+  test('derives RFC 8448 handshake finished keys', () => {
+    expect(bytesToHex(deriveTls13FinishedKey(rfc8448ClientHandshakeTrafficSecret))).toBe(
+      bytesToHex(rfc8448ClientHandshakeFinishedKey),
+    )
+    expect(bytesToHex(deriveTls13FinishedKey(rfc8448ServerHandshakeTrafficSecret))).toBe(
+      bytesToHex(rfc8448ServerHandshakeFinishedKey),
+    )
+  })
+
+  test('computes SHA-256 Finished verify data', () => {
+    const verifyData = computeTls13FinishedVerifyData(
+      rfc8448ClientHandshakeTrafficSecret,
+      rfc8448ClientServerHelloTranscriptHash,
+    )
+    const changedTranscriptHash = new Uint8Array(rfc8448ClientServerHelloTranscriptHash)
+    changedTranscriptHash.set([0x79], 0)
+    const changedVerifyData = computeTls13FinishedVerifyData(
+      rfc8448ClientHandshakeTrafficSecret,
+      changedTranscriptHash,
+    )
+
+    expect(verifyData).toHaveLength(TLS13_SHA256_SECRET_LENGTH)
+    expect(bytesToHex(changedVerifyData)).not.toBe(bytesToHex(verifyData))
+  })
+
   test('rejects wrong transcript hash length', () => {
     expect(() =>
       deriveTls13Secret(rfc8448HandshakeSecret, 'c hs traffic', hexToBytes('00')),
@@ -91,5 +121,17 @@ describe('TLS 1.3 SHA-256 key schedule', () => {
     expect(() => deriveTls13Aes128GcmTrafficKeys(hexToBytes('00'))).toThrow(
       'TLS traffic secret must be 32 bytes',
     )
+    expect(() => deriveTls13FinishedKey(hexToBytes('00'))).toThrow(
+      'TLS traffic secret must be 32 bytes',
+    )
+    expect(() =>
+      computeTls13FinishedVerifyData(hexToBytes('00'), tls13EmptyTranscriptHash()),
+    ).toThrow('TLS traffic secret must be 32 bytes')
+  })
+
+  test('rejects wrong-length Finished transcript hash', () => {
+    expect(() =>
+      computeTls13FinishedVerifyData(rfc8448ClientHandshakeTrafficSecret, hexToBytes('00')),
+    ).toThrow('TLS transcript hash must be 32 bytes')
   })
 })
