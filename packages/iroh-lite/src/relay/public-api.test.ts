@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 
-import { RELAY_SUBPROTOCOLS, RelayConnectAbortedError } from '@paltaio/iroh-lite'
+import {
+  RELAY_SUBPROTOCOLS,
+  RelayConnectAbortedError,
+  normalizeRelayUrl as normalizeRootRelayUrl,
+} from '@paltaio/iroh-lite'
 import { RelayAuthDeniedError } from '@paltaio/iroh-lite/relay/client'
 import { FrameType } from '@paltaio/iroh-lite/relay/frames'
 import { RELAY_PATH } from '@paltaio/iroh-lite/relay/handshake'
@@ -14,6 +18,9 @@ describe('public relay API', () => {
     expect(new RelayAuthDeniedError('denied').reason).toBe('denied')
     expect(FrameType.Ping).toBe(9)
     expect(RELAY_PATH).toBe('/relay')
+    expect(normalizeRootRelayUrl('https://relay.example.com/ping').toString()).toBe(
+      'https://relay.example.com/',
+    )
     expect(normalizeRelayUrl('https://relay.example.com/ping').toString()).toBe(
       'https://relay.example.com/',
     )

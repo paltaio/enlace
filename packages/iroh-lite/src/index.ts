@@ -44,7 +44,6 @@ export type {
 } from './relay/frames'
 export {
   CLIENT_AUTH_HEADER,
-  RELAY_PATH,
   RELAY_SUBPROTOCOLS,
   SERVER_CHALLENGE_LENGTH,
   challengeMessageToSign,
@@ -54,11 +53,15 @@ export {
   encodeClientAuthFrame,
   encodeServerChallengeFrame,
   encodeServerConfirmsAuthFrame,
+} from './relay/handshake'
+export type { ClientAuth, HandshakeFrame, ServerChallenge } from './relay/handshake'
+export {
+  RELAY_PATH,
   normalizeRelayUrl,
   normalizeRelayUrls,
   relayHttpUrlToWebSocketUrl,
   relayUrlToWebSocketUrl,
-} from './relay/handshake'
-export type { ClientAuth, HandshakeFrame, RelayUrlInput, ServerChallenge } from './relay/handshake'
+} from './relay/url'
+export type { RelayUrlInput } from './relay/url'
 export { MAX_QUIC_VARINT, decodeVarInt, decodeVarIntNumber, encodeVarInt } from './relay/varint'
 export type { VarIntDecodeResult } from './relay/varint'
