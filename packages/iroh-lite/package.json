@@ -4,7 +4,11 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./relay/client": "./src/relay/client.ts",
+    "./relay/frames": "./src/relay/frames.ts",
+    "./relay/handshake": "./src/relay/handshake.ts",
+    "./relay/varint": "./src/relay/varint.ts"
   },
   "scripts": {
     "fmt": "oxfmt .",
