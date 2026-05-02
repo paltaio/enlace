@@ -10,6 +10,7 @@ const topicId = new Uint8Array([
   0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
 ])
 const payload = new TextEncoder().encode('hello gossip api')
+const replyPayload = new TextEncoder().encode('hello full duplex gossip')
 
 describe('public gossip API', () => {
   test('joins a peer and receives broadcast events', async () => {
@@ -40,6 +41,47 @@ describe('public gossip API', () => {
       receiverTopic.close()
       sender.close()
       receiver.close()
+      await relay.stop()
+    }
+  })
+
+  test('keeps inbound events alive while dialing the same peer', async () => {
+    const relay = await startLocalIrohRelay()
+    const left = await createEndpoint({ relayUrl: relay.url })
+    const right = await createEndpoint({ relayUrl: relay.url })
+    const leftTopic = createGossip(left).subscribe({ topicId })
+    const rightTopic = createGossip(right).subscribe({ topicId })
+
+    try {
+      const leftEvent = nextMessage(leftTopic.events())
+      const rightEvent = nextMessage(rightTopic.events())
+
+      await Promise.all([
+        leftTopic.joinPeer({ peer: right.address }),
+        rightTopic.joinPeer({ peer: left.address }),
+      ])
+      leftTopic.broadcast({ payload })
+      rightTopic.broadcast({ payload: replyPayload })
+
+      expect(await withTimeout(leftEvent, 'left gossip message', 5_000)).toEqual({
+        type: 'message',
+        topicId,
+        id: expect.any(Uint8Array),
+        payload: replyPayload,
+        scope: { type: 'swarm', round: 0 },
+      })
+      expect(await withTimeout(rightEvent, 'right gossip message', 5_000)).toEqual({
+        type: 'message',
+        topicId,
+        id: expect.any(Uint8Array),
+        payload,
+        scope: { type: 'swarm', round: 0 },
+      })
+    } finally {
+      leftTopic.close()
+      rightTopic.close()
+      left.close()
+      right.close()
       await relay.stop()
     }
   })
