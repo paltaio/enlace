@@ -10,7 +10,12 @@ export {
   validateSecretKey,
   verify,
 } from './crypto/ed25519'
-export { RelayAuthDeniedError, RelayWebSocketClient, connectRelayWebSocket } from './relay/client'
+export {
+  RelayAuthDeniedError,
+  RelayConnectAbortedError,
+  RelayWebSocketClient,
+  connectRelayWebSocket,
+} from './relay/client'
 export type {
   ConnectRelayWebSocketOptions,
   RelayBrowserWebSocket,

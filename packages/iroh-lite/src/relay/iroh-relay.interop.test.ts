@@ -45,7 +45,7 @@ describe('iroh-relay interop', () => {
         ecn: null,
         contents: firstPayload,
       })
-      await expect(withTimeout(firstToSecond, 'first datagram relay')).resolves.toEqual({
+      expect(await withTimeout(firstToSecond, 'first datagram relay')).toEqual({
         endpointId: firstEndpointId,
         ecn: null,
         contents: firstPayload,
@@ -58,7 +58,7 @@ describe('iroh-relay interop', () => {
         segmentSize: 8,
         contents: secondPayload,
       })
-      await expect(withTimeout(secondToFirst, 'second datagram relay')).resolves.toEqual({
+      expect(await withTimeout(secondToFirst, 'second datagram relay')).toEqual({
         endpointId: secondEndpointId,
         ecn: 3,
         segmentSize: 8,

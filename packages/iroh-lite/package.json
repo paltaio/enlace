@@ -14,8 +14,11 @@
     "fmt": "oxfmt .",
     "fmt:check": "oxfmt --check .",
     "lint": "oxlint .",
+    "lint:type-aware": "oxlint --type-aware -D typescript/await-thenable -D typescript/no-floating-promises -D typescript/no-misused-promises .",
     "lint:fix": "oxlint --fix .",
     "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:browser": "tsc -p tsconfig.browser.json --noEmit",
     "test:relay-interop": "IROH_RELAY_INTEROP=1 bun test --timeout=180000 src/relay/iroh-relay.interop.test.ts"
   },
   "dependencies": {
@@ -26,6 +29,7 @@
     "@types/bun": "1.3.1",
     "oxfmt": "0.47.0",
     "oxlint": "1.62.0",
+    "oxlint-tsgolint": "0.22.1",
     "typescript": "5.9.3"
   }
 }

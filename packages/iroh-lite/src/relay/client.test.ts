@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import type { RelayBrowserWebSocket } from './client'
-import { RelayAuthDeniedError, connectRelayWebSocket } from './client'
+import { RelayAuthDeniedError, RelayConnectAbortedError, connectRelayWebSocket } from './client'
 import { challengeMessageToSign, decodeHandshakeFrame } from './handshake'
 import {
   MAX_FRAME_SIZE,
@@ -204,7 +204,7 @@ describe('relay websocket connect', () => {
     await drainMicrotasks()
     socket.message(authDenied)
 
-    await expect(connecting).rejects.toEqual(new RelayAuthDeniedError('not authorized'))
+    expect(await rejectionReason(connecting)).toEqual(new RelayAuthDeniedError('not authorized'))
   })
 
   test('rejects unsupported selected relay subprotocol', async () => {
@@ -218,8 +218,8 @@ describe('relay websocket connect', () => {
     socket.protocol = 'other-protocol'
     socket.open()
 
-    await expect(connecting).rejects.toThrow(
-      'relay selected unsupported subprotocol: other-protocol',
+    expect(await rejectionReason(connecting)).toEqual(
+      new Error('relay selected unsupported subprotocol: other-protocol'),
     )
     expect(socket.readyState).toBe(3)
   })
@@ -235,7 +235,9 @@ describe('relay websocket connect', () => {
     socket.protocol = ''
     socket.open()
 
-    await expect(connecting).rejects.toThrow('relay selected unsupported subprotocol: <none>')
+    expect(await rejectionReason(connecting)).toEqual(
+      new Error('relay selected unsupported subprotocol: <none>'),
+    )
     expect(socket.readyState).toBe(3)
   })
 
@@ -247,7 +249,7 @@ describe('relay websocket connect', () => {
       WebSocket: FakeWebSocket,
     })
     latestSocket().fail()
-    await expect(failedOpen).rejects.toThrow('relay websocket failed to open')
+    expect(await rejectionReason(failedOpen)).toEqual(new Error('relay websocket failed to open'))
 
     resetFakeSockets()
     const closedBeforeOpen = connectRelayWebSocket({
@@ -256,7 +258,44 @@ describe('relay websocket connect', () => {
       WebSocket: FakeWebSocket,
     })
     latestSocket().close()
-    await expect(closedBeforeOpen).rejects.toThrow('relay websocket closed before open')
+    expect(await rejectionReason(closedBeforeOpen)).toEqual(
+      new Error('relay websocket closed before open'),
+    )
+  })
+
+  test('rejects aborted connect before opening websocket', async () => {
+    resetFakeSockets()
+    const controller = new AbortController()
+    controller.abort()
+
+    expect(
+      await rejectionReason(
+        connectRelayWebSocket({
+          url: 'https://relay.example.com',
+          secretKey,
+          signal: controller.signal,
+          WebSocket: FakeWebSocket,
+        }),
+      ),
+    ).toEqual(new RelayConnectAbortedError())
+    expect(FakeWebSocket.instances).toEqual([])
+  })
+
+  test('rejects aborted connect while opening websocket', async () => {
+    resetFakeSockets()
+    const controller = new AbortController()
+    const connecting = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      signal: controller.signal,
+      WebSocket: FakeWebSocket,
+    })
+    const socket = latestSocket()
+
+    controller.abort()
+
+    expect(await rejectionReason(connecting)).toEqual(new RelayConnectAbortedError())
+    expect(socket.readyState).toBe(3)
   })
 
   test('rejects close before server challenge', async () => {
@@ -270,7 +309,27 @@ describe('relay websocket connect', () => {
     socket.open()
     socket.close()
 
-    await expect(connecting).rejects.toThrow('relay websocket closed before server challenge')
+    expect(await rejectionReason(connecting)).toEqual(
+      new Error('relay websocket closed before server challenge'),
+    )
+  })
+
+  test('rejects aborted connect while waiting for server challenge', async () => {
+    resetFakeSockets()
+    const controller = new AbortController()
+    const connecting = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      signal: controller.signal,
+      WebSocket: FakeWebSocket,
+    })
+    const socket = latestSocket()
+    socket.open()
+
+    controller.abort()
+
+    expect(await rejectionReason(connecting)).toEqual(new RelayConnectAbortedError())
+    expect(socket.readyState).toBe(3)
   })
 
   test('rejects close before auth confirmation', async () => {
@@ -286,8 +345,31 @@ describe('relay websocket connect', () => {
     await waitForSent(socket, 1)
     socket.close()
 
-    await expect(connecting).rejects.toThrow('relay websocket closed before auth confirmation')
+    expect(await rejectionReason(connecting)).toEqual(
+      new Error('relay websocket closed before auth confirmation'),
+    )
     expect(socket.sent).toEqual([clientAuth])
+  })
+
+  test('rejects aborted connect before auth confirmation', async () => {
+    resetFakeSockets()
+    const controller = new AbortController()
+    const connecting = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      signal: controller.signal,
+      WebSocket: FakeWebSocket,
+    })
+    const socket = latestSocket()
+    socket.open()
+    socket.message(encodeServerChallengeFrame({ challenge }))
+    await waitForSent(socket, 1)
+
+    controller.abort()
+
+    expect(await rejectionReason(connecting)).toEqual(new RelayConnectAbortedError())
+    expect(socket.sent).toEqual([clientAuth])
+    expect(socket.readyState).toBe(3)
   })
 
   test('does not send auth after close during auth creation', async () => {
@@ -302,7 +384,7 @@ describe('relay websocket connect', () => {
     socket.message(encodeServerChallengeFrame({ challenge }))
     socket.close()
 
-    await expect(connecting).rejects.toThrow('relay websocket is not open')
+    expect(await rejectionReason(connecting)).toEqual(new Error('relay websocket is not open'))
     expect(socket.sent).toEqual([])
   })
 
@@ -317,7 +399,7 @@ describe('relay websocket connect', () => {
     socket.open()
     socket.message(authDenied)
 
-    await expect(connecting).rejects.toEqual(new RelayAuthDeniedError('not authorized'))
+    expect(await rejectionReason(connecting)).toEqual(new RelayAuthDeniedError('not authorized'))
     expect(socket.sent).toEqual([])
   })
 
@@ -331,8 +413,8 @@ describe('relay websocket connect', () => {
     const socket = latestSocket()
     socket.open()
     socket.message(encodeServerConfirmsAuthFrame())
-    await expect(missingChallenge).rejects.toThrow(
-      'unexpected relay handshake frame: server-confirms-auth',
+    expect(await rejectionReason(missingChallenge)).toEqual(
+      new Error('unexpected relay handshake frame: server-confirms-auth'),
     )
 
     resetFakeSockets()
@@ -346,8 +428,8 @@ describe('relay websocket connect', () => {
     nextSocket.message(encodeServerChallengeFrame({ challenge }))
     await drainMicrotasks()
     nextSocket.message(encodeServerChallengeFrame({ challenge }))
-    await expect(missingConfirmation).rejects.toThrow(
-      'unexpected relay handshake frame: server-challenge',
+    expect(await rejectionReason(missingConfirmation)).toEqual(
+      new Error('unexpected relay handshake frame: server-challenge'),
     )
   })
 })
@@ -438,19 +520,19 @@ describe('relay websocket integration', () => {
       expect(client.endpointId).toEqual(endpointId)
 
       const received = client.receive()
-      await expect(withTestTimeout(pongFrame.promise, 'pong')).resolves.toEqual({
+      expect(await withTestTimeout(pongFrame.promise, 'pong')).toEqual({
         type: 'pong',
         data: pingData,
       })
-      await expect(received).resolves.toEqual({ type: 'datagrams', datagrams: relayDatagrams })
+      expect(await received).toEqual({ type: 'datagrams', datagrams: relayDatagrams })
 
       const closed = client.receive()
       client.sendDatagrams(clientDatagrams)
-      await expect(withTestTimeout(datagramsFrame.promise, 'datagrams')).resolves.toEqual({
+      expect(await withTestTimeout(datagramsFrame.promise, 'datagrams')).toEqual({
         type: 'datagrams',
         datagrams: clientDatagrams,
       })
-      await expect(withTestTimeout(closed, 'close')).resolves.toBeNull()
+      expect(await withTestTimeout(closed, 'close')).toBeNull()
       client.close()
     } finally {
       void server.stop(true)
@@ -589,7 +671,7 @@ describe('relay websocket integration', () => {
         ecn: 1,
         contents: firstPayload,
       })
-      await expect(withTestTimeout(fromFirst, 'first datagram')).resolves.toEqual({
+      expect(await withTestTimeout(fromFirst, 'first datagram')).toEqual({
         type: 'datagrams',
         datagrams: {
           endpointId,
@@ -605,7 +687,7 @@ describe('relay websocket integration', () => {
         segmentSize: 7,
         contents: secondPayload,
       })
-      await expect(withTestTimeout(fromSecond, 'second datagram')).resolves.toEqual({
+      expect(await withTestTimeout(fromSecond, 'second datagram')).toEqual({
         type: 'datagrams',
         datagrams: {
           endpointId: secondEndpointId,
@@ -634,7 +716,7 @@ describe('relay websocket frames', () => {
     expect(socket.sent.at(-1)).toEqual(encodeClientToRelayFrame({ type: 'pong', data: pingData }))
 
     socket.message(encodeRelayToClientFrame({ type: 'pong', data: pingData }))
-    await expect(received).resolves.toEqual({ type: 'pong', data: pingData })
+    expect(await received).toEqual({ type: 'pong', data: pingData })
   })
 
   test('decodes frames using selected relay subprotocol', async () => {
@@ -656,7 +738,7 @@ describe('relay websocket frames', () => {
     socket.message(encodeRelayToClientFrame({ type: 'health', problem: 'warming up' }))
 
     expect(client.protocol).toBe('iroh-relay-v1')
-    await expect(received).resolves.toEqual({ type: 'health', problem: 'warming up' })
+    expect(await received).toEqual({ type: 'health', problem: 'warming up' })
   })
 
   test('sends and receives datagrams as relay payloads', async () => {
@@ -668,7 +750,7 @@ describe('relay websocket frames', () => {
 
     const received = client.receive()
     socket.message(encodeRelayToClientFrame({ type: 'datagrams', datagrams }))
-    await expect(received).resolves.toEqual({ type: 'datagrams', datagrams })
+    expect(await received).toEqual({ type: 'datagrams', datagrams })
   })
 
   test('resolves pending receive with null on close', async () => {
@@ -677,7 +759,7 @@ describe('relay websocket frames', () => {
 
     client.close(1000, 'done')
 
-    await expect(received).resolves.toBeNull()
+    expect(await received).toBeNull()
   })
 
   test('resolves all pending and future receives with null on close', async () => {
@@ -687,9 +769,9 @@ describe('relay websocket frames', () => {
 
     client.close()
 
-    await expect(first).resolves.toBeNull()
-    await expect(second).resolves.toBeNull()
-    await expect(client.receive()).resolves.toBeNull()
+    expect(await first).toBeNull()
+    expect(await second).toBeNull()
+    expect(await client.receive()).toBeNull()
   })
 
   test('does not pong a queued ping after close', async () => {
@@ -699,7 +781,7 @@ describe('relay websocket frames', () => {
     socket.message(encodeRelayToClientFrame({ type: 'ping', data: new Uint8Array(8) }))
     socket.close()
 
-    await expect(received).resolves.toBeNull()
+    expect(await received).toBeNull()
     expect(socket.sent).toEqual([clientAuth])
   })
 
@@ -711,8 +793,8 @@ describe('relay websocket frames', () => {
     socket.message(encodeRelayToClientFrame({ type: 'datagrams', datagrams }))
     socket.close()
 
-    await expect(received).resolves.toEqual({ type: 'datagrams', datagrams })
-    await expect(client.receive()).resolves.toBeNull()
+    expect(await received).toEqual({ type: 'datagrams', datagrams })
+    expect(await client.receive()).toBeNull()
   })
 
   test('rejects pending receive on websocket error', async () => {
@@ -721,7 +803,7 @@ describe('relay websocket frames', () => {
 
     socket.fail()
 
-    await expect(received).rejects.toThrow('relay websocket error')
+    expect(await rejectionReason(received)).toEqual(new Error('relay websocket error'))
   })
 
   test('rejects all pending and future receives on websocket error', async () => {
@@ -739,7 +821,7 @@ describe('relay websocket frames', () => {
         expect(error.message).toBe('relay websocket error')
       }
     }
-    await expect(client.receive()).rejects.toThrow('relay websocket error')
+    expect(await rejectionReason(client.receive())).toEqual(new Error('relay websocket error'))
   })
 
   test('rejects non-binary websocket messages', async () => {
@@ -748,7 +830,9 @@ describe('relay websocket frames', () => {
 
     socket.messageData('text frame')
 
-    await expect(received).rejects.toThrow('relay websocket message must be binary')
+    expect(await rejectionReason(received)).toEqual(
+      new TypeError('relay websocket message must be binary'),
+    )
   })
 
   test('rejects websocket messages over frame limit', async () => {
@@ -757,8 +841,8 @@ describe('relay websocket frames', () => {
 
     socket.messageData(new Uint8Array(MAX_FRAME_SIZE + 1))
 
-    await expect(received).rejects.toThrow(
-      `relay websocket message exceeds ${MAX_FRAME_SIZE} bytes`,
+    expect(await rejectionReason(received)).toEqual(
+      new RangeError(`relay websocket message exceeds ${MAX_FRAME_SIZE} bytes`),
     )
   })
 
@@ -768,8 +852,8 @@ describe('relay websocket frames', () => {
 
     socket.messageData(new Blob([new Uint8Array(MAX_FRAME_SIZE + 1)]))
 
-    await expect(received).rejects.toThrow(
-      `relay websocket message exceeds ${MAX_FRAME_SIZE} bytes`,
+    expect(await rejectionReason(received)).toEqual(
+      new RangeError(`relay websocket message exceeds ${MAX_FRAME_SIZE} bytes`),
     )
   })
 

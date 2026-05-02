@@ -42,6 +42,7 @@ export interface RelayWebSocketConstructor {
 export interface ConnectRelayWebSocketOptions {
   readonly url: string | URL
   readonly secretKey: Uint8Array
+  readonly signal?: AbortSignal
   readonly WebSocket?: RelayWebSocketConstructor
 }
 
@@ -52,6 +53,13 @@ export class RelayAuthDeniedError extends Error {
     super(`relay denied authentication: ${reason}`)
     this.name = 'RelayAuthDeniedError'
     this.reason = reason
+  }
+}
+
+export class RelayConnectAbortedError extends Error {
+  constructor() {
+    super('relay websocket connect aborted')
+    this.name = 'RelayConnectAbortedError'
   }
 }
 
@@ -233,17 +241,22 @@ export async function connectRelayWebSocket(
 ): Promise<RelayWebSocketClient> {
   const url = relayHttpUrlToWebSocketUrl(options.url)
   const WebSocketCtor = options.WebSocket ?? defaultWebSocketConstructor()
+  throwIfConnectAborted(options.signal)
   const socket = new WebSocketCtor(url, [...RELAY_SUBPROTOCOLS])
   socket.binaryType = 'arraybuffer'
 
   const reader = new RelayWebSocketReader(socket)
   try {
-    await waitForOpen(socket)
+    await withConnectAbort(waitForOpen(socket), options.signal)
     const protocol = parseRelayProtocol(socket.protocol)
-    const challenge = await readServerChallenge(reader)
-    const auth = await createClientAuth(options.secretKey, { challenge })
+    const challenge = await withConnectAbort(readServerChallenge(reader), options.signal)
+    const auth = await withConnectAbort(
+      createClientAuth(options.secretKey, { challenge }),
+      options.signal,
+    )
+    throwIfConnectAborted(options.signal)
     sendSocketFrame(socket, encodeClientAuth(auth))
-    await readServerConfirmation(reader)
+    await withConnectAbort(readServerConfirmation(reader), options.signal)
     return new RelayWebSocketClient(socket, reader, url, protocol, auth.endpointId)
   } catch (error) {
     reader.dispose()
@@ -280,6 +293,36 @@ async function readServerConfirmation(reader: RelayWebSocketReader): Promise<voi
     throw new RelayAuthDeniedError(frame.reason)
   }
   throw new Error(`unexpected relay handshake frame: ${frame.type}`)
+}
+
+function throwIfConnectAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw new RelayConnectAbortedError()
+  }
+}
+
+function withConnectAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) {
+    return promise
+  }
+  throwIfConnectAborted(signal)
+
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(new RelayConnectAbortedError())
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(value)
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(error)
+      },
+    )
+  })
 }
 
 function defaultWebSocketConstructor(): RelayWebSocketConstructor {

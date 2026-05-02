@@ -38,7 +38,7 @@ describe('challenge auth', () => {
   })
 
   test('derives endpoint id from iroh secret key seed', async () => {
-    await expect(endpointIdFromSecretKey(secretKey)).resolves.toEqual(endpointId)
+    expect(await endpointIdFromSecretKey(secretKey)).toEqual(endpointId)
   })
 
   test('encodes server challenge frame', () => {
@@ -62,7 +62,7 @@ describe('challenge auth', () => {
   })
 
   test('verifies Rust challenge signature vector', async () => {
-    await expect(verify(endpointId, challengeMessage, challengeSignature)).resolves.toBe(true)
+    expect(await verify(endpointId, challengeMessage, challengeSignature)).toBe(true)
   })
 
   test('encodes empty auth confirmation', () => {
