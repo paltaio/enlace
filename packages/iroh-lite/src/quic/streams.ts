@@ -310,10 +310,11 @@ class QuicStreamReceiveBuffer {
   receive(frame: QuicStreamFrame): QuicStreamReceiveOutput | null {
     validateStreamOffset(frame.streamOffset)
     const endOffset = checkedStreamEndOffset(frame.streamOffset, frame.data.length)
+    const nextFinalSize = frame.fin ? endOffset : this.#finalSize
     if (frame.fin) {
-      this.setFinalSize(endOffset)
+      this.validateFinalSize(endOffset)
     }
-    if (this.#finalSize !== null && endOffset > this.#finalSize) {
+    if (nextFinalSize !== null && endOffset > nextFinalSize) {
       throw new RangeError('QUIC STREAM data exceeds final size')
     }
 
@@ -327,6 +328,17 @@ class QuicStreamReceiveBuffer {
       if (existing !== undefined && existing !== value) {
         throw new RangeError('conflicting QUIC STREAM data')
       }
+    }
+
+    if (frame.fin) {
+      this.#finalSize = endOffset
+    }
+    for (let index = 0; index < frame.data.length; index += 1) {
+      const value = frame.data[index]
+      if (value === undefined) {
+        throw new RangeError('not enough bytes for QUIC STREAM data')
+      }
+      const offset = frame.streamOffset + index
       this.#bytes.set(offset, value)
     }
 
@@ -342,11 +354,10 @@ class QuicStreamReceiveBuffer {
     }
   }
 
-  private setFinalSize(finalSize: number): void {
+  private validateFinalSize(finalSize: number): void {
     if (this.#finalSize !== null && this.#finalSize !== finalSize) {
       throw new RangeError('conflicting QUIC STREAM final size')
     }
-    this.#finalSize = finalSize
   }
 
   private contiguousOutput(): QuicStreamReceiveOutput | null {
