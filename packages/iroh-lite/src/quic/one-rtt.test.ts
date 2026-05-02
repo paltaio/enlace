@@ -10,6 +10,7 @@ import {
   decryptQuicOneRttPacket,
   encryptQuicOneRttPacket,
   parseQuicOneRttPacketHeader,
+  receiveQuicOneRttPacket,
 } from './one-rtt'
 import { deriveTls13ApplicationTrafficFromHandshakeState } from './tls-application-traffic'
 import { verifyTls13ClientHandshakeState } from './tls-handshake-state'
@@ -33,6 +34,7 @@ describe('QUIC 1-RTT short-header packet foundation', () => {
     )
     expect(result.header.packetNumberLength).toBe(3)
     expect(result.header.packetNumber).toBe(0x123456)
+    expect(result.packetNumber).toBe(0x123456n)
     expect(result.header.packetNumberOffset).toBe(5)
     expect(result.header.payloadOffset).toBe(8)
     expect(bytesToHex(result.payload)).toBe(bytesToHex(payload))
@@ -106,17 +108,76 @@ describe('QUIC 1-RTT short-header packet foundation', () => {
     )
   })
 
-  test('rejects packet numbers that do not fit the selected truncated length', async () => {
+  test('recovers the full packet number when the truncated packet number wraps', async () => {
     const keys = await applicationTrafficKeys()
+    const destinationConnectionId = hexToBytes('01020304')
+    const payload = concatBytes([encodeQuicPaddingFrame(2), encodeQuicPingFrame()])
+    const packet = encryptQuicOneRttPacket(keys.client, {
+      destinationConnectionId,
+      packetNumber: 0x100n,
+      packetNumberLength: 1,
+      payload,
+    })
+    const result = decryptQuicOneRttPacket(
+      packet,
+      keys.client,
+      destinationConnectionId.length,
+      0,
+      0x100n,
+    )
 
+    expect(result.header.packetNumberLength).toBe(1)
+    expect(result.header.packetNumber).toBe(0)
+    expect(result.packetNumber).toBe(0x100n)
+    expect(bytesToHex(result.payload)).toBe(bytesToHex(payload))
+  })
+
+  test('receives packets with recovered packet numbers and updated largest received state', async () => {
+    const keys = await applicationTrafficKeys()
+    const destinationConnectionId = hexToBytes('01020304')
+    const payload = concatBytes([encodeQuicPaddingFrame(2), encodeQuicPingFrame()])
+    const wrappedPacket = encryptQuicOneRttPacket(keys.client, {
+      destinationConnectionId,
+      packetNumber: 0x100n,
+      packetNumberLength: 1,
+      payload,
+    })
+    const previousPacket = encryptQuicOneRttPacket(keys.client, {
+      destinationConnectionId,
+      packetNumber: 0xffn,
+      packetNumberLength: 1,
+      payload,
+    })
+
+    const first = receiveQuicOneRttPacket(
+      wrappedPacket,
+      keys.client,
+      destinationConnectionId.length,
+      0xffn,
+    )
+    const second = receiveQuicOneRttPacket(
+      previousPacket,
+      keys.client,
+      destinationConnectionId.length,
+      first.largestReceivedPacketNumber,
+    )
+
+    expect(first.packetNumber).toBe(0x100n)
+    expect(first.largestReceivedPacketNumber).toBe(0x100n)
+    expect(second.packetNumber).toBe(0xffn)
+    expect(second.largestReceivedPacketNumber).toBe(0x100n)
+  })
+
+  test('rejects packet numbers outside the QUIC packet number range', async () => {
+    const keys = await applicationTrafficKeys()
     expect(() =>
       encryptQuicOneRttPacket(keys.client, {
         destinationConnectionId: hexToBytes('01020304'),
-        packetNumber: 0x100,
+        packetNumber: 0x4000000000000000n,
         packetNumberLength: 1,
         payload: hexToBytes('00'),
       }),
-    ).toThrow('QUIC packet number does not fit truncated length')
+    ).toThrow('QUIC packet number out of range')
   })
 })
 

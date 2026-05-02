@@ -7,7 +7,13 @@ import {
   removeQuicHeaderProtection,
   type QuicDirectionalKeys,
 } from './crypto'
-import { readQuicPacketNumber } from './packet'
+import {
+  nextExpectedQuicPacketNumber,
+  quicPacketNumberToBigInt,
+  readQuicPacketNumber,
+  recoverQuicPacketNumber,
+  updateLargestReceivedQuicPacketNumber,
+} from './packet'
 
 export interface QuicOneRttPacketHeaderPrefix {
   readonly firstByte: number
@@ -23,14 +29,19 @@ export interface QuicOneRttPacketHeader extends QuicOneRttPacketHeaderPrefix {
 
 export interface QuicOneRttPacketDecryptionResult {
   readonly header: QuicOneRttPacketHeader
+  readonly packetNumber: bigint
   readonly payload: Uint8Array
   readonly unprotectedPacket: Uint8Array
   readonly endOffset: number
 }
 
+export interface QuicOneRttPacketReceiveResult extends QuicOneRttPacketDecryptionResult {
+  readonly largestReceivedPacketNumber: bigint
+}
+
 export interface QuicOneRttPacketProtectionOptions {
   readonly destinationConnectionId: Uint8Array
-  readonly packetNumber: number
+  readonly packetNumber: number | bigint
   readonly packetNumberLength: number
   readonly payload: Uint8Array
 }
@@ -101,6 +112,7 @@ export function decryptQuicOneRttPacket(
   keys: QuicDirectionalKeys,
   destinationConnectionIdLength: number,
   offset = 0,
+  expectedPacketNumber: number | bigint | null = null,
 ): QuicOneRttPacketDecryptionResult {
   const prefix = parseQuicOneRttPacketHeaderPrefix(packet, destinationConnectionIdLength, offset)
   const protectedPacket = copyBytes(packet.subarray(offset))
@@ -113,13 +125,47 @@ export function decryptQuicOneRttPacket(
   const header = parseQuicOneRttPacketHeader(protection.packet, destinationConnectionIdLength)
   const ciphertext = protection.packet.subarray(header.payloadOffset)
   const associatedData = protection.packet.subarray(0, header.payloadOffset)
-  const payload = decryptQuicAes128GcmPacket(keys, header.packetNumber, associatedData, ciphertext)
+  const packetNumber =
+    expectedPacketNumber === null
+      ? BigInt(header.packetNumber)
+      : recoverQuicPacketNumber(
+          header.packetNumber,
+          header.packetNumberLength,
+          expectedPacketNumber,
+        )
+  const payload = decryptQuicAes128GcmPacket(keys, packetNumber, associatedData, ciphertext)
 
   return {
     header,
+    packetNumber,
     payload,
     unprotectedPacket: protection.packet,
     endOffset: packet.length,
+  }
+}
+
+export function receiveQuicOneRttPacket(
+  packet: Uint8Array,
+  keys: QuicDirectionalKeys,
+  destinationConnectionIdLength: number,
+  largestReceivedPacketNumber: number | bigint | null,
+  offset = 0,
+): QuicOneRttPacketReceiveResult {
+  const expectedPacketNumber = nextExpectedQuicPacketNumber(largestReceivedPacketNumber)
+  const result = decryptQuicOneRttPacket(
+    packet,
+    keys,
+    destinationConnectionIdLength,
+    offset,
+    expectedPacketNumber,
+  )
+
+  return {
+    ...result,
+    largestReceivedPacketNumber: updateLargestReceivedQuicPacketNumber(
+      largestReceivedPacketNumber,
+      result.packetNumber,
+    ),
   }
 }
 
@@ -135,19 +181,12 @@ function validatePacketNumberLength(length: number): void {
   }
 }
 
-function encodeTruncatedPacketNumber(packetNumber: number, length: number): Uint8Array {
-  if (!Number.isSafeInteger(packetNumber) || packetNumber < 0) {
-    throw new RangeError('QUIC packet number out of range')
-  }
-  const maxPacketNumber = 2 ** (8 * length) - 1
-  if (packetNumber > maxPacketNumber) {
-    throw new RangeError('QUIC packet number does not fit truncated length')
-  }
-
+function encodeTruncatedPacketNumber(packetNumber: number | bigint, length: number): Uint8Array {
+  let remaining = quicPacketNumberToBigInt(packetNumber)
   const bytes = new Uint8Array(length)
-  for (let index = 0; index < length; index += 1) {
-    const shift = 8 * (length - index - 1)
-    bytes[index] = Math.floor(packetNumber / 2 ** shift) & 0xff
+  for (let index = length - 1; index >= 0; index -= 1) {
+    bytes[index] = Number(remaining & 0xffn)
+    remaining >>= 8n
   }
   return bytes
 }

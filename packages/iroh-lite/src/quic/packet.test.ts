@@ -4,9 +4,12 @@ import { bytesToHex, hexToBytes } from '../testing/hex'
 import {
   QUIC_VERSION_1,
   QuicLongHeaderPacketType,
+  nextExpectedQuicPacketNumber,
   parseQuicHandshakePacketHeader,
   parseQuicInitialPacketHeader,
   parseQuicLongHeader,
+  recoverQuicPacketNumber,
+  updateLargestReceivedQuicPacketNumber,
 } from './packet'
 
 const initialPacket = hexToBytes('c300000001088394c8f03e515708080001020304050607000700000002aabbcc')
@@ -94,5 +97,49 @@ describe('QUIC Initial header parsing', () => {
         hexToBytes('c300000001088394c8f03e515708080001020304050607000300000002'),
       ),
     ).toThrow('QUIC Initial length smaller than packet number')
+  })
+})
+
+describe('QUIC packet number recovery', () => {
+  test('recovers the full packet number from the truncated packet number', () => {
+    expect(recoverQuicPacketNumber(0x9b32, 2, 0xa82f30eb)).toBe(0xa82f9b32n)
+  })
+
+  test('selects the lower candidate near the half-window boundary', () => {
+    expect(recoverQuicPacketNumber(0xff, 1, 0x10000)).toBe(0xffffn)
+  })
+
+  test('selects the higher candidate near the half-window boundary', () => {
+    expect(recoverQuicPacketNumber(0x00, 1, 0xffff)).toBe(0x10000n)
+  })
+
+  test('allows recovery up to the QUIC maximum packet number', () => {
+    expect(recoverQuicPacketNumber(0xff, 1, 0x3fffffffffffff80n)).toBe(0x3fffffffffffffffn)
+  })
+
+  test('rejects invalid recovery inputs', () => {
+    expect(() => recoverQuicPacketNumber(0, 0, 0)).toThrow('QUIC packet number length out of range')
+    expect(() => recoverQuicPacketNumber(0x100, 1, 0)).toThrow(
+      'QUIC truncated packet number out of range',
+    )
+    expect(() => recoverQuicPacketNumber(0, 1, -1)).toThrow('QUIC packet number out of range')
+  })
+
+  test('derives the expected next packet number from the largest received packet number', () => {
+    expect(nextExpectedQuicPacketNumber(null)).toBe(0n)
+    expect(nextExpectedQuicPacketNumber(0x100n)).toBe(0x101n)
+    expect(() => nextExpectedQuicPacketNumber(0x3fffffffffffffffn)).toThrow(
+      'QUIC expected packet number out of range',
+    )
+  })
+
+  test('updates largest received without ACK scheduling state', () => {
+    let largestReceived: bigint | null = null
+    largestReceived = updateLargestReceivedQuicPacketNumber(largestReceived, 0x100n)
+    largestReceived = updateLargestReceivedQuicPacketNumber(largestReceived, 0xffn)
+    largestReceived = updateLargestReceivedQuicPacketNumber(largestReceived, 0x101n)
+
+    expect(largestReceived).toBe(0x101n)
+    expect(nextExpectedQuicPacketNumber(largestReceived)).toBe(0x102n)
   })
 })

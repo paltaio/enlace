@@ -4,6 +4,7 @@ import { sha256 } from '@noble/hashes/sha2.js'
 
 import { copyBytes, readU8, requireLength } from '../bytes'
 import { hkdfExpandTls13LabelSha256 } from '../crypto/hkdf'
+import { quicPacketNumberToBigInt } from './packet'
 
 const CLIENT_INITIAL_LABEL = 'client in'
 const SERVER_INITIAL_LABEL = 'server in'
@@ -21,7 +22,6 @@ export const QUIC_AES_128_KEY_LENGTH = 16
 export const QUIC_AES_128_IV_LENGTH = 12
 export const QUIC_HEADER_PROTECTION_SAMPLE_LENGTH = 16
 export const QUIC_HEADER_PROTECTION_MASK_LENGTH = 5
-export const QUIC_MAX_PACKET_NUMBER = 0x3fffffffffffffffn
 
 export interface QuicInitialSecrets {
   readonly initial: Uint8Array
@@ -104,7 +104,7 @@ export function deriveQuicDirectionalKeys(secret: Uint8Array): QuicDirectionalKe
 export function quicPacketNonce(packetIv: Uint8Array, packetNumber: number | bigint): Uint8Array {
   requireLength(packetIv, QUIC_AES_128_IV_LENGTH, 'QUIC packet IV')
   const nonce = copyBytes(packetIv)
-  let remaining = packetNumberToBigInt(packetNumber)
+  let remaining = quicPacketNumberToBigInt(packetNumber)
 
   for (let index = nonce.length - 1; index >= 0 && remaining > 0n; index -= 1) {
     nonce[index] = readU8(nonce, index) ^ Number(remaining & 0xffn)
@@ -181,19 +181,6 @@ export function headerProtectionSample(packet: Uint8Array, packetNumberOffset: n
   return copyBytes(
     packet.subarray(sampleOffset, sampleOffset + QUIC_HEADER_PROTECTION_SAMPLE_LENGTH),
   )
-}
-
-function packetNumberToBigInt(packetNumber: number | bigint): bigint {
-  if (typeof packetNumber === 'number') {
-    if (!Number.isSafeInteger(packetNumber) || packetNumber < 0) {
-      throw new RangeError('QUIC packet number out of range')
-    }
-    return BigInt(packetNumber)
-  }
-  if (packetNumber < 0n || packetNumber > QUIC_MAX_PACKET_NUMBER) {
-    throw new RangeError('QUIC packet number out of range')
-  }
-  return packetNumber
 }
 
 function isLongHeader(firstByte: number): boolean {
