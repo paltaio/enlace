@@ -6,6 +6,9 @@ import {
   decodeGossipStreamFrame,
   decodeGossipStreamHeader,
   decodeGossipTopicMessage,
+  encodeGossipBroadcastMessage,
+  encodeGossipStreamHeader,
+  encodeGossipSwarmJoinMessage,
   gossipAlpn,
 } from './wire'
 
@@ -32,6 +35,12 @@ describe('gossip wire frames', () => {
     expect(bytesToHex(header.topicId)).toBe(vector.topicIdHex)
   })
 
+  test('encodes native stream header frame', () => {
+    expect(bytesToHex(encodeGossipStreamHeader({ topicId: hexToBytes(vector.topicIdHex) }))).toBe(
+      vector.streamHeaderFrameHex,
+    )
+  })
+
   test('decodes native join message frame', () => {
     const frame = decodeGossipStreamFrame(hexToBytes(vector.joinMessageFrameHex))
     const message = decodeGossipTopicMessage(frame.payload)
@@ -41,6 +50,10 @@ describe('gossip wire frames', () => {
       type: 'join',
       peerData: new Uint8Array(),
     })
+  })
+
+  test('encodes native join message frame', () => {
+    expect(bytesToHex(encodeGossipSwarmJoinMessage())).toBe(vector.joinMessageFrameHex)
   })
 
   test('decodes native broadcast message frame', () => {
@@ -56,5 +69,11 @@ describe('gossip wire frames', () => {
     expect(message.content).toEqual(payload)
     expect(message.scope).toEqual({ type: 'swarm', round: 0 })
     expect(message.id).toEqual(blake3(payload))
+  })
+
+  test('encodes native broadcast message frame', () => {
+    expect(
+      bytesToHex(encodeGossipBroadcastMessage({ content: hexToBytes(vector.broadcastPayloadHex) })),
+    ).toBe(vector.broadcastMessageFrameHex)
   })
 })

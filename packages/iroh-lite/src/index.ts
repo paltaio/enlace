@@ -13,6 +13,15 @@ export type {
   IrohEndpointOptions,
   IrohStreamRead,
 } from './endpoint'
+export { IrohGossip, IrohGossipSubscription, createGossip } from './gossip'
+export type {
+  IrohGossipBroadcastOptions,
+  IrohGossipEvent,
+  IrohGossipJoinEvent,
+  IrohGossipJoinPeerOptions,
+  IrohGossipMessageEvent,
+  IrohGossipSubscribeOptions,
+} from './gossip'
 export {
   ENDPOINT_ID_LENGTH,
   SECRET_KEY_LENGTH,

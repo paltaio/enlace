@@ -6,6 +6,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./endpoint": "./src/endpoint.ts",
+    "./gossip": "./src/gossip.ts",
     "./varint": "./src/varint.ts",
     "./relay/client": "./src/relay/client.ts",
     "./relay/frames": "./src/relay/frames.ts",

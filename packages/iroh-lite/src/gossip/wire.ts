@@ -1,4 +1,14 @@
-import { copyBytes, decodePostcardLen, readU32BE } from '../bytes'
+import { blake3 } from '@noble/hashes/blake3.js'
+
+import {
+  concatBytes,
+  copyBytes,
+  decodePostcardLen,
+  encodePostcardLen,
+  readU32BE,
+  requireLength,
+  writeU32BE,
+} from '../bytes'
 
 export const gossipAlpn = new TextEncoder().encode('/iroh-gossip/1')
 
@@ -36,6 +46,50 @@ export interface GossipSwarmDeliveryScope {
 
 export interface GossipNeighborDeliveryScope {
   readonly type: 'neighbors'
+}
+
+export interface GossipBroadcastMessageInput {
+  readonly content: Uint8Array
+  readonly scope?: GossipDeliveryScope
+}
+
+export function encodeGossipStreamFrame(payload: Uint8Array): Uint8Array {
+  return concatBytes([writeU32BE(payload.length), payload])
+}
+
+export function encodeGossipStreamHeader(header: GossipStreamHeader): Uint8Array {
+  return encodeGossipStreamFrame(validateGossipTopicId(header.topicId))
+}
+
+export function encodeGossipSwarmJoinMessage(peerData = new Uint8Array()): Uint8Array {
+  return encodeGossipStreamFrame(
+    concatBytes([
+      encodePostcardLen(0),
+      encodePostcardLen(0),
+      encodePostcardLen(1),
+      encodePostcardLen(peerData.length),
+      peerData,
+    ]),
+  )
+}
+
+export function encodeGossipBroadcastMessage(message: GossipBroadcastMessageInput): Uint8Array {
+  const content = copyBytes(message.content)
+  return encodeGossipStreamFrame(
+    concatBytes([
+      encodePostcardLen(1),
+      encodePostcardLen(0),
+      blake3(content),
+      encodePostcardLen(content.length),
+      content,
+      encodeDeliveryScope(message.scope ?? { type: 'swarm', round: 0 }),
+    ]),
+  )
+}
+
+export function validateGossipTopicId(topicId: Uint8Array): Uint8Array {
+  requireLength(topicId, 32, 'gossip topic id')
+  return copyBytes(topicId)
 }
 
 export function decodeGossipStreamFrame(bytes: Uint8Array, offset = 0): GossipStreamFrame {
@@ -115,6 +169,13 @@ function decodeDeliveryScope(reader: PostcardReader): GossipDeliveryScope {
     return { type: 'neighbors' }
   }
   throw new RangeError(`unsupported gossip delivery scope ${variant}`)
+}
+
+function encodeDeliveryScope(scope: GossipDeliveryScope): Uint8Array {
+  if (scope.type === 'swarm') {
+    return concatBytes([encodePostcardLen(0), encodePostcardLen(scope.round)])
+  }
+  return encodePostcardLen(1)
 }
 
 class PostcardReader {
