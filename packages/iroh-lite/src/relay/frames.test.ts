@@ -114,6 +114,38 @@ describe('relay-to-client frames', () => {
       status: { type: 'same-endpoint-id-connected' },
     })
   })
+
+  test('encodes and decodes v1 health', () => {
+    const encoded = encodeRelayToClientFrame({ type: 'health', problem: 'warming up' })
+    expect(bytesToHex(encoded)).toBe('0b7761726d696e67207570')
+    expect(decodeRelayToClientFrame(encoded, 'iroh-relay-v1')).toEqual({
+      type: 'health',
+      problem: 'warming up',
+    })
+  })
+
+  test('rejects version-specific relay frames on the wrong subprotocol', () => {
+    const health = encodeRelayToClientFrame({ type: 'health', problem: 'warming up' })
+    const status = encodeRelayToClientFrame({
+      type: 'status',
+      status: { type: 'healthy' },
+    })
+
+    expect(() => decodeRelayToClientFrame(health, 'iroh-relay-v2')).toThrow(
+      'relay frame not allowed for selected protocol',
+    )
+    expect(() => decodeRelayToClientFrame(status, 'iroh-relay-v1')).toThrow(
+      'relay frame not allowed for selected protocol',
+    )
+  })
+
+  test('rejects oversized and malformed v1 health frames', () => {
+    expect(() =>
+      encodeRelayToClientFrame({ type: 'health', problem: 'x'.repeat(MAX_PACKET_SIZE) }),
+    ).toThrow(`relay frame exceeds ${MAX_PACKET_SIZE} bytes`)
+
+    expect(() => decodeRelayToClientFrame(hexToBytes('0bff'), 'iroh-relay-v1')).toThrow()
+  })
 })
 
 describe('client-to-relay frames', () => {

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import type { RelayBrowserWebSocket } from './client'
 import { RelayAuthDeniedError, connectRelayWebSocket } from './client'
+import { challengeMessageToSign, decodeHandshakeFrame } from './handshake'
 import {
   MAX_FRAME_SIZE,
   decodeClientToRelayFrame,
@@ -13,10 +14,17 @@ import {
   encodeServerChallengeFrame,
   encodeServerConfirmsAuthFrame,
 } from './handshake'
-import { hexToBytes } from '../testing/hex'
+import { verify } from '../crypto/ed25519'
+import { bytesToHex, hexToBytes } from '../testing/hex'
 
 const secretKey = hexToBytes('2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a')
+const secondSecretKey = hexToBytes(
+  '4343434343434343434343434343434343434343434343434343434343434343',
+)
 const endpointId = hexToBytes('197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61')
+const secondEndpointId = hexToBytes(
+  '22fc297792f0b6ffc0bfcfdb7edb0c0aa14e025a365ec0e342e86e3829cb74b6',
+)
 const challenge = hexToBytes('07070707070707070707070707070707')
 const clientAuth = hexToBytes(
   '01197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d6140425fda43adca848e71a65ded8c4fb4f4434ca7f248aa6aec7c547ff96aa0b33bd3245943b407b12a9d8a55522f1bd07fa03180b01793ed572a8068bc49319205',
@@ -108,6 +116,15 @@ function rejectionReason(promise: Promise<unknown>): Promise<unknown> {
   return promise.then(
     () => new Error('expected promise rejection'),
     (error: unknown) => error,
+  )
+}
+
+function bunWebSocketMessageBytes(message: string | ArrayBufferView): Uint8Array {
+  if (typeof message === 'string') {
+    throw new TypeError('relay server expected bytes')
+  }
+  return new Uint8Array(
+    message.buffer.slice(message.byteOffset, message.byteOffset + message.byteLength),
   )
 }
 
@@ -369,12 +386,7 @@ describe('relay websocket integration', () => {
         },
         message(ws, message) {
           try {
-            if (typeof message === 'string') {
-              throw new TypeError('relay server expected bytes')
-            }
-            const bytes = new Uint8Array(
-              message.buffer.slice(message.byteOffset, message.byteOffset + message.byteLength),
-            )
+            const bytes = bunWebSocketMessageBytes(message)
             if (!ws.data.confirmed) {
               ws.data.confirmed = true
               authBytes.resolve(bytes)
@@ -444,6 +456,171 @@ describe('relay websocket integration', () => {
       void server.stop(true)
     }
   })
+
+  test('routes datagrams between two relay clients', async () => {
+    type RelayPeerData = {
+      endpointId: Uint8Array | null
+    }
+
+    const firstPayload = new TextEncoder().encode('from first client')
+    const secondPayload = new TextEncoder().encode('from second client')
+    const peers = new Map<string, Bun.ServerWebSocket<RelayPeerData>>()
+    const authFrames = deferred<Uint8Array[]>()
+    const protocolHeaders: (string | null)[] = []
+    const authenticated: Uint8Array[] = []
+
+    const server = Bun.serve<RelayPeerData>({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch(request, server) {
+        const url = new URL(request.url)
+        if (url.pathname !== '/relay') {
+          return new Response('not found', { status: 404 })
+        }
+        protocolHeaders.push(request.headers.get('sec-websocket-protocol'))
+        const upgraded = server.upgrade(request, {
+          headers: { 'Sec-WebSocket-Protocol': 'iroh-relay-v2' },
+          data: { endpointId: null },
+        })
+        if (upgraded) {
+          return
+        }
+        return new Response('upgrade failed', { status: 400 })
+      },
+      websocket: {
+        open(ws) {
+          ws.send(encodeServerChallengeFrame({ challenge }))
+        },
+        async message(ws, message) {
+          try {
+            const bytes = bunWebSocketMessageBytes(message)
+            if (ws.data.endpointId === null) {
+              const frame = decodeHandshakeFrame(bytes)
+              if (frame.type !== 'client-auth') {
+                throw new Error(`expected client auth, got ${frame.type}`)
+              }
+              const verified = await verify(
+                frame.auth.endpointId,
+                challengeMessageToSign(challenge),
+                frame.auth.signature,
+              )
+              if (!verified) {
+                throw new Error('client auth signature did not verify')
+              }
+              ws.data.endpointId = frame.auth.endpointId
+              authenticated.push(bytes)
+              peers.set(bytesToHex(frame.auth.endpointId), ws)
+              if (authenticated.length === 2) {
+                authFrames.resolve(authenticated)
+              }
+              ws.send(encodeServerConfirmsAuthFrame())
+              return
+            }
+
+            const frame = decodeClientToRelayFrame(bytes)
+            if (frame.type !== 'datagrams') {
+              throw new Error(`expected datagrams, got ${frame.type}`)
+            }
+            const recipient = peers.get(bytesToHex(frame.datagrams.endpointId))
+            if (recipient === undefined) {
+              throw new Error('missing relay recipient')
+            }
+            const forwardedDatagrams =
+              frame.datagrams.segmentSize === undefined
+                ? {
+                    endpointId: ws.data.endpointId,
+                    ecn: frame.datagrams.ecn,
+                    contents: frame.datagrams.contents,
+                  }
+                : {
+                    endpointId: ws.data.endpointId,
+                    ecn: frame.datagrams.ecn,
+                    segmentSize: frame.datagrams.segmentSize,
+                    contents: frame.datagrams.contents,
+                  }
+            recipient.send(
+              encodeRelayToClientFrame({
+                type: 'datagrams',
+                datagrams: forwardedDatagrams,
+              }),
+            )
+          } catch (error) {
+            authFrames.reject(error)
+            ws.close(1011, 'test failure')
+          }
+        },
+      },
+    })
+
+    try {
+      const firstClientPromise = connectRelayWebSocket({ url: server.url, secretKey })
+      const secondClientPromise = connectRelayWebSocket({
+        url: server.url,
+        secretKey: secondSecretKey,
+      })
+      const [firstClient, secondClient] = await withTestTimeout(
+        Promise.all([firstClientPromise, secondClientPromise]),
+        'connect clients',
+      )
+
+      expect(protocolHeaders).toEqual([
+        'iroh-relay-v2, iroh-relay-v1',
+        'iroh-relay-v2, iroh-relay-v1',
+      ])
+      const receivedAuthFrames = await withTestTimeout(authFrames.promise, 'auth frames')
+      expect(receivedAuthFrames).toHaveLength(2)
+      const [firstAuth, secondAuth] = receivedAuthFrames
+      if (firstAuth === undefined || secondAuth === undefined) {
+        throw new Error('missing auth frame')
+      }
+      const secondAuthFrame = decodeHandshakeFrame(secondAuth)
+      expect(firstAuth).toEqual(clientAuth)
+      if (secondAuthFrame.type !== 'client-auth') {
+        throw new Error(`expected second client auth, got ${secondAuthFrame.type}`)
+      }
+      expect(secondAuthFrame.auth.endpointId).toEqual(secondEndpointId)
+      expect(secondAuthFrame.auth.signature).toHaveLength(64)
+      expect(firstClient.endpointId).toEqual(endpointId)
+      expect(secondClient.endpointId).toEqual(secondEndpointId)
+
+      const fromFirst = secondClient.receive()
+      firstClient.sendDatagrams({
+        endpointId: secondEndpointId,
+        ecn: 1,
+        contents: firstPayload,
+      })
+      await expect(withTestTimeout(fromFirst, 'first datagram')).resolves.toEqual({
+        type: 'datagrams',
+        datagrams: {
+          endpointId,
+          ecn: 1,
+          contents: firstPayload,
+        },
+      })
+
+      const fromSecond = firstClient.receive()
+      secondClient.sendDatagrams({
+        endpointId,
+        ecn: 3,
+        segmentSize: 7,
+        contents: secondPayload,
+      })
+      await expect(withTestTimeout(fromSecond, 'second datagram')).resolves.toEqual({
+        type: 'datagrams',
+        datagrams: {
+          endpointId: secondEndpointId,
+          ecn: 3,
+          segmentSize: 7,
+          contents: secondPayload,
+        },
+      })
+
+      firstClient.close()
+      secondClient.close()
+    } finally {
+      void server.stop(true)
+    }
+  })
 })
 
 describe('relay websocket frames', () => {
@@ -458,6 +635,28 @@ describe('relay websocket frames', () => {
 
     socket.message(encodeRelayToClientFrame({ type: 'pong', data: pingData }))
     await expect(received).resolves.toEqual({ type: 'pong', data: pingData })
+  })
+
+  test('decodes frames using selected relay subprotocol', async () => {
+    resetFakeSockets()
+    const connecting = connectRelayWebSocket({
+      url: 'https://relay.example.com',
+      secretKey,
+      WebSocket: FakeWebSocket,
+    })
+    const socket = latestSocket()
+    socket.protocol = 'iroh-relay-v1'
+    socket.open()
+    socket.message(encodeServerChallengeFrame({ challenge }))
+    await drainMicrotasks()
+    socket.message(encodeServerConfirmsAuthFrame())
+    const client = await connecting
+
+    const received = client.receive()
+    socket.message(encodeRelayToClientFrame({ type: 'health', problem: 'warming up' }))
+
+    expect(client.protocol).toBe('iroh-relay-v1')
+    await expect(received).resolves.toEqual({ type: 'health', problem: 'warming up' })
   })
 
   test('sends and receives datagrams as relay payloads', async () => {

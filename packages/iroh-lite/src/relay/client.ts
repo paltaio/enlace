@@ -187,7 +187,7 @@ export class RelayWebSocketClient {
       if (bytes === null) {
         return null
       }
-      const frame = decodeRelayToClientFrame(bytes)
+      const frame = decodeRelayToClientFrame(bytes, this.protocol)
       if (frame.type !== 'ping') {
         return frame
       }

@@ -56,9 +56,12 @@ export type RelayFrame =
   | { readonly type: 'ping'; readonly data: Uint8Array }
   | { readonly type: 'pong'; readonly data: Uint8Array }
   | { readonly type: 'status'; readonly status: RelayStatusValue }
+  | { readonly type: 'health'; readonly problem: string }
   | { readonly type: 'restarting'; readonly reconnectInMs: number; readonly tryForMs: number }
   | { readonly type: 'endpoint-gone'; readonly endpointId: Uint8Array }
   | { readonly type: 'datagrams'; readonly datagrams: Datagrams }
+
+export type RelayFrameProtocolVersion = 'iroh-relay-v1' | 'iroh-relay-v2'
 
 export type ClientRelayFrame =
   | { readonly type: 'ping'; readonly data: Uint8Array }
@@ -174,6 +177,17 @@ function encodeStatus(status: RelayStatusValue): Uint8Array {
   }
 }
 
+function encodeHealth(problem: string): Uint8Array {
+  const tagBytes = frameTag(FrameType.Health)
+  const payload = new TextEncoder().encode(problem)
+  assertPayloadLimit(tagBytes.length + payload.length)
+  return concatBytes([tagBytes, payload])
+}
+
+function decodeHealth(payload: Uint8Array): string {
+  return new TextDecoder('utf-8', { fatal: true }).decode(payload)
+}
+
 function decodeTaggedFrame(bytes: Uint8Array): {
   readonly tag: number
   readonly payload: Uint8Array
@@ -192,6 +206,8 @@ export function encodeRelayToClientFrame(frame: RelayFrame): Uint8Array {
       return encodePingPong(FrameType.Pong, frame.data)
     case 'status':
       return encodeStatus(frame.status)
+    case 'health':
+      return encodeHealth(frame.problem)
     case 'restarting':
       return concatBytes([
         frameTag(FrameType.Restarting),
@@ -227,7 +243,10 @@ export function encodeClientToRelayFrame(frame: ClientRelayFrame): Uint8Array {
   }
 }
 
-export function decodeRelayToClientFrame(bytes: Uint8Array): RelayFrame {
+export function decodeRelayToClientFrame(
+  bytes: Uint8Array,
+  protocol: RelayFrameProtocolVersion = 'iroh-relay-v2',
+): RelayFrame {
   const { tag, payload } = decodeTaggedFrame(bytes)
   switch (tag) {
     case FrameType.RelayToClientDatagram:
@@ -243,6 +262,11 @@ export function decodeRelayToClientFrame(bytes: Uint8Array): RelayFrame {
     case FrameType.Pong:
       requireLength(payload, 8, 'pong payload')
       return { type: 'pong', data: copyBytes(payload) }
+    case FrameType.Health:
+      if (protocol !== 'iroh-relay-v1') {
+        throw new RangeError('relay frame not allowed for selected protocol')
+      }
+      return { type: 'health', problem: decodeHealth(payload) }
     case FrameType.Restarting:
       requireLength(payload, 8, 'restarting payload')
       return {
@@ -251,6 +275,9 @@ export function decodeRelayToClientFrame(bytes: Uint8Array): RelayFrame {
         tryForMs: readU32BE(payload, 4),
       }
     case FrameType.Status:
+      if (protocol !== 'iroh-relay-v2') {
+        throw new RangeError('relay frame not allowed for selected protocol')
+      }
       return { type: 'status', status: parseStatus(payload) }
     default:
       throw new RangeError(`invalid relay-to-client frame tag ${tag}`)
