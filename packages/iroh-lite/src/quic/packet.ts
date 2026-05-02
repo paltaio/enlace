@@ -26,9 +26,17 @@ export interface QuicInitialPacketHeader extends QuicLongHeader {
   readonly packetType: typeof QuicLongHeaderPacketType.Initial
   readonly token: Uint8Array
   readonly length: number
+  readonly packetNumberOffset: number
   readonly packetNumberLength: number
   readonly packetNumber: number
   readonly payloadOffset: number
+}
+
+export interface QuicInitialPacketHeaderPrefix extends QuicLongHeader {
+  readonly packetType: typeof QuicLongHeaderPacketType.Initial
+  readonly token: Uint8Array
+  readonly length: number
+  readonly packetNumberOffset: number
 }
 
 export function parseQuicLongHeader(bytes: Uint8Array, offset = 0): QuicLongHeader {
@@ -71,6 +79,36 @@ export function parseQuicInitialPacketHeader(
   bytes: Uint8Array,
   offset = 0,
 ): QuicInitialPacketHeader {
+  const header = parseQuicInitialPacketHeaderPrefix(bytes, offset)
+  let pos = header.packetNumberOffset
+
+  const packetNumberLength = (header.firstByte & 0x03) + 1
+  const packetNumber = readQuicPacketNumber(bytes, pos, packetNumberLength)
+  pos += packetNumberLength
+
+  if (header.length < packetNumberLength) {
+    throw new RangeError('QUIC Initial length smaller than packet number')
+  }
+  if (bytes.length - pos < header.length - packetNumberLength) {
+    throw new RangeError('not enough bytes for QUIC Initial payload')
+  }
+
+  return {
+    ...header,
+    packetType: QuicLongHeaderPacketType.Initial,
+    token: header.token,
+    length: header.length,
+    packetNumberOffset: header.packetNumberOffset,
+    packetNumberLength,
+    packetNumber,
+    payloadOffset: pos,
+  }
+}
+
+export function parseQuicInitialPacketHeaderPrefix(
+  bytes: Uint8Array,
+  offset = 0,
+): QuicInitialPacketHeaderPrefix {
   const header = parseQuicLongHeader(bytes, offset)
   if (header.packetType !== QuicLongHeaderPacketType.Initial) {
     throw new RangeError('QUIC packet is not Initial')
@@ -85,26 +123,28 @@ export function parseQuicInitialPacketHeader(
   const encodedLength = decodeVarIntNumber(bytes, pos)
   pos += encodedLength.bytesRead
 
-  const packetNumberLength = (header.firstByte & 0x03) + 1
-  const packetNumber = readPacketNumber(bytes, pos, packetNumberLength)
-  pos += packetNumberLength
-
-  if (encodedLength.value < packetNumberLength) {
-    throw new RangeError('QUIC Initial length smaller than packet number')
-  }
-  if (bytes.length - pos < encodedLength.value - packetNumberLength) {
-    throw new RangeError('not enough bytes for QUIC Initial payload')
-  }
-
   return {
     ...header,
     packetType: QuicLongHeaderPacketType.Initial,
     token,
     length: encodedLength.value,
-    packetNumberLength,
-    packetNumber,
-    payloadOffset: pos,
+    packetNumberOffset: pos,
   }
+}
+
+export function readQuicPacketNumber(bytes: Uint8Array, offset: number, length: number): number {
+  if (length < 1 || length > 4) {
+    throw new RangeError('QUIC packet number length out of range')
+  }
+  if (bytes.length - offset < length) {
+    throw new RangeError('not enough bytes for QUIC packet number')
+  }
+
+  let packetNumber = 0
+  for (let index = 0; index < length; index += 1) {
+    packetNumber = packetNumber * 0x100 + readU8(bytes, offset + index)
+  }
+  return packetNumber
 }
 
 function longHeaderPacketType(firstByte: number): QuicLongHeaderPacketTypeValue {
@@ -121,21 +161,6 @@ function longHeaderPacketType(firstByte: number): QuicLongHeaderPacketTypeValue 
     default:
       throw new RangeError('QUIC long header packet type out of range')
   }
-}
-
-function readPacketNumber(bytes: Uint8Array, offset: number, length: number): number {
-  if (length < 1 || length > 4) {
-    throw new RangeError('QUIC packet number length out of range')
-  }
-  if (bytes.length - offset < length) {
-    throw new RangeError('not enough bytes for QUIC packet number')
-  }
-
-  let packetNumber = 0
-  for (let index = 0; index < length; index += 1) {
-    packetNumber = packetNumber * 0x100 + readU8(bytes, offset + index)
-  }
-  return packetNumber
 }
 
 function readBytes(bytes: Uint8Array, offset: number, length: number, name: string): Uint8Array {
