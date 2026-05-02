@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
-import { bytesToHex } from '../testing/hex'
+import { concatBytes } from '../bytes'
+import { bytesToHex, hexToBytes } from '../testing/hex'
 import {
   rfc8448ClientHandshakeTrafficSecret,
   rfc8448ClientHello,
@@ -75,6 +76,28 @@ describe('TLS 1.3 X25519 handshake secret bridge', () => {
     })
 
     expect(bytesToHex(result.sharedSecret)).toBe(bytesToHex(rfc8448SharedSecret))
+    expect(bytesToHex(result.transcriptHash)).toBe(
+      bytesToHex(rfc8448ClientServerHelloTranscriptHash),
+    )
+    expect(bytesToHex(result.secrets.clientHandshakeTrafficSecret)).toBe(
+      bytesToHex(rfc8448ClientHandshakeTrafficSecret),
+    )
+    expect(bytesToHex(result.secrets.serverHandshakeTrafficSecret)).toBe(
+      bytesToHex(rfc8448ServerHandshakeTrafficSecret),
+    )
+  })
+
+  test('uses ServerHello transcript boundary when server CRYPTO includes later messages', async () => {
+    const encryptedExtensions = hexToBytes('080000020000')
+    const result = await deriveTls13X25519HandshakeSecretsFromQuicCrypto({
+      role: TlsHandshakeRole.Client,
+      privateKey: rfc8448ClientPrivateKey,
+      clientMessages: collectQuicTlsHandshakeMessages([cryptoFrame(0, rfc8448ClientHello)]),
+      serverMessages: collectQuicTlsHandshakeMessages([
+        cryptoFrame(0, concatBytes([rfc8448ServerHello, encryptedExtensions])),
+      ]),
+    })
+
     expect(bytesToHex(result.transcriptHash)).toBe(
       bytesToHex(rfc8448ClientServerHelloTranscriptHash),
     )

@@ -1,5 +1,5 @@
 import { requireLength } from '../bytes'
-import type { QuicTlsHandshakeMessages } from './tls-crypto-stream'
+import type { QuicTlsHandshakeMessage, QuicTlsHandshakeMessages } from './tls-crypto-stream'
 import {
   deriveTls13HandshakeSecrets,
   TLS13_SHA256_SECRET_LENGTH,
@@ -7,6 +7,7 @@ import {
   type Tls13HandshakeSecrets,
 } from './tls-key-schedule'
 import { deriveTlsX25519SharedSecret, findTlsClientX25519KeyShare } from './tls-key-share'
+import { collectTlsHandshakeTranscript } from './tls-transcript'
 import {
   getTlsExtension,
   parseTlsClientKeyShares,
@@ -54,18 +55,12 @@ export interface Tls13X25519HandshakeSecrets {
 export async function deriveTls13X25519HandshakeSecrets(
   options: DeriveTls13X25519HandshakeSecretsOptions,
 ): Promise<Tls13X25519HandshakeSecrets> {
-  validateTls13HelloNegotiation(options.clientHello, options.serverHello)
-  const peerKeyShare =
-    options.role === TlsHandshakeRole.Client
-      ? parseTlsServerKeyShare(
-          requireExtensionData(options.serverHello.body.extensions, TlsExtensionType.KeyShare),
-        )
-      : findTlsClientX25519KeyShare(
-          parseTlsClientKeyShares(
-            requireExtensionData(options.clientHello.body.extensions, TlsExtensionType.KeyShare),
-          ),
-        )
-  const sharedSecret = await deriveTlsX25519SharedSecret(options.privateKey, peerKeyShare)
+  const sharedSecret = await deriveTls13X25519SharedSecretForHellos(
+    options.role,
+    options.privateKey,
+    options.clientHello,
+    options.serverHello,
+  )
   const transcriptHash = tls13TranscriptHash([
     options.clientHelloMessage,
     options.serverHelloMessage,
@@ -82,17 +77,43 @@ export async function deriveTls13X25519HandshakeSecrets(
 export async function deriveTls13X25519HandshakeSecretsFromQuicCrypto(
   options: DeriveTls13X25519HandshakeSecretsFromQuicCryptoOptions,
 ): Promise<Tls13X25519HandshakeSecrets> {
-  const clientHello = requireClientHelloMessage(options.clientMessages)
-  const serverHello = requireServerHelloMessage(options.serverMessages)
+  const transcript = collectTlsHandshakeTranscript([options.clientMessages, options.serverMessages])
+  const clientHello = requireClientHelloMessage(transcript.messages)
+  const serverHello = requireServerHelloMessage(transcript.messages)
+  const sharedSecret = await deriveTls13X25519SharedSecretForHellos(
+    options.role,
+    options.privateKey,
+    clientHello.handshake,
+    serverHello.handshake,
+  )
+  const transcriptHash = tls13TranscriptHash([clientHello.message, serverHello.message])
+  requireLength(transcriptHash, TLS13_SHA256_SECRET_LENGTH, 'TLS transcript hash')
 
-  return deriveTls13X25519HandshakeSecrets({
-    role: options.role,
-    privateKey: options.privateKey,
-    clientHello: clientHello.handshake,
-    serverHello: serverHello.handshake,
-    clientHelloMessage: clientHello.message,
-    serverHelloMessage: serverHello.message,
-  })
+  return {
+    sharedSecret,
+    transcriptHash,
+    secrets: deriveTls13HandshakeSecrets(sharedSecret, transcriptHash),
+  }
+}
+
+async function deriveTls13X25519SharedSecretForHellos(
+  role: TlsHandshakeRoleValue,
+  privateKey: Uint8Array,
+  clientHello: TlsClientHelloHandshake,
+  serverHello: TlsServerHelloHandshake,
+): Promise<Uint8Array> {
+  validateTls13HelloNegotiation(clientHello, serverHello)
+  const peerKeyShare =
+    role === TlsHandshakeRole.Client
+      ? parseTlsServerKeyShare(
+          requireExtensionData(serverHello.body.extensions, TlsExtensionType.KeyShare),
+        )
+      : findTlsClientX25519KeyShare(
+          parseTlsClientKeyShares(
+            requireExtensionData(clientHello.body.extensions, TlsExtensionType.KeyShare),
+          ),
+        )
+  return deriveTlsX25519SharedSecret(privateKey, peerKeyShare)
 }
 
 function validateTls13HelloNegotiation(
@@ -130,11 +151,11 @@ function requireExtensionData(
   return extension.data
 }
 
-function requireClientHelloMessage(messages: QuicTlsHandshakeMessages): {
+function requireClientHelloMessage(messages: readonly QuicTlsHandshakeMessage[]): {
   readonly handshake: TlsClientHelloHandshake
   readonly message: Uint8Array
 } {
-  for (const message of messages.messages) {
+  for (const message of messages) {
     if (message.handshake.kind === 'client-hello') {
       return {
         handshake: message.handshake,
@@ -145,11 +166,11 @@ function requireClientHelloMessage(messages: QuicTlsHandshakeMessages): {
   throw new RangeError('missing TLS ClientHello handshake message')
 }
 
-function requireServerHelloMessage(messages: QuicTlsHandshakeMessages): {
+function requireServerHelloMessage(messages: readonly QuicTlsHandshakeMessage[]): {
   readonly handshake: TlsServerHelloHandshake
   readonly message: Uint8Array
 } {
-  for (const message of messages.messages) {
+  for (const message of messages) {
     if (message.handshake.kind === 'server-hello') {
       return {
         handshake: message.handshake,
