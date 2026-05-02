@@ -91,13 +91,10 @@ export async function verifyTls13ClientHandshakeState(
     expectedEndpointId: options.expectedServerEndpointId,
     messages: options.messages,
   })
-  const client =
-    server.certificateRequest === null
-      ? null
-      : await verifyTls13ClientEncryptedHandshakeMessages({
-          clientHandshakeTrafficSecret: handshake.secrets.clientHandshakeTrafficSecret,
-          messages: options.messages,
-        })
+  const client = await verifyTls13ClientEncryptedHandshakeMessages({
+    clientHandshakeTrafficSecret: handshake.secrets.clientHandshakeTrafficSecret,
+    messages: options.messages,
+  })
   const negotiatedAlpn = requireNegotiatedAlpn(
     hello.client.handshake,
     server.encryptedExtensions.extensions,
@@ -136,13 +133,10 @@ export async function verifyTls13ServerHandshakeState(
     expectedEndpointId: options.localServerEndpointId,
     messages: options.messages,
   })
-  const client =
-    server.certificateRequest === null
-      ? null
-      : await verifyTls13ClientEncryptedHandshakeMessages({
-          clientHandshakeTrafficSecret: handshake.secrets.clientHandshakeTrafficSecret,
-          messages: options.messages,
-        })
+  const client = await verifyTls13ClientEncryptedHandshakeMessages({
+    clientHandshakeTrafficSecret: handshake.secrets.clientHandshakeTrafficSecret,
+    messages: options.messages,
+  })
   const negotiatedAlpn = requireNegotiatedAlpn(
     hello.client.handshake,
     server.encryptedExtensions.extensions,
@@ -155,7 +149,7 @@ export async function verifyTls13ServerHandshakeState(
 
   return {
     negotiatedAlpn,
-    peerEndpointId: client === null ? null : copyBytes(client.endpointId),
+    peerEndpointId: client.endpointId === null ? null : copyBytes(client.endpointId),
     handshake,
     transportParameters,
     server,
@@ -282,7 +276,7 @@ function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
 function transcriptBoundaries(
   handshake: Tls13X25519HandshakeSecrets,
   server: Tls13ServerEncryptedHandshakeVerification,
-  client: Tls13ClientEncryptedHandshakeVerification | null,
+  client: Tls13ClientEncryptedHandshakeVerification,
 ): Tls13HandshakeTranscriptBoundaries {
   return {
     serverHello: copyBytes(handshake.transcriptHash),
@@ -290,8 +284,10 @@ function transcriptBoundaries(
     serverFinished: copyBytes(server.finishedTranscriptHash),
     serverApplicationTraffic: copyBytes(server.applicationTrafficTranscriptHash),
     clientCertificateVerify:
-      client === null ? null : copyBytes(client.certificateVerifyTranscriptHash),
-    clientFinished: client === null ? null : copyBytes(client.finishedTranscriptHash),
+      client.certificateVerifyTranscriptHash === null
+        ? null
+        : copyBytes(client.certificateVerifyTranscriptHash),
+    clientFinished: copyBytes(client.finishedTranscriptHash),
   }
 }
 

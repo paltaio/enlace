@@ -2,12 +2,17 @@ import { describe, expect, test } from 'bun:test'
 
 import { endpointIdFromSecretKey } from '../crypto/ed25519'
 import { bytesToHex, hexToBytes } from '../testing/hex'
-import { tlsHandshakeStateFixture, tlsTestAlpn } from '../testing/tls-handshake-fixtures'
+import {
+  replaceLastMessageBody,
+  tlsHandshakeStateFixture,
+  tlsTestAlpn,
+} from '../testing/tls-handshake-fixtures'
 import { rfc8448ClientPrivateKey, rfc8448ServerPrivateKey } from '../testing/rfc8448-tls'
 import {
   verifyTls13ClientHandshakeState,
   verifyTls13ServerHandshakeState,
 } from './tls-handshake-state'
+import { TlsHandshakeKind } from './tls'
 import type { QuicTlsHandshakeMessage } from './tls-crypto-stream'
 
 describe('TLS 1.3 handshake state bridge', () => {
@@ -73,7 +78,7 @@ describe('TLS 1.3 handshake state bridge', () => {
     )
   })
 
-  test('skips client auth verification when no CertificateRequest is present', async () => {
+  test('verifies client Finished when no CertificateRequest is present', async () => {
     const fixture = await tlsHandshakeStateFixture({ certificateRequest: false })
     const state = await verifyTls13ServerHandshakeState({
       x25519PrivateKey: rfc8448ServerPrivateKey,
@@ -82,13 +87,13 @@ describe('TLS 1.3 handshake state bridge', () => {
     })
 
     expect(bytesToHex(state.negotiatedAlpn)).toBe(bytesToHex(tlsTestAlpn))
-    expect(state.client).toBeNull()
+    expect(state.client).not.toBeNull()
     expect(state.peerEndpointId).toBeNull()
     expect(state.transcriptHashes.clientCertificateVerify).toBeNull()
-    expect(state.transcriptHashes.clientFinished).toBeNull()
+    expect(state.transcriptHashes.clientFinished).not.toBeNull()
   })
 
-  test('client-side state also skips client auth without CertificateRequest', async () => {
+  test('client-side state also verifies Finished without CertificateRequest', async () => {
     const fixture = await tlsHandshakeStateFixture({ certificateRequest: false })
     const state = await verifyTls13ClientHandshakeState({
       x25519PrivateKey: rfc8448ClientPrivateKey,
@@ -97,9 +102,27 @@ describe('TLS 1.3 handshake state bridge', () => {
     })
 
     expect(bytesToHex(state.negotiatedAlpn)).toBe(bytesToHex(tlsTestAlpn))
-    expect(state.client).toBeNull()
+    expect(state.client).not.toBeNull()
     expect(state.transcriptHashes.clientCertificateVerify).toBeNull()
-    expect(state.transcriptHashes.clientFinished).toBeNull()
+    expect(state.transcriptHashes.clientFinished).not.toBeNull()
+  })
+
+  test('rejects invalid client Finished without CertificateRequest', async () => {
+    const fixture = await tlsHandshakeStateFixture({ certificateRequest: false })
+    const changed = replaceLastMessageBody(
+      fixture.messages,
+      TlsHandshakeKind.Finished,
+      new Uint8Array(32),
+    )
+
+    await expectRejects(
+      verifyTls13ServerHandshakeState({
+        x25519PrivateKey: rfc8448ServerPrivateKey,
+        localServerEndpointId: fixture.server.endpointId,
+        messages: changed,
+      }),
+      'TLS Finished verify_data invalid',
+    )
   })
 
   test('requires server endpoint id from caller', async () => {
@@ -159,6 +182,47 @@ describe('TLS 1.3 handshake state bridge', () => {
         messages: fixture.messages,
       }),
       'TLS EncryptedExtensions must include QUIC transport parameters',
+    )
+  })
+
+  test('requires raw public key certificate type negotiation', async () => {
+    const withoutServerOffer = await tlsHandshakeStateFixture({
+      certificateRequest: false,
+      offerServerRawPublicKey: false,
+    })
+    await expectRejects(
+      verifyTls13ClientHandshakeState({
+        x25519PrivateKey: rfc8448ClientPrivateKey,
+        expectedServerEndpointId: withoutServerOffer.server.endpointId,
+        messages: withoutServerOffer.messages,
+      }),
+      'TLS ClientHello must offer server raw public key certificate type',
+    )
+
+    const withoutServerSelection = await tlsHandshakeStateFixture({
+      certificateRequest: false,
+      selectServerRawPublicKey: false,
+    })
+    await expectRejects(
+      verifyTls13ClientHandshakeState({
+        x25519PrivateKey: rfc8448ClientPrivateKey,
+        expectedServerEndpointId: withoutServerSelection.server.endpointId,
+        messages: withoutServerSelection.messages,
+      }),
+      'TLS EncryptedExtensions must select server raw public key certificate type',
+    )
+
+    const withoutClientSelection = await tlsHandshakeStateFixture({
+      certificateRequest: true,
+      selectClientRawPublicKey: false,
+    })
+    await expectRejects(
+      verifyTls13ServerHandshakeState({
+        x25519PrivateKey: rfc8448ServerPrivateKey,
+        localServerEndpointId: withoutClientSelection.server.endpointId,
+        messages: withoutClientSelection.messages,
+      }),
+      'TLS EncryptedExtensions must select client raw public key certificate type',
     )
   })
 

@@ -13,6 +13,7 @@ import { deriveQuicInitialKeys } from './crypto'
 import {
   encodeQuicAckFrame,
   encodeQuicApplicationConnectionCloseFrame,
+  encodeQuicCryptoFrame,
   encodeQuicMaxDataFrame,
   encodeQuicMaxStreamDataFrame,
   encodeQuicPaddingFrame,
@@ -183,6 +184,7 @@ describe('QUIC frame parsing', () => {
 
   test('encodes 1-RTT frame envelopes to exact bytes', () => {
     expect(bytesToHex(encodeQuicPingFrame())).toBe('01')
+    expect(bytesToHex(encodeQuicCryptoFrame(0x40, hexToBytes('aabbcc')))).toBe('06404003aabbcc')
     expect(bytesToHex(encodeQuicStreamFrame(4, 0x400, hexToBytes('6869'), true))).toBe(
       '0f044400026869',
     )

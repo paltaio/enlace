@@ -11,6 +11,7 @@ import {
 import type { QuicCryptoFrame } from '../quic/frame'
 import {
   parseTlsHandshakes,
+  TlsCertificateType,
   TlsExtensionType,
   TlsHandshakeKind,
   TlsHandshakeType,
@@ -53,6 +54,10 @@ export interface ServerEncryptedHandshakeFixtureOptions {
   readonly serverHandshakeTrafficSecret?: Uint8Array
   readonly selectedAlpn?: Uint8Array
   readonly serverTransportParameters?: Uint8Array | null
+  readonly offerClientRawPublicKey?: boolean
+  readonly offerServerRawPublicKey?: boolean
+  readonly selectClientRawPublicKey?: boolean
+  readonly selectServerRawPublicKey?: boolean
 }
 
 export interface ClientEncryptedHandshakeFixtureOptions {
@@ -69,7 +74,13 @@ export interface TlsHandshakeStateFixture {
 export async function serverEncryptedHandshakeFixture(
   options: ServerEncryptedHandshakeFixtureOptions,
 ): Promise<EncryptedHandshakeFixture> {
-  const clientHelloMessage = options.clientHelloMessage ?? rfc8448ClientHello
+  const clientHelloMessage = addRawPublicKeyOffers(
+    options.clientHelloMessage ?? rfc8448ClientHello,
+    {
+      client: options.offerClientRawPublicKey !== false,
+      server: options.offerServerRawPublicKey !== false,
+    },
+  )
   const serverHelloMessage = options.serverHelloMessage ?? rfc8448ServerHello
   const serverHandshakeTrafficSecret =
     options.serverHandshakeTrafficSecret ?? rfc8448ServerHandshakeTrafficSecret
@@ -77,7 +88,12 @@ export async function serverEncryptedHandshakeFixture(
   const endpointId = await endpointIdFromSecretKey(secretKey)
   const encryptedExtensions = tlsHandshakeMessage(
     TlsHandshakeType.EncryptedExtensions,
-    encryptedExtensionsBody(options.selectedAlpn, options.serverTransportParameters),
+    encryptedExtensionsBody(
+      options.selectedAlpn,
+      options.serverTransportParameters,
+      options.selectClientRawPublicKey !== false,
+      options.selectServerRawPublicKey !== false,
+    ),
   )
   const certificateRequest = options.certificateRequest
     ? tlsHandshakeMessage(
@@ -155,6 +171,10 @@ export async function tlsHandshakeStateFixture(options: {
   readonly selectedAlpn?: Uint8Array | null
   readonly clientTransportParameters?: Uint8Array
   readonly serverTransportParameters?: Uint8Array | null
+  readonly offerClientRawPublicKey?: boolean
+  readonly offerServerRawPublicKey?: boolean
+  readonly selectClientRawPublicKey?: boolean
+  readonly selectServerRawPublicKey?: boolean
 }): Promise<TlsHandshakeStateFixture> {
   const clientHelloWithTransportParameters = appendTlsExtensionToClientHello(rfc8448ClientHello, {
     type: TlsExtensionType.QuicTransportParameters,
@@ -170,13 +190,17 @@ export async function tlsHandshakeStateFixture(options: {
         initialSourceConnectionId: hexToBytes('08070605'),
       }),
   })
-  const clientHello =
+  const clientHelloWithAlpn =
     options.offerAlpn === false
       ? clientHelloWithTransportParameters
       : appendTlsExtensionToClientHello(clientHelloWithTransportParameters, {
           type: TlsExtensionType.ApplicationLayerProtocolNegotiation,
           data: tlsAlpnExtensionData([tlsTestAlpn]),
         })
+  const clientHello = addRawPublicKeyOffers(clientHelloWithAlpn, {
+    client: options.offerClientRawPublicKey !== false,
+    server: options.offerServerRawPublicKey !== false,
+  })
   const serverHello = rfc8448ServerHello
   const handshake = await deriveTls13X25519HandshakeSecrets({
     role: TlsHandshakeRole.Client,
@@ -201,6 +225,10 @@ export async function tlsHandshakeStateFixture(options: {
       : {
           serverTransportParameters: options.serverTransportParameters,
         }),
+    offerClientRawPublicKey: false,
+    offerServerRawPublicKey: false,
+    selectClientRawPublicKey: options.selectClientRawPublicKey !== false,
+    selectServerRawPublicKey: options.selectServerRawPublicKey !== false,
   })
   const client = options.certificateRequest
     ? await clientEncryptedHandshakeFixtureFromServer(server, {
@@ -208,11 +236,15 @@ export async function tlsHandshakeStateFixture(options: {
       })
     : null
 
+  const messages =
+    client?.messages ??
+    clientFinishedHandshakeMessages(server.messages, handshake.secrets.clientHandshakeTrafficSecret)
+
   return {
     handshake,
     server,
     client,
-    messages: client?.messages ?? server.messages,
+    messages,
   }
 }
 
@@ -271,6 +303,44 @@ export async function clientEncryptedHandshakeFixtureFromServer(
     finishedTranscriptHash,
     finishedVerifyData,
   }
+}
+
+function clientFinishedHandshakeMessages(
+  priorMessages: readonly QuicTlsHandshakeMessage[],
+  clientHandshakeTrafficSecret: Uint8Array,
+): readonly QuicTlsHandshakeMessage[] {
+  const finishedTranscriptHash = tls13TranscriptHash(
+    priorMessages.map((message) => message.message),
+  )
+  const finishedVerifyData = computeTls13FinishedVerifyData(
+    clientHandshakeTrafficSecret,
+    finishedTranscriptHash,
+  )
+  const finished = tlsHandshakeMessage(TlsHandshakeType.Finished, finishedVerifyData)
+  return [...priorMessages, ...collectQuicTlsHandshakeMessages([cryptoFrame(0, finished)]).messages]
+}
+
+function addRawPublicKeyOffers(
+  message: Uint8Array,
+  options: {
+    readonly client: boolean
+    readonly server: boolean
+  },
+): Uint8Array {
+  let out = message
+  if (options.client) {
+    out = appendTlsExtensionToClientHello(out, {
+      type: TlsExtensionType.ClientCertificateType,
+      data: tlsCertificateTypeList(TlsCertificateType.RawPublicKey),
+    })
+  }
+  if (options.server) {
+    out = appendTlsExtensionToClientHello(out, {
+      type: TlsExtensionType.ServerCertificateType,
+      data: tlsCertificateTypeList(TlsCertificateType.RawPublicKey),
+    })
+  }
+  return out
 }
 
 export function appendTlsExtensionToClientHello(
@@ -461,6 +531,8 @@ function tlsExtensions(extensions: readonly ExtensionFixture[]): Uint8Array {
 function encryptedExtensionsBody(
   selectedAlpn: Uint8Array | undefined,
   serverTransportParameters: Uint8Array | null | undefined,
+  selectClientRawPublicKey: boolean,
+  selectServerRawPublicKey: boolean,
 ): Uint8Array {
   const extensions: ExtensionFixture[] = []
   const transportParameterData =
@@ -483,13 +555,45 @@ function encryptedExtensionsBody(
     })
   }
   if (selectedAlpn === undefined) {
-    return tlsExtensions(extensions)
+    return tlsExtensions(
+      addRawPublicKeySelections(extensions, {
+        client: selectClientRawPublicKey,
+        server: selectServerRawPublicKey,
+      }),
+    )
   }
   extensions.push({
     type: TlsExtensionType.ApplicationLayerProtocolNegotiation,
     data: tlsAlpnExtensionData([selectedAlpn]),
   })
-  return tlsExtensions(extensions)
+  return tlsExtensions(
+    addRawPublicKeySelections(extensions, {
+      client: selectClientRawPublicKey,
+      server: selectServerRawPublicKey,
+    }),
+  )
+}
+
+function addRawPublicKeySelections(
+  extensions: ExtensionFixture[],
+  options: {
+    readonly client: boolean
+    readonly server: boolean
+  },
+): ExtensionFixture[] {
+  if (options.client) {
+    extensions.push({
+      type: TlsExtensionType.ClientCertificateType,
+      data: new Uint8Array([TlsCertificateType.RawPublicKey]),
+    })
+  }
+  if (options.server) {
+    extensions.push({
+      type: TlsExtensionType.ServerCertificateType,
+      data: new Uint8Array([TlsCertificateType.RawPublicKey]),
+    })
+  }
+  return extensions
 }
 
 function certificateEntry(entry: CertificateEntryFixture): Uint8Array {
@@ -513,6 +617,10 @@ function tlsU8Vector(bytes: Uint8Array): Uint8Array {
     throw new RangeError('TLS u8 vector too large')
   }
   return concatBytes([new Uint8Array([bytes.length]), bytes])
+}
+
+function tlsCertificateTypeList(certificateType: number): Uint8Array {
+  return tlsU8Vector(new Uint8Array([certificateType]))
 }
 
 function tlsU16Vector(bytes: Uint8Array): Uint8Array {

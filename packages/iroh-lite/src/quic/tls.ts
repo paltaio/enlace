@@ -26,14 +26,22 @@ export const TlsHandshakeType = {
 
 export const TlsExtensionType = {
   ServerName: 0x0000,
+  SignatureAlgorithms: 0x000d,
   ApplicationLayerProtocolNegotiation: 0x0010,
+  ClientCertificateType: 0x0013,
+  ServerCertificateType: 0x0014,
   SupportedVersions: 0x002b,
+  SupportedGroups: 0x000a,
   KeyShare: 0x0033,
   QuicTransportParameters: 0x0039,
 } as const
 
 export const TlsNamedGroup = {
   X25519: 0x001d,
+} as const
+
+export const TlsCertificateType = {
+  RawPublicKey: 0x02,
 } as const
 
 export const TLS_VERSION_1_3 = 0x0304

@@ -178,6 +178,15 @@ export function encodeQuicAckFrame(
   return concatBytes(fields)
 }
 
+export function encodeQuicCryptoFrame(cryptoOffset: number, data: Uint8Array): Uint8Array {
+  return concatBytes([
+    new Uint8Array([QuicFrameType.Crypto]),
+    encodeVarInt(cryptoOffset),
+    encodeVarInt(data.length),
+    data,
+  ])
+}
+
 export function encodeQuicStreamFrame(
   streamId: number,
   streamOffset: number,

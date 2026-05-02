@@ -19,7 +19,14 @@ import {
 } from './tls-encrypted-extensions'
 import { requireTlsFinishedVerifyData, verifyTls13FinishedHandshake } from './tls-finished'
 import { TLS13_SHA256_SECRET_LENGTH, tls13TranscriptHash } from './tls-key-schedule'
-import { TlsHandshakeKind } from './tls'
+import {
+  getTlsExtension,
+  TlsCertificateType,
+  TlsExtensionType,
+  TlsHandshakeKind,
+  type TlsClientHelloHandshake,
+  type TlsExtension,
+} from './tls'
 
 export interface VerifyTls13ServerEncryptedHandshakeMessagesOptions {
   readonly serverHandshakeTrafficSecret: Uint8Array
@@ -45,11 +52,11 @@ export interface Tls13ServerEncryptedHandshakeVerification {
 }
 
 export interface Tls13ClientEncryptedHandshakeVerification {
-  readonly certificate: TlsCertificate
-  readonly certificateVerify: TlsCertificateVerify
+  readonly certificate: TlsCertificate | null
+  readonly certificateVerify: TlsCertificateVerify | null
   readonly finishedVerifyData: Uint8Array
-  readonly endpointId: Uint8Array
-  readonly certificateVerifyTranscriptHash: Uint8Array
+  readonly endpointId: Uint8Array | null
+  readonly certificateVerifyTranscriptHash: Uint8Array | null
   readonly finishedTranscriptHash: Uint8Array
 }
 
@@ -67,9 +74,9 @@ interface EncryptedHandshakeSequence {
 }
 
 interface ClientEncryptedHandshakeSequence {
-  readonly certificateRequest: IndexedHandshakeMessage
-  readonly certificate: IndexedHandshakeMessage
-  readonly certificateVerify: IndexedHandshakeMessage
+  readonly certificateRequest: IndexedHandshakeMessage | null
+  readonly certificate: IndexedHandshakeMessage | null
+  readonly certificateVerify: IndexedHandshakeMessage | null
   readonly finished: IndexedHandshakeMessage
 }
 
@@ -85,6 +92,11 @@ export async function verifyTls13ServerEncryptedHandshakeMessages(
   const sequence = requireServerEncryptedHandshakeSequence(options.messages)
   const encryptedExtensions = parseTlsEncryptedExtensions(
     sequence.encryptedExtensions.value.handshake,
+  )
+  requireRawPublicKeyCertificateType(
+    requireClientHello(options.messages),
+    encryptedExtensions.extensions,
+    'server',
   )
   const certificateRequest =
     sequence.certificateRequest === null
@@ -153,29 +165,63 @@ export async function verifyTls13ClientEncryptedHandshakeMessages(
   )
 
   const sequence = requireClientEncryptedHandshakeSequence(options.messages)
+  if (sequence.certificateRequest === null) {
+    const finishedTranscriptHash = transcriptHashBefore(options.messages, sequence.finished.index)
+    if (
+      !verifyTls13FinishedHandshake(
+        options.clientHandshakeTrafficSecret,
+        finishedTranscriptHash,
+        sequence.finished.value.handshake,
+      )
+    ) {
+      throw new RangeError('TLS Finished verify_data invalid')
+    }
+
+    return {
+      certificate: null,
+      certificateVerify: null,
+      finishedVerifyData: requireTlsFinishedVerifyData(sequence.finished.value.handshake),
+      endpointId: null,
+      certificateVerifyTranscriptHash: null,
+      finishedTranscriptHash,
+    }
+  }
+
+  const certificate = requireIndexedMessage(sequence.certificate, 'TLS certificate handshake')
+  const certificateVerify = requireIndexedMessage(
+    sequence.certificateVerify,
+    'TLS certificate-verify handshake',
+  )
   const certificateRequest = parseTlsCertificateRequest(sequence.certificateRequest.value.handshake)
-  const certificate = parseTlsCertificate(sequence.certificate.value.handshake)
+  const parsedCertificate = parseTlsCertificate(certificate.value.handshake)
+  requireRawPublicKeyCertificateType(
+    requireClientHello(options.messages),
+    parseTlsEncryptedExtensions(
+      requireServerEncryptedHandshakeSequence(options.messages).encryptedExtensions.value.handshake,
+    ).extensions,
+    'client',
+  )
   requireEmptyCertificateContext(
     certificateRequest.requestContext,
     'TLS CertificateRequest context',
   )
   requireCertificateContext(
-    certificate.requestContext,
+    parsedCertificate.requestContext,
     certificateRequest.requestContext,
     'TLS Certificate request context',
   )
-  const certificateVerify = parseTlsCertificateVerify(sequence.certificateVerify.value.handshake)
-  const endpointId = requireTlsEd25519RawPublicKeyCertificate(sequence.certificate.value.handshake)
+  const parsedCertificateVerify = parseTlsCertificateVerify(certificateVerify.value.handshake)
+  const endpointId = requireTlsEd25519RawPublicKeyCertificate(certificate.value.handshake)
 
   const certificateVerifyTranscriptHash = transcriptHashBefore(
     options.messages,
-    sequence.certificateVerify.index,
+    certificateVerify.index,
   )
   const certificateVerifyOk = await verifyTls13Ed25519CertificateVerifyHandshake(
     TlsCertificateVerifyRole.Client,
     certificateVerifyTranscriptHash,
     endpointId,
-    sequence.certificateVerify.value.handshake,
+    certificateVerify.value.handshake,
   )
   if (!certificateVerifyOk) {
     throw new RangeError('TLS CertificateVerify signature invalid')
@@ -193,8 +239,8 @@ export async function verifyTls13ClientEncryptedHandshakeMessages(
   }
 
   return {
-    certificate,
-    certificateVerify,
+    certificate: parsedCertificate,
+    certificateVerify: parsedCertificateVerify,
     finishedVerifyData: requireTlsFinishedVerifyData(sequence.finished.value.handshake),
     endpointId,
     certificateVerifyTranscriptHash,
@@ -243,7 +289,16 @@ function requireClientEncryptedHandshakeSequence(
 ): ClientEncryptedHandshakeSequence {
   const serverSequence = requireServerEncryptedHandshakeSequence(messages)
   if (serverSequence.certificateRequest === null) {
-    throw new RangeError('missing TLS certificate-request handshake')
+    return {
+      certificateRequest: null,
+      certificate: null,
+      certificateVerify: null,
+      finished: requireHandshakeAt(
+        messages,
+        serverSequence.finished.index + 1,
+        TlsHandshakeKind.Finished,
+      ),
+    }
   }
   const certificate = requireHandshakeAt(
     messages,
@@ -269,6 +324,21 @@ function requireClientEncryptedHandshakeSequence(
   }
 }
 
+function requireClientHello(messages: readonly QuicTlsHandshakeMessage[]): TlsClientHelloHandshake {
+  const message = requireHandshakeAt(messages, 0, TlsHandshakeKind.ClientHello)
+  if (message.value.handshake.kind !== TlsHandshakeKind.ClientHello) {
+    throw new RangeError('missing TLS client-hello handshake')
+  }
+  return message.value.handshake
+}
+
+function requireIndexedMessage<T>(value: T | null, message: string): T {
+  if (value === null) {
+    throw new RangeError(`missing ${message}`)
+  }
+  return value
+}
+
 function requireHandshakeAt(
   messages: readonly QuicTlsHandshakeMessage[],
   index: number,
@@ -279,6 +349,48 @@ function requireHandshakeAt(
     throw new RangeError(`missing TLS ${kind} handshake`)
   }
   return { index, value: message }
+}
+
+function requireRawPublicKeyCertificateType(
+  clientHello: TlsClientHelloHandshake,
+  encryptedExtensions: readonly TlsExtension[],
+  side: 'client' | 'server',
+): void {
+  const extensionType =
+    side === 'client'
+      ? TlsExtensionType.ClientCertificateType
+      : TlsExtensionType.ServerCertificateType
+  const offer = getTlsExtension(clientHello.body.extensions, extensionType)
+  if (offer === null || !certificateTypeListIncludes(offer.data, TlsCertificateType.RawPublicKey)) {
+    throw new RangeError(`TLS ClientHello must offer ${side} raw public key certificate type`)
+  }
+
+  const selected = getTlsExtension(encryptedExtensions, extensionType)
+  if (
+    selected === null ||
+    selected.data.length !== 1 ||
+    readU8(selected.data, 0) !== TlsCertificateType.RawPublicKey
+  ) {
+    throw new RangeError(
+      `TLS EncryptedExtensions must select ${side} raw public key certificate type`,
+    )
+  }
+}
+
+function certificateTypeListIncludes(data: Uint8Array, certificateType: number): boolean {
+  if (data.length === 0) {
+    throw new RangeError('TLS certificate type list length mismatch')
+  }
+  const length = readU8(data, 0)
+  if (data.length !== length + 1) {
+    throw new RangeError('TLS certificate type list length mismatch')
+  }
+  for (let offset = 1; offset < data.length; offset += 1) {
+    if (readU8(data, offset) === certificateType) {
+      return true
+    }
+  }
+  return false
 }
 
 function transcriptHashBefore(

@@ -21,6 +21,7 @@ import { TlsExtensionType, TlsHandshakeKind } from './tls'
 import { ed25519SpkiFromEndpointId } from './tls-certificate'
 import { TlsSignatureScheme } from './tls-certificate-verify'
 import { tls13TranscriptHash } from './tls-key-schedule'
+import { buildTls13ClientEncryptedFlight } from './tls-handshake-flight'
 import {
   verifyTls13ClientEncryptedHandshakeMessages,
   verifyTls13ServerEncryptedHandshakeMessages,
@@ -38,7 +39,11 @@ describe('TLS encrypted handshake verification bridge', () => {
     expect(bytesToHex(result.endpointId)).toBe(bytesToHex(fixture.endpointId))
     expect(
       result.encryptedExtensions.extensions.map((extension) => extension.extensionType),
-    ).toEqual([TlsExtensionType.QuicTransportParameters])
+    ).toEqual([
+      TlsExtensionType.QuicTransportParameters,
+      TlsExtensionType.ClientCertificateType,
+      TlsExtensionType.ServerCertificateType,
+    ])
     expect(result.certificateRequest?.extensions).toHaveLength(1)
     expect(result.certificate.entries).toHaveLength(1)
     expect(result.certificateVerify.signatureScheme).toBe(TlsSignatureScheme.Ed25519)
@@ -228,11 +233,11 @@ describe('TLS encrypted handshake verification bridge', () => {
       messages: fixture.messages,
     })
 
-    expect(bytesToHex(result.endpointId)).toBe(bytesToHex(fixture.endpointId))
-    expect(result.certificate.entries).toHaveLength(1)
-    expect(result.certificateVerify.signatureScheme).toBe(TlsSignatureScheme.Ed25519)
+    expect(bytesToHex(requireValue(result.endpointId))).toBe(bytesToHex(fixture.endpointId))
+    expect(requireValue(result.certificate).entries).toHaveLength(1)
+    expect(requireValue(result.certificateVerify).signatureScheme).toBe(TlsSignatureScheme.Ed25519)
     expect(bytesToHex(result.finishedVerifyData)).toBe(bytesToHex(fixture.finishedVerifyData))
-    expect(bytesToHex(result.certificateVerifyTranscriptHash)).toBe(
+    expect(bytesToHex(requireValue(result.certificateVerifyTranscriptHash))).toBe(
       bytesToHex(fixture.certificateVerifyTranscriptHash),
     )
     expect(bytesToHex(result.finishedTranscriptHash)).toBe(
@@ -240,7 +245,32 @@ describe('TLS encrypted handshake verification bridge', () => {
     )
   })
 
-  test('rejects client handshakes without server CertificateRequest', async () => {
+  test('verifies client Finished without server CertificateRequest', async () => {
+    const serverFixture = await serverEncryptedHandshakeFixture({ certificateRequest: false })
+    const clientFlight = await buildTls13ClientEncryptedFlight({
+      priorMessages: serverFixture.messages,
+      clientHandshakeTrafficSecret: rfc8448ClientHandshakeTrafficSecret,
+      endpointSecretKey: hexToBytes(
+        '202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f',
+      ),
+    })
+    const messages = [...serverFixture.messages, ...clientFlight.messages]
+    const result = await verifyTls13ClientEncryptedHandshakeMessages({
+      clientHandshakeTrafficSecret: rfc8448ClientHandshakeTrafficSecret,
+      messages,
+    })
+
+    expect(result.certificate).toBeNull()
+    expect(result.certificateVerify).toBeNull()
+    expect(result.endpointId).toBeNull()
+    expect(result.certificateVerifyTranscriptHash).toBeNull()
+    expect(bytesToHex(result.finishedTranscriptHash)).toBe(
+      bytesToHex(clientFlight.finishedTranscriptHash),
+    )
+    expect(bytesToHex(result.finishedVerifyData)).toBe(bytesToHex(clientFlight.finishedVerifyData))
+  })
+
+  test('rejects client certificates without server CertificateRequest', async () => {
     const serverFixture = await serverEncryptedHandshakeFixture({ certificateRequest: false })
     const fixture = await clientEncryptedHandshakeFixtureFromServer(serverFixture)
 
@@ -249,7 +279,7 @@ describe('TLS encrypted handshake verification bridge', () => {
         clientHandshakeTrafficSecret: rfc8448ClientHandshakeTrafficSecret,
         messages: fixture.messages,
       }),
-      'missing TLS certificate-request handshake',
+      'missing TLS finished handshake',
     )
   })
 
@@ -319,4 +349,11 @@ async function expectRejects(promise: Promise<unknown>, message: string): Promis
     return
   }
   throw new Error('expected promise rejection')
+}
+
+function requireValue<T>(value: T | null): T {
+  if (value === null) {
+    throw new Error('expected value')
+  }
+  return value
 }
