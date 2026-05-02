@@ -29,6 +29,7 @@ import {
 import { QUIC_MAX_PACKET_NUMBER } from './packet'
 import { deriveTls13ApplicationTrafficFromHandshakeState } from './tls-application-traffic'
 import { verifyTls13ClientHandshakeState } from './tls-handshake-state'
+import { QuicEndpointRole, defaultQuicTransportParameters } from './transport-parameters'
 
 describe('QUIC 1-RTT short-header packet foundation', () => {
   test('unprotects and decrypts a protected short-header packet', async () => {
@@ -798,6 +799,28 @@ describe('QUIC 1-RTT packet state', () => {
     const sent = state.sendStream(keys.client, destinationConnectionId, 0, hexToBytes('6869'), true)
 
     expect(sent.stream.nextStreamOffset).toBe(2)
+    expect(state.streamSendOffset(0)).toBe(2)
+  })
+
+  test('seeds stream send credit from peer transport parameters', async () => {
+    const keys = await applicationTrafficKeys()
+    const destinationConnectionId = hexToBytes('01020304')
+    const state = new QuicOneRttState(0, null, {
+      localRole: QuicEndpointRole.Client,
+      peerTransportParameters: {
+        ...defaultQuicTransportParameters(),
+        initialMaxData: 2n,
+        initialMaxStreamDataBidiRemote: 2n,
+      },
+    })
+
+    const sent = state.sendStream(keys.client, destinationConnectionId, 0, hexToBytes('6869'))
+
+    expect(sent.stream.nextStreamOffset).toBe(2)
+    expect(() =>
+      state.sendStream(keys.client, destinationConnectionId, 0, hexToBytes('21')),
+    ).toThrow('QUIC STREAM data exceeds MAX_STREAM_DATA')
+    expect(state.nextPacketNumber).toBe(1n)
     expect(state.streamSendOffset(0)).toBe(2)
   })
 

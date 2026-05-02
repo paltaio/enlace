@@ -34,6 +34,7 @@ import {
   type QuicTlsHandshakeMessage,
 } from '../quic/tls-crypto-stream'
 import { computeTls13FinishedVerifyData, tls13TranscriptHash } from '../quic/tls-key-schedule'
+import { encodeQuicTransportParameters } from '../quic/transport-parameters'
 
 export const tlsTestAlpn = hexToBytes('2f69726f682d676f737369702f31')
 
@@ -51,6 +52,7 @@ export interface ServerEncryptedHandshakeFixtureOptions {
   readonly serverHelloMessage?: Uint8Array
   readonly serverHandshakeTrafficSecret?: Uint8Array
   readonly selectedAlpn?: Uint8Array
+  readonly serverTransportParameters?: Uint8Array | null
 }
 
 export interface ClientEncryptedHandshakeFixtureOptions {
@@ -75,7 +77,7 @@ export async function serverEncryptedHandshakeFixture(
   const endpointId = await endpointIdFromSecretKey(secretKey)
   const encryptedExtensions = tlsHandshakeMessage(
     TlsHandshakeType.EncryptedExtensions,
-    encryptedExtensionsBody(options.selectedAlpn),
+    encryptedExtensionsBody(options.selectedAlpn, options.serverTransportParameters),
   )
   const certificateRequest = options.certificateRequest
     ? tlsHandshakeMessage(
@@ -151,11 +153,27 @@ export async function tlsHandshakeStateFixture(options: {
   readonly certificateRequest: boolean
   readonly offerAlpn?: boolean
   readonly selectedAlpn?: Uint8Array | null
+  readonly clientTransportParameters?: Uint8Array
+  readonly serverTransportParameters?: Uint8Array | null
 }): Promise<TlsHandshakeStateFixture> {
+  const clientHelloWithTransportParameters = appendTlsExtensionToClientHello(rfc8448ClientHello, {
+    type: TlsExtensionType.QuicTransportParameters,
+    data:
+      options.clientTransportParameters ??
+      encodeQuicTransportParameters({
+        initialMaxData: 65536n,
+        initialMaxStreamDataBidiLocal: 65536n,
+        initialMaxStreamDataBidiRemote: 65536n,
+        initialMaxStreamDataUni: 65536n,
+        initialMaxStreamsBidi: 16n,
+        initialMaxStreamsUni: 16n,
+        initialSourceConnectionId: hexToBytes('08070605'),
+      }),
+  })
   const clientHello =
     options.offerAlpn === false
-      ? rfc8448ClientHello
-      : appendTlsExtensionToClientHello(rfc8448ClientHello, {
+      ? clientHelloWithTransportParameters
+      : appendTlsExtensionToClientHello(clientHelloWithTransportParameters, {
           type: TlsExtensionType.ApplicationLayerProtocolNegotiation,
           data: tlsAlpnExtensionData([tlsTestAlpn]),
         })
@@ -177,6 +195,11 @@ export async function tlsHandshakeStateFixture(options: {
       ? {}
       : {
           selectedAlpn: options.selectedAlpn ?? tlsTestAlpn,
+        }),
+    ...(options.serverTransportParameters === undefined
+      ? {}
+      : {
+          serverTransportParameters: options.serverTransportParameters,
         }),
   })
   const client = options.certificateRequest
@@ -435,16 +458,38 @@ function tlsExtensions(extensions: readonly ExtensionFixture[]): Uint8Array {
   return tlsU16Vector(concatBytes(extensions.map(tlsExtension)))
 }
 
-function encryptedExtensionsBody(selectedAlpn: Uint8Array | undefined): Uint8Array {
-  if (selectedAlpn === undefined) {
-    return writeU16BE(0)
+function encryptedExtensionsBody(
+  selectedAlpn: Uint8Array | undefined,
+  serverTransportParameters: Uint8Array | null | undefined,
+): Uint8Array {
+  const extensions: ExtensionFixture[] = []
+  const transportParameterData =
+    serverTransportParameters === undefined
+      ? encodeQuicTransportParameters({
+          initialMaxData: 65536n,
+          initialMaxStreamDataBidiLocal: 65536n,
+          initialMaxStreamDataBidiRemote: 65536n,
+          initialMaxStreamDataUni: 65536n,
+          initialMaxStreamsBidi: 16n,
+          initialMaxStreamsUni: 16n,
+          originalDestinationConnectionId: hexToBytes('09080706'),
+          initialSourceConnectionId: hexToBytes('01020304'),
+        })
+      : serverTransportParameters
+  if (transportParameterData !== null) {
+    extensions.push({
+      type: TlsExtensionType.QuicTransportParameters,
+      data: transportParameterData,
+    })
   }
-  return tlsExtensions([
-    {
-      type: TlsExtensionType.ApplicationLayerProtocolNegotiation,
-      data: tlsAlpnExtensionData([selectedAlpn]),
-    },
-  ])
+  if (selectedAlpn === undefined) {
+    return tlsExtensions(extensions)
+  }
+  extensions.push({
+    type: TlsExtensionType.ApplicationLayerProtocolNegotiation,
+    data: tlsAlpnExtensionData([selectedAlpn]),
+  })
+  return tlsExtensions(extensions)
 }
 
 function certificateEntry(entry: CertificateEntryFixture): Uint8Array {

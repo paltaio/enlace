@@ -17,7 +17,7 @@ import {
   replaceMessageBody,
   serverEncryptedHandshakeFixture,
 } from '../testing/tls-handshake-fixtures'
-import { TlsHandshakeKind } from './tls'
+import { TlsExtensionType, TlsHandshakeKind } from './tls'
 import { ed25519SpkiFromEndpointId } from './tls-certificate'
 import { TlsSignatureScheme } from './tls-certificate-verify'
 import { tls13TranscriptHash } from './tls-key-schedule'
@@ -36,7 +36,9 @@ describe('TLS encrypted handshake verification bridge', () => {
     })
 
     expect(bytesToHex(result.endpointId)).toBe(bytesToHex(fixture.endpointId))
-    expect(result.encryptedExtensions.extensions).toEqual([])
+    expect(
+      result.encryptedExtensions.extensions.map((extension) => extension.extensionType),
+    ).toEqual([TlsExtensionType.QuicTransportParameters])
     expect(result.certificateRequest?.extensions).toHaveLength(1)
     expect(result.certificate.entries).toHaveLength(1)
     expect(result.certificateVerify.signatureScheme).toBe(TlsSignatureScheme.Ed25519)

@@ -19,6 +19,7 @@ import {
   QuicStreamState,
   type QuicStreamReceiveOutput,
 } from './streams'
+import { QuicEndpointRole, defaultQuicTransportParameters } from './transport-parameters'
 import { deriveTls13ApplicationTrafficFromHandshakeState } from './tls-application-traffic'
 import { verifyTls13ClientHandshakeState } from './tls-handshake-state'
 
@@ -243,6 +244,76 @@ describe('QUIC stream send state', () => {
 
     expect(state.maxData()).toBe(5)
     expect(state.maxStreamData(0)).toBe(4)
+  })
+
+  test('uses peer transport parameters as initial send credit', () => {
+    const state = new QuicStreamSendState({
+      localRole: QuicEndpointRole.Client,
+      peerTransportParameters: {
+        ...defaultQuicTransportParameters(),
+        initialMaxData: 6n,
+        initialMaxStreamDataBidiLocal: 1n,
+        initialMaxStreamDataBidiRemote: 3n,
+        initialMaxStreamDataUni: 2n,
+      },
+    })
+
+    expect(state.maxData()).toBe(6)
+    expect(state.maxStreamData(0)).toBe(3)
+    expect(state.maxStreamData(1)).toBe(1)
+    expect(state.maxStreamData(2)).toBe(2)
+    state.send(0, hexToBytes('616263'))
+    expect(() => state.send(0, hexToBytes('64'))).toThrow(
+      'QUIC STREAM data exceeds MAX_STREAM_DATA',
+    )
+    expect(() => state.send(3, hexToBytes('61'))).toThrow(
+      'QUIC cannot send on peer-initiated unidirectional stream',
+    )
+  })
+
+  test('lets MAX_STREAM_DATA raise initial stream credit', () => {
+    const state = new QuicStreamSendState({
+      localRole: QuicEndpointRole.Server,
+      peerTransportParameters: {
+        ...defaultQuicTransportParameters(),
+        initialMaxData: 5n,
+        initialMaxStreamDataBidiRemote: 1n,
+      },
+    })
+
+    expect(state.maxStreamData(1)).toBe(1)
+    state.applyMaxStreamData({
+      type: 'max-stream-data',
+      streamId: 1,
+      maximumStreamData: 4,
+      offset: 0,
+      endOffset: 0,
+    })
+
+    expect(state.maxStreamData(1)).toBe(4)
+    expect(state.send(1, hexToBytes('61626364')).nextStreamOffset).toBe(4)
+  })
+
+  test('does not lower initial stream credit with MAX_STREAM_DATA', () => {
+    const state = new QuicStreamSendState({
+      localRole: QuicEndpointRole.Client,
+      peerTransportParameters: {
+        ...defaultQuicTransportParameters(),
+        initialMaxData: 8n,
+        initialMaxStreamDataBidiRemote: 4n,
+      },
+    })
+
+    state.applyMaxStreamData({
+      type: 'max-stream-data',
+      streamId: 0,
+      maximumStreamData: 2,
+      offset: 0,
+      endOffset: 0,
+    })
+
+    expect(state.maxStreamData(0)).toBe(4)
+    expect(state.send(0, hexToBytes('61626364')).nextStreamOffset).toBe(4)
   })
 })
 

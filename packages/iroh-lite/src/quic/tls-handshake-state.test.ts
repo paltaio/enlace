@@ -31,6 +31,11 @@ describe('TLS 1.3 handshake state bridge', () => {
     expect(bytesToHex(state.handshake.secrets.serverHandshakeTrafficSecret)).toBe(
       bytesToHex(fixture.handshake.secrets.serverHandshakeTrafficSecret),
     )
+    expect(state.transportParameters.client.initialSourceConnectionId).not.toBeNull()
+    expect(state.transportParameters.server.originalDestinationConnectionId).not.toBeNull()
+    expect(state.transportParameters.server.initialSourceConnectionId).not.toBeNull()
+    expect(state.transportParameters.server.initialMaxData).toBe(65536n)
+    expect(state.transportParameters.server.initialMaxStreamDataBidiRemote).toBe(65536n)
     expect(state.client).not.toBeNull()
     expect(bytesToHex(state.transcriptHashes.serverHello)).toBe(
       bytesToHex(fixture.handshake.transcriptHash),
@@ -138,6 +143,22 @@ describe('TLS 1.3 handshake state bridge', () => {
         messages: notOffered.messages,
       }),
       'TLS selected ALPN must be offered by ClientHello',
+    )
+  })
+
+  test('requires QUIC transport parameters in encrypted extensions', async () => {
+    const fixture = await tlsHandshakeStateFixture({
+      certificateRequest: false,
+      serverTransportParameters: null,
+    })
+
+    await expectRejects(
+      verifyTls13ClientHandshakeState({
+        x25519PrivateKey: rfc8448ClientPrivateKey,
+        expectedServerEndpointId: fixture.server.endpointId,
+        messages: fixture.messages,
+      }),
+      'TLS EncryptedExtensions must include QUIC transport parameters',
     )
   })
 

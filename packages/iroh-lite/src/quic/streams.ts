@@ -8,6 +8,12 @@ import {
   type QuicMaxStreamDataFrame,
   type QuicStreamFrame,
 } from './frame'
+import {
+  quicTransportParameterToSafeNumber,
+  QuicEndpointRole,
+  type QuicEndpointRoleValue,
+  type QuicTransportParameters,
+} from './transport-parameters'
 
 export interface QuicStreamReceiveOutput {
   readonly streamId: number
@@ -40,9 +46,20 @@ export interface QuicStreamSendResult {
   readonly nextStreamOffset: number
 }
 
+export interface QuicStreamSendStateOptions {
+  readonly maxData?: number | null
+  readonly peerTransportParameters?: QuicTransportParameters
+  readonly localRole?: QuicEndpointRoleValue
+}
+
 export class QuicStreamState {
-  readonly #receiveState = new QuicStreamReceiveState()
-  readonly #sendState = new QuicStreamSendState()
+  readonly #receiveState: QuicStreamReceiveState
+  readonly #sendState: QuicStreamSendState
+
+  constructor(sendOptions: QuicStreamSendStateOptions = {}) {
+    this.#receiveState = new QuicStreamReceiveState()
+    this.#sendState = new QuicStreamSendState(sendOptions)
+  }
 
   receiveFrame(frame: QuicStreamFrame): QuicStreamReceiveOutput | null {
     return this.#receiveState.receive(frame)
@@ -143,9 +160,17 @@ export class QuicStreamSendState {
   readonly #streamLimits = new Map<number, number>()
   #maxData: number | null
   #sentData = 0
+  #localRole: QuicEndpointRoleValue | null = null
+  #initialMaxStreamDataBidiLocal: number | null = null
+  #initialMaxStreamDataBidiRemote: number | null = null
+  #initialMaxStreamDataUni: number | null = null
 
-  constructor(maxData: number | null = null) {
-    this.#maxData = validateOptionalStreamLimit(maxData, 'QUIC MAX_DATA')
+  constructor(options: QuicStreamSendStateOptions | number | null = {}) {
+    const sendOptions = normalizeSendStateOptions(options)
+    this.#maxData = validateOptionalStreamLimit(sendOptions.maxData ?? null, 'QUIC MAX_DATA')
+    if (sendOptions.peerTransportParameters !== undefined) {
+      this.applyPeerTransportParameters(sendOptions.peerTransportParameters, sendOptions.localRole)
+    }
   }
 
   send(streamId: number, data: Uint8Array, fin = false): QuicStreamSendResult {
@@ -174,7 +199,7 @@ export class QuicStreamSendState {
     this.#streamLimits.set(
       frame.streamId,
       maxLimit(
-        this.#streamLimits.get(frame.streamId) ?? null,
+        this.maxStreamDataForSend(frame.streamId),
         frame.maximumStreamData,
         'QUIC MAX_STREAM_DATA',
       ),
@@ -193,6 +218,30 @@ export class QuicStreamSendState {
     }
   }
 
+  applyPeerTransportParameters(
+    params: QuicTransportParameters,
+    localRole: QuicEndpointRoleValue = QuicEndpointRole.Client,
+  ): void {
+    this.#localRole = localRole
+    this.#maxData = maxLimit(
+      this.#maxData,
+      quicTransportParameterToSafeNumber(params.initialMaxData, 'QUIC initial_max_data'),
+      'QUIC MAX_DATA',
+    )
+    this.#initialMaxStreamDataBidiLocal = quicTransportParameterToSafeNumber(
+      params.initialMaxStreamDataBidiLocal,
+      'QUIC initial_max_stream_data_bidi_local',
+    )
+    this.#initialMaxStreamDataBidiRemote = quicTransportParameterToSafeNumber(
+      params.initialMaxStreamDataBidiRemote,
+      'QUIC initial_max_stream_data_bidi_remote',
+    )
+    this.#initialMaxStreamDataUni = quicTransportParameterToSafeNumber(
+      params.initialMaxStreamDataUni,
+      'QUIC initial_max_stream_data_uni',
+    )
+  }
+
   maxData(): number | null {
     return this.#maxData
   }
@@ -203,7 +252,7 @@ export class QuicStreamSendState {
 
   maxStreamData(streamId: number): number | null {
     validateStreamId(streamId)
-    return this.#streamLimits.get(streamId) ?? null
+    return this.maxStreamDataForSend(streamId)
   }
 
   private stream(streamId: number): QuicStreamSendCursor {
@@ -219,14 +268,31 @@ export class QuicStreamSendState {
   private validateCredit(streamId: number, length: number): void {
     const currentOffset = this.offset(streamId)
     const nextStreamOffset = checkedStreamEndOffset(currentOffset, length)
-    const maxStreamData = this.#streamLimits.get(streamId)
-    if (maxStreamData !== undefined && nextStreamOffset > maxStreamData) {
+    const maxStreamData = this.maxStreamDataForSend(streamId)
+    if (maxStreamData !== null && nextStreamOffset > maxStreamData) {
       throw new RangeError('QUIC STREAM data exceeds MAX_STREAM_DATA')
     }
     const nextSentData = checkedStreamEndOffset(this.#sentData, length)
     if (this.#maxData !== null && nextSentData > this.#maxData) {
       throw new RangeError('QUIC STREAM data exceeds MAX_DATA')
     }
+  }
+
+  private maxStreamDataForSend(streamId: number): number | null {
+    const explicit = this.#streamLimits.get(streamId)
+    if (explicit !== undefined) {
+      return explicit
+    }
+    if (this.#localRole === null) {
+      return null
+    }
+    return initialStreamLimitForSend(
+      streamId,
+      this.#localRole,
+      this.#initialMaxStreamDataBidiLocal,
+      this.#initialMaxStreamDataBidiRemote,
+      this.#initialMaxStreamDataUni,
+    )
   }
 }
 
@@ -406,4 +472,38 @@ function maxLimit(current: number | null, next: number, name: string): number {
     return validated
   }
   return current
+}
+
+function normalizeSendStateOptions(
+  options: QuicStreamSendStateOptions | number | null,
+): QuicStreamSendStateOptions {
+  if (typeof options === 'number' || options === null) {
+    return { maxData: options }
+  }
+  return options
+}
+
+function initialStreamLimitForSend(
+  streamId: number,
+  localRole: QuicEndpointRoleValue,
+  bidiLocal: number | null,
+  bidiRemote: number | null,
+  uni: number | null,
+): number | null {
+  const direction = streamId & 0x02
+  if (direction === 0x02) {
+    if (!isLocalInitiatedStream(streamId, localRole)) {
+      throw new RangeError('QUIC cannot send on peer-initiated unidirectional stream')
+    }
+    return uni
+  }
+  return isLocalInitiatedStream(streamId, localRole) ? bidiRemote : bidiLocal
+}
+
+function isLocalInitiatedStream(streamId: number, localRole: QuicEndpointRoleValue): boolean {
+  const initiator = streamId & 0x01
+  return (
+    (localRole === QuicEndpointRole.Client && initiator === 0) ||
+    (localRole === QuicEndpointRole.Server && initiator === 1)
+  )
 }

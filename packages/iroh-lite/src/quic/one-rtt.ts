@@ -26,6 +26,7 @@ import {
   type QuicStreamReceiveOutput,
   type QuicStreamReceiveSnapshot,
   type QuicStreamSendResult,
+  type QuicStreamSendStateOptions,
 } from './streams'
 
 export interface QuicOneRttPacketHeaderPrefix {
@@ -120,14 +121,16 @@ export class QuicOneRttSendState {
 export class QuicOneRttState {
   readonly #sendState: QuicOneRttSendState
   readonly #receiveState: QuicOneRttReceiveState
-  readonly #streamState = new QuicStreamState()
+  readonly #streamState: QuicStreamState
 
   constructor(
     nextPacketNumber: number | bigint = 0,
     largestReceivedPacketNumber: number | bigint | null = null,
+    streamSendOptions: QuicStreamSendStateOptions = {},
   ) {
     this.#sendState = new QuicOneRttSendState(nextPacketNumber)
     this.#receiveState = new QuicOneRttReceiveState(largestReceivedPacketNumber)
+    this.#streamState = new QuicStreamState(streamSendOptions)
   }
 
   get nextPacketNumber(): bigint {

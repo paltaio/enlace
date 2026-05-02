@@ -20,6 +20,11 @@ import {
   type TlsExtension,
   type TlsServerHelloHandshake,
 } from './tls'
+import {
+  parseQuicTransportParameters,
+  QuicEndpointRole,
+  type QuicTransportParameters,
+} from './transport-parameters'
 
 export interface VerifyTls13ClientHandshakeStateOptions {
   readonly x25519PrivateKey: Uint8Array
@@ -48,6 +53,7 @@ export interface Tls13ClientHandshakeState {
   readonly negotiatedAlpn: Uint8Array
   readonly peerEndpointId: Uint8Array
   readonly handshake: Tls13X25519HandshakeSecrets
+  readonly transportParameters: Tls13HandshakeTransportParameters
   readonly server: Tls13ServerEncryptedHandshakeVerification
   readonly client: Tls13ClientEncryptedHandshakeVerification | null
   readonly transcriptHashes: Tls13HandshakeTranscriptBoundaries
@@ -57,9 +63,15 @@ export interface Tls13ServerHandshakeState {
   readonly negotiatedAlpn: Uint8Array
   readonly peerEndpointId: Uint8Array | null
   readonly handshake: Tls13X25519HandshakeSecrets
+  readonly transportParameters: Tls13HandshakeTransportParameters
   readonly server: Tls13ServerEncryptedHandshakeVerification
   readonly client: Tls13ClientEncryptedHandshakeVerification | null
   readonly transcriptHashes: Tls13HandshakeTranscriptBoundaries
+}
+
+export interface Tls13HandshakeTransportParameters {
+  readonly client: QuicTransportParameters
+  readonly server: QuicTransportParameters
 }
 
 export async function verifyTls13ClientHandshakeState(
@@ -91,11 +103,16 @@ export async function verifyTls13ClientHandshakeState(
     server.encryptedExtensions.extensions,
     options.expectedAlpn,
   )
+  const transportParameters = requireTransportParameters(
+    hello.client.handshake,
+    server.encryptedExtensions.extensions,
+  )
 
   return {
     negotiatedAlpn,
     peerEndpointId: copyBytes(server.endpointId),
     handshake,
+    transportParameters,
     server,
     client,
     transcriptHashes: transcriptBoundaries(handshake, server, client),
@@ -131,11 +148,16 @@ export async function verifyTls13ServerHandshakeState(
     server.encryptedExtensions.extensions,
     options.expectedAlpn,
   )
+  const transportParameters = requireTransportParameters(
+    hello.client.handshake,
+    server.encryptedExtensions.extensions,
+  )
 
   return {
     negotiatedAlpn,
     peerEndpointId: client === null ? null : copyBytes(client.endpointId),
     handshake,
+    transportParameters,
     server,
     client,
     transcriptHashes: transcriptBoundaries(handshake, server, client),
@@ -211,6 +233,30 @@ function requireExtensionData(
     throw new RangeError(message)
   }
   return extension.data
+}
+
+function requireTransportParameters(
+  clientHello: TlsClientHelloHandshake,
+  encryptedExtensions: readonly TlsExtension[],
+): Tls13HandshakeTransportParameters {
+  return {
+    client: parseQuicTransportParameters(
+      requireExtensionData(
+        clientHello.body.extensions,
+        TlsExtensionType.QuicTransportParameters,
+        'TLS ClientHello must include QUIC transport parameters',
+      ),
+      QuicEndpointRole.Client,
+    ),
+    server: parseQuicTransportParameters(
+      requireExtensionData(
+        encryptedExtensions,
+        TlsExtensionType.QuicTransportParameters,
+        'TLS EncryptedExtensions must include QUIC transport parameters',
+      ),
+      QuicEndpointRole.Server,
+    ),
+  }
 }
 
 function includesBytes(values: readonly Uint8Array[], needle: Uint8Array): boolean {
