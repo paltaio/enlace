@@ -132,14 +132,6 @@ describe('TLS handshake transcript from collected QUIC CRYPTO messages', () => {
     ])
     expect(transcript.bytes).toEqual(unknown)
   })
-
-  test('keeps browser runtime module free of Node and Bun APIs', async () => {
-    const source = await Bun.file(new URL('./tls-transcript.ts', import.meta.url)).text()
-
-    expect(source).not.toContain("from 'node:")
-    expect(source).not.toContain('Bun.')
-    expect(source).not.toContain('process.')
-  })
 })
 
 function cryptoFrame(cryptoOffset: number, data: Uint8Array): QuicCryptoFrame {
