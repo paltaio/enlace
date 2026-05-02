@@ -1,4 +1,5 @@
 import { requireLength } from '../bytes'
+import type { QuicTlsHandshakeMessages } from './tls-crypto-stream'
 import {
   deriveTls13HandshakeSecrets,
   TLS13_SHA256_SECRET_LENGTH,
@@ -37,6 +38,13 @@ export interface DeriveTls13X25519HandshakeSecretsOptions {
   readonly serverHelloMessage: Uint8Array
 }
 
+export interface DeriveTls13X25519HandshakeSecretsFromQuicCryptoOptions {
+  readonly role: TlsHandshakeRoleValue
+  readonly privateKey: Uint8Array
+  readonly clientMessages: QuicTlsHandshakeMessages
+  readonly serverMessages: QuicTlsHandshakeMessages
+}
+
 export interface Tls13X25519HandshakeSecrets {
   readonly sharedSecret: Uint8Array
   readonly transcriptHash: Uint8Array
@@ -69,6 +77,22 @@ export async function deriveTls13X25519HandshakeSecrets(
     transcriptHash,
     secrets: deriveTls13HandshakeSecrets(sharedSecret, transcriptHash),
   }
+}
+
+export async function deriveTls13X25519HandshakeSecretsFromQuicCrypto(
+  options: DeriveTls13X25519HandshakeSecretsFromQuicCryptoOptions,
+): Promise<Tls13X25519HandshakeSecrets> {
+  const clientHello = requireClientHelloMessage(options.clientMessages)
+  const serverHello = requireServerHelloMessage(options.serverMessages)
+
+  return deriveTls13X25519HandshakeSecrets({
+    role: options.role,
+    privateKey: options.privateKey,
+    clientHello: clientHello.handshake,
+    serverHello: serverHello.handshake,
+    clientHelloMessage: clientHello.message,
+    serverHelloMessage: serverHello.message,
+  })
 }
 
 function validateTls13HelloNegotiation(
@@ -104,4 +128,34 @@ function requireExtensionData(
     throw new RangeError(`missing TLS extension 0x${extensionType.toString(16)}`)
   }
   return extension.data
+}
+
+function requireClientHelloMessage(messages: QuicTlsHandshakeMessages): {
+  readonly handshake: TlsClientHelloHandshake
+  readonly message: Uint8Array
+} {
+  for (const message of messages.messages) {
+    if (message.handshake.kind === 'client-hello') {
+      return {
+        handshake: message.handshake,
+        message: message.message,
+      }
+    }
+  }
+  throw new RangeError('missing TLS ClientHello handshake message')
+}
+
+function requireServerHelloMessage(messages: QuicTlsHandshakeMessages): {
+  readonly handshake: TlsServerHelloHandshake
+  readonly message: Uint8Array
+} {
+  for (const message of messages.messages) {
+    if (message.handshake.kind === 'server-hello') {
+      return {
+        handshake: message.handshake,
+        message: message.message,
+      }
+    }
+  }
+  throw new RangeError('missing TLS ServerHello handshake message')
 }

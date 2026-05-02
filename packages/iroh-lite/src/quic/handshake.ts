@@ -1,5 +1,6 @@
 import { copyBytes } from '../bytes'
 import {
+  deriveQuicDirectionalKeys,
   decryptQuicAes128GcmPacket,
   removeQuicHeaderProtection,
   type QuicDirectionalKeys,
@@ -9,12 +10,31 @@ import {
   parseQuicHandshakePacketHeaderPrefix,
   type QuicHandshakePacketHeader,
 } from './packet'
+import {
+  deriveTls13X25519HandshakeSecretsFromQuicCrypto,
+  type DeriveTls13X25519HandshakeSecretsFromQuicCryptoOptions,
+} from './tls-handshake'
 
 export interface QuicHandshakePacketDecryptionResult {
   readonly header: QuicHandshakePacketHeader
   readonly payload: Uint8Array
   readonly unprotectedPacket: Uint8Array
   readonly endOffset: number
+}
+
+export interface QuicHandshakeKeys {
+  readonly client: QuicDirectionalKeys
+  readonly server: QuicDirectionalKeys
+}
+
+export async function deriveQuicHandshakeKeysFromTlsCrypto(
+  options: DeriveTls13X25519HandshakeSecretsFromQuicCryptoOptions,
+): Promise<QuicHandshakeKeys> {
+  const handshakeSecrets = await deriveTls13X25519HandshakeSecretsFromQuicCrypto(options)
+  return {
+    client: deriveQuicDirectionalKeys(handshakeSecrets.secrets.clientHandshakeTrafficSecret),
+    server: deriveQuicDirectionalKeys(handshakeSecrets.secrets.serverHandshakeTrafficSecret),
+  }
 }
 
 export function decryptQuicHandshakePacket(

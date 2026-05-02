@@ -3,7 +3,10 @@ import { describe, expect, test } from 'bun:test'
 import { concatBytes, readU8 } from '../bytes'
 import {
   rfc8448ClientHandshakeTrafficSecret,
+  rfc8448ClientHello,
+  rfc8448ClientPrivateKey,
   rfc8448ServerHandshakeTrafficSecret,
+  rfc8448ServerHello,
 } from '../testing/rfc8448-tls'
 import { bytesToHex } from '../testing/hex'
 import { encodeVarInt } from '../varint'
@@ -14,7 +17,10 @@ import {
   headerProtectionSample,
   type QuicDirectionalKeys,
 } from './crypto'
-import { decryptQuicHandshakePacket } from './handshake'
+import type { QuicCryptoFrame } from './frame'
+import { decryptQuicHandshakePacket, deriveQuicHandshakeKeysFromTlsCrypto } from './handshake'
+import { TlsHandshakeRole } from './tls-handshake'
+import { collectQuicTlsHandshakeMessages } from './tls-crypto-stream'
 
 describe('QUIC Handshake key derivation', () => {
   test('derives QUIC keys from TLS handshake traffic secrets', () => {
@@ -27,6 +33,22 @@ describe('QUIC Handshake key derivation', () => {
     expect(bytesToHex(serverKeys.packetKey)).toBe('03f01e7bf4e9bc37901b9ae3a022dfe7')
     expect(bytesToHex(serverKeys.packetIv)).toBe('53df176c0bdf845443fca523')
     expect(bytesToHex(serverKeys.headerProtectionKey)).toBe('5b6160d63552d737da036abf737ce2bf')
+  })
+
+  test('derives QUIC keys from collected TLS hellos', async () => {
+    const keys = await deriveQuicHandshakeKeysFromTlsCrypto({
+      role: TlsHandshakeRole.Client,
+      privateKey: rfc8448ClientPrivateKey,
+      clientMessages: collectQuicTlsHandshakeMessages([cryptoFrame(0, rfc8448ClientHello)]),
+      serverMessages: collectQuicTlsHandshakeMessages([cryptoFrame(0, rfc8448ServerHello)]),
+    })
+
+    expect(bytesToHex(keys.client.packetKey)).toBe('b574ba1b323a2c6ad03e410836b5605c')
+    expect(bytesToHex(keys.client.packetIv)).toBe('200c933d2209b9a1aa879197')
+    expect(bytesToHex(keys.client.headerProtectionKey)).toBe('bb1db87365312baa38818fa20be44fde')
+    expect(bytesToHex(keys.server.packetKey)).toBe('03f01e7bf4e9bc37901b9ae3a022dfe7')
+    expect(bytesToHex(keys.server.packetIv)).toBe('53df176c0bdf845443fca523')
+    expect(bytesToHex(keys.server.headerProtectionKey)).toBe('5b6160d63552d737da036abf737ce2bf')
   })
 })
 
@@ -97,4 +119,14 @@ function applyLongHeaderProtection(
   }
 
   return protectedPacket
+}
+
+function cryptoFrame(cryptoOffset: number, data: Uint8Array): QuicCryptoFrame {
+  return {
+    type: 'crypto',
+    cryptoOffset,
+    data,
+    offset: 0,
+    endOffset: data.length,
+  }
 }

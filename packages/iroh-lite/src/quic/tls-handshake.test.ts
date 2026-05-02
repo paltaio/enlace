@@ -11,12 +11,18 @@ import {
   rfc8448ServerPrivateKey,
   rfc8448SharedSecret,
 } from '../testing/rfc8448-tls'
-import { deriveTls13X25519HandshakeSecrets, TlsHandshakeRole } from './tls-handshake'
+import type { QuicCryptoFrame } from './frame'
 import {
   parseTlsHandshakes,
   type TlsClientHelloHandshake,
   type TlsServerHelloHandshake,
 } from './tls'
+import {
+  deriveTls13X25519HandshakeSecrets,
+  deriveTls13X25519HandshakeSecretsFromQuicCrypto,
+  TlsHandshakeRole,
+} from './tls-handshake'
+import { collectQuicTlsHandshakeMessages } from './tls-crypto-stream'
 
 describe('TLS 1.3 X25519 handshake secret bridge', () => {
   test('derives client-side RFC 8448 handshake secrets from parsed hellos', async () => {
@@ -57,6 +63,43 @@ describe('TLS 1.3 X25519 handshake secret bridge', () => {
     )
     expect(bytesToHex(result.secrets.serverHandshakeTrafficSecret)).toBe(
       bytesToHex(rfc8448ServerHandshakeTrafficSecret),
+    )
+  })
+
+  test('derives RFC 8448 handshake secrets from QUIC CRYPTO messages', async () => {
+    const result = await deriveTls13X25519HandshakeSecretsFromQuicCrypto({
+      role: TlsHandshakeRole.Client,
+      privateKey: rfc8448ClientPrivateKey,
+      clientMessages: collectQuicTlsHandshakeMessages([cryptoFrame(0, rfc8448ClientHello)]),
+      serverMessages: collectQuicTlsHandshakeMessages([cryptoFrame(0, rfc8448ServerHello)]),
+    })
+
+    expect(bytesToHex(result.sharedSecret)).toBe(bytesToHex(rfc8448SharedSecret))
+    expect(bytesToHex(result.transcriptHash)).toBe(
+      bytesToHex(rfc8448ClientServerHelloTranscriptHash),
+    )
+    expect(bytesToHex(result.secrets.clientHandshakeTrafficSecret)).toBe(
+      bytesToHex(rfc8448ClientHandshakeTrafficSecret),
+    )
+    expect(bytesToHex(result.secrets.serverHandshakeTrafficSecret)).toBe(
+      bytesToHex(rfc8448ServerHandshakeTrafficSecret),
+    )
+  })
+
+  test('rejects missing QUIC CRYPTO hello messages', async () => {
+    await deriveTls13X25519HandshakeSecretsFromQuicCrypto({
+      role: TlsHandshakeRole.Client,
+      privateKey: rfc8448ClientPrivateKey,
+      clientMessages: collectQuicTlsHandshakeMessages([cryptoFrame(0, rfc8448ServerHello)]),
+      serverMessages: collectQuicTlsHandshakeMessages([cryptoFrame(0, rfc8448ServerHello)]),
+    }).then(
+      () => {
+        throw new Error('expected missing ClientHello failure')
+      },
+      (error: unknown) => {
+        expect(error).toBeInstanceOf(RangeError)
+        expect(error).toHaveProperty('message', 'missing TLS ClientHello handshake message')
+      },
     )
   })
 
@@ -128,4 +171,14 @@ function parseRfc8448ServerHello(): TlsServerHelloHandshake {
     throw new Error('expected RFC 8448 ServerHello')
   }
   return handshake
+}
+
+function cryptoFrame(cryptoOffset: number, data: Uint8Array): QuicCryptoFrame {
+  return {
+    type: 'crypto',
+    cryptoOffset,
+    data,
+    offset: 0,
+    endOffset: data.length,
+  }
 }
