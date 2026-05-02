@@ -9,7 +9,7 @@ import {
   type QuicStreamFrame,
 } from './frame'
 import {
-  quicTransportParameterToSafeNumber,
+  quicTransportParameterToSaturatingSafeNumber,
   QuicEndpointRole,
   type QuicEndpointRoleValue,
   type QuicTransportParameters,
@@ -225,20 +225,17 @@ export class QuicStreamSendState {
     this.#localRole = localRole
     this.#maxData = maxLimit(
       this.#maxData,
-      quicTransportParameterToSafeNumber(params.initialMaxData, 'QUIC initial_max_data'),
+      quicTransportParameterToSaturatingSafeNumber(params.initialMaxData),
       'QUIC MAX_DATA',
     )
-    this.#initialMaxStreamDataBidiLocal = quicTransportParameterToSafeNumber(
+    this.#initialMaxStreamDataBidiLocal = quicTransportParameterToSaturatingSafeNumber(
       params.initialMaxStreamDataBidiLocal,
-      'QUIC initial_max_stream_data_bidi_local',
     )
-    this.#initialMaxStreamDataBidiRemote = quicTransportParameterToSafeNumber(
+    this.#initialMaxStreamDataBidiRemote = quicTransportParameterToSaturatingSafeNumber(
       params.initialMaxStreamDataBidiRemote,
-      'QUIC initial_max_stream_data_bidi_remote',
     )
-    this.#initialMaxStreamDataUni = quicTransportParameterToSafeNumber(
+    this.#initialMaxStreamDataUni = quicTransportParameterToSaturatingSafeNumber(
       params.initialMaxStreamDataUni,
-      'QUIC initial_max_stream_data_uni',
     )
   }
 

@@ -42,6 +42,27 @@ describe('QUIC Initial packet decryption', () => {
     expect(bytesToHex(packet)).toBe(bytesToHex(rfc9001ProtectedServerInitialPacket))
   })
 
+  test('pads Initial packets to requested minimum length', () => {
+    const keys = deriveQuicInitialKeys(rfc9001DestinationConnectionId)
+    const packet = encryptQuicInitialPacket(keys.client, {
+      destinationConnectionId: rfc9001DestinationConnectionId,
+      sourceConnectionId: new Uint8Array(),
+      packetNumber: 0,
+      packetNumberLength: 1,
+      payload: rfc9001ClientInitialFrames,
+      minimumPacketLength: 1200,
+    })
+    const result = decryptQuicInitialPacket(packet, keys.client)
+
+    expect(packet).toHaveLength(1200)
+    expect(bytesToHex(result.payload.subarray(0, rfc9001ClientInitialFrames.length))).toBe(
+      bytesToHex(rfc9001ClientInitialFrames),
+    )
+    expect(result.payload.subarray(rfc9001ClientInitialFrames.length)).toEqual(
+      new Uint8Array(result.payload.length - rfc9001ClientInitialFrames.length),
+    )
+  })
+
   test('recovers wrapped Initial packet numbers for nonce construction', () => {
     const keys = deriveQuicInitialKeys(rfc9001DestinationConnectionId)
     const payload = new Uint8Array(16)

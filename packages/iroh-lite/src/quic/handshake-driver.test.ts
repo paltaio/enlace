@@ -37,6 +37,7 @@ describe('QUIC handshake driver', () => {
     const echoed = pair.clientConnection.receive(response.packet)
 
     expect(pair.start.packetNumber).toBe(0n)
+    expect(pair.start.packet).toHaveLength(1200)
     expect(pair.serverFlight.initialPacketNumber).toBe(0n)
     expect(pair.serverFlight.handshakePacketNumber).toBe(0n)
     expect(pair.flight.packetNumber).toBe(0n)

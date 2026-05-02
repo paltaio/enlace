@@ -57,6 +57,8 @@ function isQuicAckElicitingFrame(frame: QuicFrame): boolean {
     case 'stream':
     case 'max-data':
     case 'max-stream-data':
+    case 'new-connection-id':
+    case 'handshake-done':
       return true
   }
 }

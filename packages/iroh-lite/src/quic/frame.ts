@@ -11,8 +11,10 @@ export const QuicFrameType = {
   StreamBase: 0x08,
   MaxData: 0x10,
   MaxStreamData: 0x11,
+  NewConnectionId: 0x18,
   ConnectionCloseTransport: 0x1c,
   ConnectionCloseApplication: 0x1d,
+  HandshakeDone: 0x1e,
 } as const
 
 export type QuicFrame =
@@ -24,7 +26,9 @@ export type QuicFrame =
   | QuicStreamFrame
   | QuicMaxDataFrame
   | QuicMaxStreamDataFrame
+  | QuicNewConnectionIdFrame
   | QuicConnectionCloseFrame
+  | QuicHandshakeDoneFrame
 
 export interface QuicPaddingFrame {
   readonly type: 'padding'
@@ -98,6 +102,16 @@ export interface QuicMaxStreamDataFrame {
   readonly endOffset: number
 }
 
+export interface QuicNewConnectionIdFrame {
+  readonly type: 'new-connection-id'
+  readonly sequenceNumber: bigint
+  readonly retirePriorTo: bigint
+  readonly connectionId: Uint8Array
+  readonly statelessResetToken: Uint8Array
+  readonly offset: number
+  readonly endOffset: number
+}
+
 export type QuicConnectionCloseFrame =
   | QuicTransportConnectionCloseFrame
   | QuicApplicationConnectionCloseFrame
@@ -118,6 +132,12 @@ export interface QuicApplicationConnectionCloseFrame {
   readonly errorCode: number
   readonly frameType: null
   readonly reasonPhrase: Uint8Array
+  readonly offset: number
+  readonly endOffset: number
+}
+
+export interface QuicHandshakeDoneFrame {
+  readonly type: 'handshake-done'
   readonly offset: number
   readonly endOffset: number
 }
@@ -294,11 +314,23 @@ export function parseQuicFrames(bytes: Uint8Array, offset = 0): QuicFramesParseR
       pos = frame.endOffset
       continue
     }
+    if (frameType === QuicFrameType.NewConnectionId) {
+      const frame = parseNewConnectionIdFrame(bytes, pos)
+      frames.push(frame)
+      pos = frame.endOffset
+      continue
+    }
     if (
       frameType === QuicFrameType.ConnectionCloseTransport ||
       frameType === QuicFrameType.ConnectionCloseApplication
     ) {
       const frame = parseConnectionCloseFrame(bytes, pos, frameType)
+      frames.push(frame)
+      pos = frame.endOffset
+      continue
+    }
+    if (frameType === QuicFrameType.HandshakeDone) {
+      const frame = parseHandshakeDoneFrame(pos)
       frames.push(frame)
       pos = frame.endOffset
       continue
@@ -462,6 +494,34 @@ function parseMaxStreamDataFrame(bytes: Uint8Array, offset: number): QuicMaxStre
   }
 }
 
+function parseNewConnectionIdFrame(bytes: Uint8Array, offset: number): QuicNewConnectionIdFrame {
+  let pos = offset + 1
+  const sequenceNumber = decodeVarInt(bytes, pos)
+  pos += sequenceNumber.bytesRead
+  const retirePriorTo = decodeVarInt(bytes, pos)
+  pos += retirePriorTo.bytesRead
+  const connectionIdLength = readU8(bytes, pos)
+  pos += 1
+  if (connectionIdLength > 20) {
+    throw new RangeError('QUIC NEW_CONNECTION_ID connection id length out of range')
+  }
+  if (bytes.length - pos < connectionIdLength + 16) {
+    throw new RangeError('not enough bytes for QUIC NEW_CONNECTION_ID frame')
+  }
+  const connectionIdEndOffset = pos + connectionIdLength
+  const tokenEndOffset = connectionIdEndOffset + 16
+
+  return {
+    type: 'new-connection-id',
+    sequenceNumber: sequenceNumber.value,
+    retirePriorTo: retirePriorTo.value,
+    connectionId: copyBytes(bytes.subarray(pos, connectionIdEndOffset)),
+    statelessResetToken: copyBytes(bytes.subarray(connectionIdEndOffset, tokenEndOffset)),
+    offset,
+    endOffset: tokenEndOffset,
+  }
+}
+
 function parseConnectionCloseFrame(
   bytes: Uint8Array,
   offset: number,
@@ -578,6 +638,14 @@ function parseAckEcnCounts(
       ce: ce.value,
     },
     endOffset: pos,
+  }
+}
+
+function parseHandshakeDoneFrame(offset: number): QuicHandshakeDoneFrame {
+  return {
+    type: 'handshake-done',
+    offset,
+    endOffset: offset + 1,
   }
 }
 

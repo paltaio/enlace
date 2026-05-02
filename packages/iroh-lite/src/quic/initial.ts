@@ -25,6 +25,7 @@ export interface QuicInitialPacketProtectionOptions {
   readonly packetNumber: number | bigint
   readonly packetNumberLength: number
   readonly payload: Uint8Array
+  readonly minimumPacketLength?: number
 }
 
 export interface QuicInitialPacketDecryptionResult {
@@ -41,11 +42,29 @@ export function encryptQuicInitialPacket(
 ): Uint8Array {
   validateQuicConnectionIdLength(options.destinationConnectionId, 'destination connection id')
   validateQuicConnectionIdLength(options.sourceConnectionId, 'source connection id')
+  let payload = options.payload
+  let packet: Uint8Array | null = null
+  while (packet === null || packet.length < (options.minimumPacketLength ?? 0)) {
+    const packetNumber = encodeQuicTruncatedPacketNumber(
+      options.packetNumber,
+      options.packetNumberLength,
+    )
+    packet = encryptQuicInitialPacketWithPayload(keys, options, packetNumber, payload)
+    if (options.minimumPacketLength === undefined || packet.length >= options.minimumPacketLength) {
+      return packet
+    }
+    payload = concatBytes([payload, new Uint8Array(options.minimumPacketLength - packet.length)])
+  }
+  return packet
+}
+
+function encryptQuicInitialPacketWithPayload(
+  keys: QuicInitialDirectionalKeys,
+  options: QuicInitialPacketProtectionOptions,
+  packetNumber: Uint8Array,
+  payload: Uint8Array,
+): Uint8Array {
   const token = options.token ?? new Uint8Array()
-  const packetNumber = encodeQuicTruncatedPacketNumber(
-    options.packetNumber,
-    options.packetNumberLength,
-  )
   const firstByte = 0xc0 | (options.packetNumberLength - 1)
   const header = concatBytes([
     new Uint8Array([firstByte]),
@@ -56,11 +75,11 @@ export function encryptQuicInitialPacket(
     options.sourceConnectionId,
     encodeVarInt(token.length),
     token,
-    encodeVarInt(packetNumber.length + options.payload.length + QUIC_AES_128_GCM_TAG_LENGTH),
+    encodeVarInt(packetNumber.length + payload.length + QUIC_AES_128_GCM_TAG_LENGTH),
     packetNumber,
   ])
   const packetNumberOffset = header.length - packetNumber.length
-  const ciphertext = encryptQuicAes128GcmPacket(keys, options.packetNumber, header, options.payload)
+  const ciphertext = encryptQuicAes128GcmPacket(keys, options.packetNumber, header, payload)
 
   return applyQuicHeaderProtection(
     concatBytes([header, ciphertext]),

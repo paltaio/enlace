@@ -271,6 +271,21 @@ describe('QUIC stream send state', () => {
     )
   })
 
+  test('saturates oversized peer transport parameter send credit', () => {
+    const state = new QuicStreamSendState({
+      localRole: QuicEndpointRole.Client,
+      peerTransportParameters: {
+        ...defaultQuicTransportParameters(),
+        initialMaxData: 4611686018427387903n,
+        initialMaxStreamDataBidiRemote: 4611686018427387903n,
+      },
+    })
+
+    expect(state.maxData()).toBe(Number.MAX_SAFE_INTEGER)
+    expect(state.maxStreamData(0)).toBe(Number.MAX_SAFE_INTEGER)
+    expect(state.send(0, hexToBytes('616263'), true).nextStreamOffset).toBe(3)
+  })
+
   test('lets MAX_STREAM_DATA raise initial stream credit', () => {
     const state = new QuicStreamSendState({
       localRole: QuicEndpointRole.Server,

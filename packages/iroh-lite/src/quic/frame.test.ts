@@ -154,6 +154,27 @@ describe('QUIC frame parsing', () => {
     ])
   })
 
+  test('parses connection-id and handshake completion frames', () => {
+    const result = parseQuicFrames(hexToBytes('18010004aabbccdd00112233445566778899aabbccddeeff1e'))
+
+    expect(result.frames).toEqual([
+      {
+        type: 'new-connection-id',
+        sequenceNumber: 1n,
+        retirePriorTo: 0n,
+        connectionId: hexToBytes('aabbccdd'),
+        statelessResetToken: hexToBytes('00112233445566778899aabbccddeeff'),
+        offset: 0,
+        endOffset: 24,
+      },
+      {
+        type: 'handshake-done',
+        offset: 24,
+        endOffset: 25,
+      },
+    ])
+  })
+
   test('parses transport and application CONNECTION_CLOSE frames', () => {
     const transport = encodeQuicTransportConnectionCloseFrame(0x10, 0x06, hexToBytes('626164'))
     const application = encodeQuicApplicationConnectionCloseFrame(0x100, hexToBytes('6f6b'))
@@ -313,6 +334,15 @@ describe('QUIC frame parsing', () => {
   test('rejects truncated CONNECTION_CLOSE reason', () => {
     expect(() => parseQuicFrames(hexToBytes('1c1006036261'))).toThrow(
       'not enough bytes for QUIC CONNECTION_CLOSE reason',
+    )
+  })
+
+  test('rejects malformed NEW_CONNECTION_ID frames', () => {
+    expect(() => parseQuicFrames(hexToBytes('18010015'))).toThrow(
+      'QUIC NEW_CONNECTION_ID connection id length out of range',
+    )
+    expect(() => parseQuicFrames(hexToBytes('18010004aabbccdd0011'))).toThrow(
+      'not enough bytes for QUIC NEW_CONNECTION_ID frame',
     )
   })
 

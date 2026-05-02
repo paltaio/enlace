@@ -44,6 +44,8 @@ import {
   type QuicTransportParameters,
 } from './transport-parameters'
 
+const quicMinimumInitialPacketLength = 1200
+
 export interface QuicClientHandshakeDriverOptions {
   readonly x25519PrivateKey: Uint8Array
   readonly endpointSecretKey: Uint8Array
@@ -137,6 +139,7 @@ export class QuicClientHandshakeDriver {
       packetNumber,
       packetNumberLength: 1,
       payload: encodeQuicCryptoFrame(0, clientHello.message.message),
+      minimumPacketLength: quicMinimumInitialPacketLength,
     })
 
     this.#started = {

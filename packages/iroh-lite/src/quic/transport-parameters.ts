@@ -232,6 +232,10 @@ export function quicTransportParameterToSafeNumber(value: bigint, name: string):
   return Number(value)
 }
 
+export function quicTransportParameterToSaturatingSafeNumber(value: bigint): number {
+  return value > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(value)
+}
+
 function readTransportParameter(
   params: MutableQuicTransportParameters,
   id: number,
