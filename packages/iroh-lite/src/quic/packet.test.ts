@@ -4,11 +4,13 @@ import { bytesToHex, hexToBytes } from '../testing/hex'
 import {
   QUIC_VERSION_1,
   QuicLongHeaderPacketType,
+  parseQuicHandshakePacketHeader,
   parseQuicInitialPacketHeader,
   parseQuicLongHeader,
 } from './packet'
 
 const initialPacket = hexToBytes('c300000001088394c8f03e515708080001020304050607000700000002aabbcc')
+const handshakePacket = hexToBytes('e200000001040102030405060708090a05aabbccddee')
 
 describe('QUIC long header parsing', () => {
   test('decodes invariant long header fields', () => {
@@ -30,6 +32,38 @@ describe('QUIC long header parsing', () => {
 
   test('rejects packets without fixed bit', () => {
     expect(() => parseQuicLongHeader(hexToBytes('8000000001'))).toThrow('QUIC fixed bit is not set')
+  })
+})
+
+describe('QUIC Handshake header parsing', () => {
+  test('decodes Handshake length, packet number, and payload offset', () => {
+    const header = parseQuicHandshakePacketHeader(handshakePacket)
+
+    expect(header.packetType).toBe(QuicLongHeaderPacketType.Handshake)
+    expect(header.length).toBe(5)
+    expect(header.packetNumberLength).toBe(3)
+    expect(header.packetNumber).toBe(0xaabbcc)
+    expect(header.packetNumberOffset).toBe(17)
+    expect(header.payloadOffset).toBe(20)
+    expect(bytesToHex(handshakePacket.subarray(header.payloadOffset))).toBe('ddee')
+  })
+
+  test('rejects non-Handshake packets', () => {
+    expect(() => parseQuicHandshakePacketHeader(initialPacket)).toThrow(
+      'QUIC packet is not Handshake',
+    )
+  })
+
+  test('rejects truncated Handshake payload', () => {
+    expect(() =>
+      parseQuicHandshakePacketHeader(hexToBytes('e200000001040102030405060708090a05aabbccdd')),
+    ).toThrow('not enough bytes for QUIC Handshake payload')
+  })
+
+  test('rejects Handshake length smaller than packet number length', () => {
+    expect(() =>
+      parseQuicHandshakePacketHeader(hexToBytes('e200000001040102030405060708090a02aabbcc')),
+    ).toThrow('QUIC Handshake length smaller than packet number')
   })
 })
 

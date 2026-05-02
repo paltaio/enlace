@@ -39,6 +39,21 @@ export interface QuicInitialPacketHeaderPrefix extends QuicLongHeader {
   readonly packetNumberOffset: number
 }
 
+export interface QuicHandshakePacketHeader extends QuicLongHeader {
+  readonly packetType: typeof QuicLongHeaderPacketType.Handshake
+  readonly length: number
+  readonly packetNumberOffset: number
+  readonly packetNumberLength: number
+  readonly packetNumber: number
+  readonly payloadOffset: number
+}
+
+export interface QuicHandshakePacketHeaderPrefix extends QuicLongHeader {
+  readonly packetType: typeof QuicLongHeaderPacketType.Handshake
+  readonly length: number
+  readonly packetNumberOffset: number
+}
+
 export function parseQuicLongHeader(bytes: Uint8Array, offset = 0): QuicLongHeader {
   const firstByte = readU8(bytes, offset)
   if ((firstByte & 0x80) === 0) {
@@ -127,6 +142,56 @@ export function parseQuicInitialPacketHeaderPrefix(
     ...header,
     packetType: QuicLongHeaderPacketType.Initial,
     token,
+    length: encodedLength.value,
+    packetNumberOffset: pos,
+  }
+}
+
+export function parseQuicHandshakePacketHeader(
+  bytes: Uint8Array,
+  offset = 0,
+): QuicHandshakePacketHeader {
+  const header = parseQuicHandshakePacketHeaderPrefix(bytes, offset)
+  let pos = header.packetNumberOffset
+
+  const packetNumberLength = (header.firstByte & 0x03) + 1
+  const packetNumber = readQuicPacketNumber(bytes, pos, packetNumberLength)
+  pos += packetNumberLength
+
+  if (header.length < packetNumberLength) {
+    throw new RangeError('QUIC Handshake length smaller than packet number')
+  }
+  if (bytes.length - pos < header.length - packetNumberLength) {
+    throw new RangeError('not enough bytes for QUIC Handshake payload')
+  }
+
+  return {
+    ...header,
+    packetType: QuicLongHeaderPacketType.Handshake,
+    length: header.length,
+    packetNumberOffset: header.packetNumberOffset,
+    packetNumberLength,
+    packetNumber,
+    payloadOffset: pos,
+  }
+}
+
+export function parseQuicHandshakePacketHeaderPrefix(
+  bytes: Uint8Array,
+  offset = 0,
+): QuicHandshakePacketHeaderPrefix {
+  const header = parseQuicLongHeader(bytes, offset)
+  if (header.packetType !== QuicLongHeaderPacketType.Handshake) {
+    throw new RangeError('QUIC packet is not Handshake')
+  }
+
+  let pos = header.offset
+  const encodedLength = decodeVarIntNumber(bytes, pos)
+  pos += encodedLength.bytesRead
+
+  return {
+    ...header,
+    packetType: QuicLongHeaderPacketType.Handshake,
     length: encodedLength.value,
     packetNumberOffset: pos,
   }
