@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
+import { concatBytes } from '../bytes'
 import { bytesToHex, hexToBytes } from '../testing/hex'
 import {
   rfc9001ClientInitialFrames,
@@ -9,7 +10,16 @@ import {
   rfc9001ServerInitialFrames,
 } from '../testing/rfc9001-quic'
 import { deriveQuicInitialKeys } from './crypto'
-import { parseQuicFrames } from './frame'
+import {
+  encodeQuicApplicationConnectionCloseFrame,
+  encodeQuicMaxDataFrame,
+  encodeQuicMaxStreamDataFrame,
+  encodeQuicPaddingFrame,
+  encodeQuicPingFrame,
+  encodeQuicStreamFrame,
+  encodeQuicTransportConnectionCloseFrame,
+  parseQuicFrames,
+} from './frame'
 import { decryptQuicInitialPacket } from './initial'
 
 describe('QUIC frame parsing', () => {
@@ -89,8 +99,103 @@ describe('QUIC frame parsing', () => {
     ])
   })
 
+  test('parses 1-RTT PING and STREAM frame envelopes', () => {
+    const data = hexToBytes('6869')
+    const result = parseQuicFrames(
+      concatBytes([encodeQuicPingFrame(), encodeQuicStreamFrame(4, 0x400, data, true)]),
+    )
+
+    expect(result.frames).toHaveLength(2)
+    expect(result.frames[0]).toEqual({ type: 'ping', offset: 0, endOffset: 1 })
+    expect(result.frames[1]).toEqual({
+      type: 'stream',
+      streamId: 4,
+      streamOffset: 0x400,
+      data,
+      fin: true,
+      offset: 1,
+      endOffset: result.endOffset,
+    })
+  })
+
+  test('parses STREAM frames without length as the remaining payload', () => {
+    const result = parseQuicFrames(hexToBytes('08046869'))
+
+    expect(result.frames).toEqual([
+      {
+        type: 'stream',
+        streamId: 4,
+        streamOffset: 0,
+        data: hexToBytes('6869'),
+        fin: false,
+        offset: 0,
+        endOffset: 4,
+      },
+    ])
+  })
+
+  test('parses flow-control frame envelopes', () => {
+    const result = parseQuicFrames(
+      concatBytes([encodeQuicMaxDataFrame(0x4000), encodeQuicMaxStreamDataFrame(7, 0x8000)]),
+    )
+
+    expect(result.frames).toEqual([
+      { type: 'max-data', maximumData: 0x4000, offset: 0, endOffset: 5 },
+      {
+        type: 'max-stream-data',
+        streamId: 7,
+        maximumStreamData: 0x8000,
+        offset: 5,
+        endOffset: 11,
+      },
+    ])
+  })
+
+  test('parses transport and application CONNECTION_CLOSE frames', () => {
+    const transport = encodeQuicTransportConnectionCloseFrame(0x10, 0x06, hexToBytes('626164'))
+    const application = encodeQuicApplicationConnectionCloseFrame(0x100, hexToBytes('6f6b'))
+
+    expect(parseQuicFrames(transport).frames).toEqual([
+      {
+        type: 'connection-close',
+        errorSpace: 'transport',
+        errorCode: 0x10,
+        frameType: 0x06,
+        reasonPhrase: hexToBytes('626164'),
+        offset: 0,
+        endOffset: transport.length,
+      },
+    ])
+    expect(parseQuicFrames(application).frames).toEqual([
+      {
+        type: 'connection-close',
+        errorSpace: 'application',
+        errorCode: 0x100,
+        frameType: null,
+        reasonPhrase: hexToBytes('6f6b'),
+        offset: 0,
+        endOffset: application.length,
+      },
+    ])
+  })
+
+  test('encodes 1-RTT frame envelopes to exact bytes', () => {
+    expect(bytesToHex(encodeQuicPingFrame())).toBe('01')
+    expect(bytesToHex(encodeQuicStreamFrame(4, 0x400, hexToBytes('6869'), true))).toBe(
+      '0f044400026869',
+    )
+    expect(bytesToHex(encodeQuicMaxDataFrame(0x4000))).toBe('1080004000')
+    expect(bytesToHex(encodeQuicMaxStreamDataFrame(7, 0x8000))).toBe('110780008000')
+    expect(
+      bytesToHex(encodeQuicTransportConnectionCloseFrame(0x10, 0x06, hexToBytes('626164'))),
+    ).toBe('1c100603626164')
+    expect(bytesToHex(encodeQuicApplicationConnectionCloseFrame(0x100, hexToBytes('6f6b')))).toBe(
+      '1d4100026f6b',
+    )
+  })
+
   test('rejects unsupported frame type', () => {
-    expect(() => parseQuicFrames(hexToBytes('01'))).toThrow('unsupported QUIC frame type 0x1')
+    expect(() => parseQuicFrames(hexToBytes('04'))).toThrow('unsupported QUIC frame type 0x4')
   })
 
   test('rejects unsupported multi-byte frame type', () => {
@@ -107,6 +212,23 @@ describe('QUIC frame parsing', () => {
     expect(() => parseQuicFrames(hexToBytes('060005aabbcc'))).toThrow(
       'not enough bytes for QUIC CRYPTO frame data',
     )
+  })
+
+  test('rejects truncated STREAM frame data', () => {
+    expect(() => parseQuicFrames(hexToBytes('0a0105aabbcc'))).toThrow(
+      'not enough bytes for QUIC STREAM frame data',
+    )
+  })
+
+  test('rejects truncated CONNECTION_CLOSE reason', () => {
+    expect(() => parseQuicFrames(hexToBytes('1c1006036261'))).toThrow(
+      'not enough bytes for QUIC CONNECTION_CLOSE reason',
+    )
+  })
+
+  test('encodes PADDING frames with validated length', () => {
+    expect(encodeQuicPaddingFrame(3)).toEqual(hexToBytes('000000'))
+    expect(() => encodeQuicPaddingFrame(-1)).toThrow('QUIC PADDING length out of range')
   })
 
   test('rejects ACK first range underflow', () => {

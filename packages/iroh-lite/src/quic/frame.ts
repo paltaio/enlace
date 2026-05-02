@@ -1,18 +1,39 @@
-import { copyBytes, readU8 } from '../bytes'
-import { decodeVarIntNumber } from '../varint'
+import { concatBytes, copyBytes, readU8 } from '../bytes'
+import { decodeVarIntNumber, encodeVarInt } from '../varint'
 
 export const QuicFrameType = {
   Padding: 0x00,
+  Ping: 0x01,
   Ack: 0x02,
   AckEcn: 0x03,
   Crypto: 0x06,
+  StreamBase: 0x08,
+  MaxData: 0x10,
+  MaxStreamData: 0x11,
+  ConnectionCloseTransport: 0x1c,
+  ConnectionCloseApplication: 0x1d,
 } as const
 
-export type QuicFrame = QuicPaddingFrame | QuicAckFrame | QuicAckEcnFrame | QuicCryptoFrame
+export type QuicFrame =
+  | QuicPaddingFrame
+  | QuicPingFrame
+  | QuicAckFrame
+  | QuicAckEcnFrame
+  | QuicCryptoFrame
+  | QuicStreamFrame
+  | QuicMaxDataFrame
+  | QuicMaxStreamDataFrame
+  | QuicConnectionCloseFrame
 
 export interface QuicPaddingFrame {
   readonly type: 'padding'
   readonly length: number
+  readonly offset: number
+  readonly endOffset: number
+}
+
+export interface QuicPingFrame {
+  readonly type: 'ping'
   readonly offset: number
   readonly endOffset: number
 }
@@ -51,9 +72,127 @@ export interface QuicCryptoFrame {
   readonly endOffset: number
 }
 
+export interface QuicStreamFrame {
+  readonly type: 'stream'
+  readonly streamId: number
+  readonly streamOffset: number
+  readonly data: Uint8Array
+  readonly fin: boolean
+  readonly offset: number
+  readonly endOffset: number
+}
+
+export interface QuicMaxDataFrame {
+  readonly type: 'max-data'
+  readonly maximumData: number
+  readonly offset: number
+  readonly endOffset: number
+}
+
+export interface QuicMaxStreamDataFrame {
+  readonly type: 'max-stream-data'
+  readonly streamId: number
+  readonly maximumStreamData: number
+  readonly offset: number
+  readonly endOffset: number
+}
+
+export type QuicConnectionCloseFrame =
+  | QuicTransportConnectionCloseFrame
+  | QuicApplicationConnectionCloseFrame
+
+export interface QuicTransportConnectionCloseFrame {
+  readonly type: 'connection-close'
+  readonly errorSpace: 'transport'
+  readonly errorCode: number
+  readonly frameType: number
+  readonly reasonPhrase: Uint8Array
+  readonly offset: number
+  readonly endOffset: number
+}
+
+export interface QuicApplicationConnectionCloseFrame {
+  readonly type: 'connection-close'
+  readonly errorSpace: 'application'
+  readonly errorCode: number
+  readonly frameType: null
+  readonly reasonPhrase: Uint8Array
+  readonly offset: number
+  readonly endOffset: number
+}
+
 export interface QuicFramesParseResult {
   readonly frames: readonly QuicFrame[]
   readonly endOffset: number
+}
+
+export function encodeQuicPaddingFrame(length: number): Uint8Array {
+  if (!Number.isSafeInteger(length) || length < 0) {
+    throw new RangeError('QUIC PADDING length out of range')
+  }
+  return new Uint8Array(length)
+}
+
+export function encodeQuicPingFrame(): Uint8Array {
+  return new Uint8Array([QuicFrameType.Ping])
+}
+
+export function encodeQuicStreamFrame(
+  streamId: number,
+  streamOffset: number,
+  data: Uint8Array,
+  fin: boolean,
+): Uint8Array {
+  const hasOffset = streamOffset !== 0
+  const frameType = QuicFrameType.StreamBase | (hasOffset ? 0x04 : 0) | 0x02 | (fin ? 0x01 : 0)
+  return concatBytes([
+    new Uint8Array([frameType]),
+    encodeVarInt(streamId),
+    ...(hasOffset ? [encodeVarInt(streamOffset)] : []),
+    encodeVarInt(data.length),
+    data,
+  ])
+}
+
+export function encodeQuicMaxDataFrame(maximumData: number): Uint8Array {
+  return concatBytes([new Uint8Array([QuicFrameType.MaxData]), encodeVarInt(maximumData)])
+}
+
+export function encodeQuicMaxStreamDataFrame(
+  streamId: number,
+  maximumStreamData: number,
+): Uint8Array {
+  return concatBytes([
+    new Uint8Array([QuicFrameType.MaxStreamData]),
+    encodeVarInt(streamId),
+    encodeVarInt(maximumStreamData),
+  ])
+}
+
+export function encodeQuicTransportConnectionCloseFrame(
+  errorCode: number,
+  frameType: number,
+  reasonPhrase: Uint8Array,
+): Uint8Array {
+  return concatBytes([
+    new Uint8Array([QuicFrameType.ConnectionCloseTransport]),
+    encodeVarInt(errorCode),
+    encodeVarInt(frameType),
+    encodeVarInt(reasonPhrase.length),
+    reasonPhrase,
+  ])
+}
+
+export function encodeQuicApplicationConnectionCloseFrame(
+  errorCode: number,
+  reasonPhrase: Uint8Array,
+): Uint8Array {
+  return concatBytes([
+    new Uint8Array([QuicFrameType.ConnectionCloseApplication]),
+    encodeVarInt(errorCode),
+    encodeVarInt(reasonPhrase.length),
+    reasonPhrase,
+  ])
 }
 
 export function parseQuicFrames(bytes: Uint8Array, offset = 0): QuicFramesParseResult {
@@ -69,6 +208,12 @@ export function parseQuicFrames(bytes: Uint8Array, offset = 0): QuicFramesParseR
       pos = frame.endOffset
       continue
     }
+    if (frameType === QuicFrameType.Ping) {
+      const frame = parsePingFrame(pos)
+      frames.push(frame)
+      pos = frame.endOffset
+      continue
+    }
     if (frameType === QuicFrameType.Crypto) {
       const frame = parseCryptoFrame(bytes, pos)
       frames.push(frame)
@@ -77,6 +222,33 @@ export function parseQuicFrames(bytes: Uint8Array, offset = 0): QuicFramesParseR
     }
     if (frameType === QuicFrameType.Ack || frameType === QuicFrameType.AckEcn) {
       const frame = parseAckFrame(bytes, pos, frameType)
+      frames.push(frame)
+      pos = frame.endOffset
+      continue
+    }
+    if (isStreamFrameType(frameType)) {
+      const frame = parseStreamFrame(bytes, pos, frameType)
+      frames.push(frame)
+      pos = frame.endOffset
+      continue
+    }
+    if (frameType === QuicFrameType.MaxData) {
+      const frame = parseMaxDataFrame(bytes, pos)
+      frames.push(frame)
+      pos = frame.endOffset
+      continue
+    }
+    if (frameType === QuicFrameType.MaxStreamData) {
+      const frame = parseMaxStreamDataFrame(bytes, pos)
+      frames.push(frame)
+      pos = frame.endOffset
+      continue
+    }
+    if (
+      frameType === QuicFrameType.ConnectionCloseTransport ||
+      frameType === QuicFrameType.ConnectionCloseApplication
+    ) {
+      const frame = parseConnectionCloseFrame(bytes, pos, frameType)
       frames.push(frame)
       pos = frame.endOffset
       continue
@@ -98,6 +270,14 @@ function parsePaddingFrame(bytes: Uint8Array, offset: number): QuicPaddingFrame 
     length: pos - offset,
     offset,
     endOffset: pos,
+  }
+}
+
+function parsePingFrame(offset: number): QuicPingFrame {
+  return {
+    type: 'ping',
+    offset,
+    endOffset: offset + 1,
   }
 }
 
@@ -173,6 +353,110 @@ function parseAckFrame(
   }
 }
 
+function parseStreamFrame(bytes: Uint8Array, offset: number, frameType: number): QuicStreamFrame {
+  let pos = offset + 1
+  const streamId = decodeVarIntNumber(bytes, pos)
+  pos += streamId.bytesRead
+  let streamOffset = 0
+  if ((frameType & 0x04) !== 0) {
+    const decodedOffset = decodeVarIntNumber(bytes, pos)
+    pos += decodedOffset.bytesRead
+    streamOffset = decodedOffset.value
+  }
+
+  let dataLength = bytes.length - pos
+  if ((frameType & 0x02) !== 0) {
+    const decodedLength = decodeVarIntNumber(bytes, pos)
+    pos += decodedLength.bytesRead
+    dataLength = decodedLength.value
+  }
+  if (bytes.length - pos < dataLength) {
+    throw new RangeError('not enough bytes for QUIC STREAM frame data')
+  }
+  const endOffset = pos + dataLength
+
+  return {
+    type: 'stream',
+    streamId: streamId.value,
+    streamOffset,
+    data: copyBytes(bytes.subarray(pos, endOffset)),
+    fin: (frameType & 0x01) !== 0,
+    offset,
+    endOffset,
+  }
+}
+
+function parseMaxDataFrame(bytes: Uint8Array, offset: number): QuicMaxDataFrame {
+  const maximumData = decodeVarIntNumber(bytes, offset + 1)
+  return {
+    type: 'max-data',
+    maximumData: maximumData.value,
+    offset,
+    endOffset: offset + 1 + maximumData.bytesRead,
+  }
+}
+
+function parseMaxStreamDataFrame(bytes: Uint8Array, offset: number): QuicMaxStreamDataFrame {
+  let pos = offset + 1
+  const streamId = decodeVarIntNumber(bytes, pos)
+  pos += streamId.bytesRead
+  const maximumStreamData = decodeVarIntNumber(bytes, pos)
+  pos += maximumStreamData.bytesRead
+
+  return {
+    type: 'max-stream-data',
+    streamId: streamId.value,
+    maximumStreamData: maximumStreamData.value,
+    offset,
+    endOffset: pos,
+  }
+}
+
+function parseConnectionCloseFrame(
+  bytes: Uint8Array,
+  offset: number,
+  frameType:
+    | typeof QuicFrameType.ConnectionCloseTransport
+    | typeof QuicFrameType.ConnectionCloseApplication,
+): QuicConnectionCloseFrame {
+  let pos = offset + 1
+  const errorCode = decodeVarIntNumber(bytes, pos)
+  pos += errorCode.bytesRead
+  let closedFrameType: number | null = null
+  if (frameType === QuicFrameType.ConnectionCloseTransport) {
+    const decodedFrameType = decodeVarIntNumber(bytes, pos)
+    pos += decodedFrameType.bytesRead
+    closedFrameType = decodedFrameType.value
+  }
+  const reasonLength = decodeVarIntNumber(bytes, pos)
+  pos += reasonLength.bytesRead
+  if (bytes.length - pos < reasonLength.value) {
+    throw new RangeError('not enough bytes for QUIC CONNECTION_CLOSE reason')
+  }
+  const endOffset = pos + reasonLength.value
+  const base = {
+    type: 'connection-close',
+    errorCode: errorCode.value,
+    reasonPhrase: copyBytes(bytes.subarray(pos, endOffset)),
+    offset,
+    endOffset,
+  } as const
+
+  if (closedFrameType === null) {
+    return {
+      ...base,
+      errorSpace: 'application',
+      frameType: null,
+    }
+  }
+
+  return {
+    ...base,
+    errorSpace: 'transport',
+    frameType: closedFrameType,
+  }
+}
+
 function validateFirstAckRange(largestAcknowledged: number, firstAckRange: number): void {
   if (firstAckRange > largestAcknowledged) {
     throw new RangeError('QUIC ACK first range exceeds largest acknowledged')
@@ -230,6 +514,10 @@ function readQuicFrameType(bytes: Uint8Array, offset: number): number {
     throw new RangeError('QUIC frame type must use shortest encoding')
   }
   return decoded.value
+}
+
+function isStreamFrameType(frameType: number): boolean {
+  return (frameType & 0xf8) === QuicFrameType.StreamBase
 }
 
 function validateOffset(bytes: Uint8Array, offset: number): void {
