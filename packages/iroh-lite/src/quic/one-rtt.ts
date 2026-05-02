@@ -1,5 +1,10 @@
 import { concatBytes, copyBytes, readU8 } from '../bytes'
 import {
+  receiveQuicOneRttPlaintextFrames,
+  type QuicAckReceiveSnapshot,
+  type QuicAckReceiveTracker,
+} from './ack'
+import {
   createQuicHeaderProtectionMask,
   decryptQuicAes128GcmPacket,
   encryptQuicAes128GcmPacket,
@@ -7,6 +12,7 @@ import {
   removeQuicHeaderProtection,
   type QuicDirectionalKeys,
 } from './crypto'
+import type { QuicFrame } from './frame'
 import {
   nextExpectedQuicPacketNumber,
   quicPacketNumberToBigInt,
@@ -37,6 +43,13 @@ export interface QuicOneRttPacketDecryptionResult {
 
 export interface QuicOneRttPacketReceiveResult extends QuicOneRttPacketDecryptionResult {
   readonly largestReceivedPacketNumber: bigint
+}
+
+export interface QuicOneRttPacketFrameReceiveResult extends QuicOneRttPacketReceiveResult {
+  readonly frames: readonly QuicFrame[]
+  readonly ackEliciting: boolean
+  readonly ackSnapshot: QuicAckReceiveSnapshot
+  readonly ackFrame: Uint8Array | null
 }
 
 export interface QuicOneRttPacketProtectionOptions {
@@ -166,6 +179,38 @@ export function receiveQuicOneRttPacket(
       largestReceivedPacketNumber,
       result.packetNumber,
     ),
+  }
+}
+
+export function receiveQuicOneRttPacketFrames(
+  packet: Uint8Array,
+  keys: QuicDirectionalKeys,
+  destinationConnectionIdLength: number,
+  largestReceivedPacketNumber: number | bigint | null,
+  ackTracker: QuicAckReceiveTracker,
+  offset = 0,
+  ackDelay = 0,
+): QuicOneRttPacketFrameReceiveResult {
+  const receivedPacket = receiveQuicOneRttPacket(
+    packet,
+    keys,
+    destinationConnectionIdLength,
+    largestReceivedPacketNumber,
+    offset,
+  )
+  const receivedFrames = receiveQuicOneRttPlaintextFrames(
+    receivedPacket.packetNumber,
+    receivedPacket.payload,
+    ackTracker,
+    ackDelay,
+  )
+
+  return {
+    ...receivedPacket,
+    frames: receivedFrames.frames,
+    ackEliciting: receivedFrames.ackEliciting,
+    ackSnapshot: receivedFrames.ackSnapshot,
+    ackFrame: receivedFrames.ackFrame,
   }
 }
 

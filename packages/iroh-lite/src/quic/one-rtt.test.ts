@@ -4,13 +4,22 @@ import { concatBytes, readU8 } from '../bytes'
 import { bytesToHex, hexToBytes } from '../testing/hex'
 import { rfc8448ClientPrivateKey } from '../testing/rfc8448-tls'
 import { tlsHandshakeStateFixture } from '../testing/tls-handshake-fixtures'
+import { QuicAckReceiveTracker } from './ack'
 import type { QuicDirectionalKeys } from './crypto'
-import { encodeQuicPaddingFrame, encodeQuicPingFrame, parseQuicFrames } from './frame'
+import {
+  encodeQuicAckFrame,
+  encodeQuicApplicationConnectionCloseFrame,
+  encodeQuicPaddingFrame,
+  encodeQuicPingFrame,
+  encodeQuicStreamFrame,
+  parseQuicFrames,
+} from './frame'
 import {
   decryptQuicOneRttPacket,
   encryptQuicOneRttPacket,
   parseQuicOneRttPacketHeader,
   receiveQuicOneRttPacket,
+  receiveQuicOneRttPacketFrames,
 } from './one-rtt'
 import { deriveTls13ApplicationTrafficFromHandshakeState } from './tls-application-traffic'
 import { verifyTls13ClientHandshakeState } from './tls-handshake-state'
@@ -178,6 +187,173 @@ describe('QUIC 1-RTT short-header packet foundation', () => {
         payload: hexToBytes('00'),
       }),
     ).toThrow('QUIC packet number out of range')
+  })
+})
+
+describe('QUIC 1-RTT packet frame receiving', () => {
+  test('parses PING packets and emits a parser-compatible ACK', async () => {
+    const keys = await applicationTrafficKeys()
+    const destinationConnectionId = hexToBytes('01020304')
+    const tracker = new QuicAckReceiveTracker()
+    const packet = encryptQuicOneRttPacket(keys.server, {
+      destinationConnectionId,
+      packetNumber: 8,
+      packetNumberLength: 2,
+      payload: concatBytes([encodeQuicPaddingFrame(1), encodeQuicPingFrame()]),
+    })
+    const result = receiveQuicOneRttPacketFrames(
+      packet,
+      keys.server,
+      destinationConnectionId.length,
+      null,
+      tracker,
+      0,
+      2,
+    )
+    const ackFrame = result.ackFrame
+    if (ackFrame === null) {
+      throw new Error('expected ACK frame')
+    }
+
+    expect(result.packetNumber).toBe(8n)
+    expect(result.largestReceivedPacketNumber).toBe(8n)
+    expect(result.ackEliciting).toBe(true)
+    expect(result.ackSnapshot).toEqual({
+      receivedPacketNumbers: [8n],
+      largestReceivedPacketNumber: 8n,
+    })
+    expect(result.frames.map((frame) => frame.type)).toEqual(['padding', 'ping'])
+    expect(parseQuicFrames(ackFrame).frames).toEqual([
+      {
+        type: 'ack',
+        largestAcknowledged: 8n,
+        ackDelay: 2,
+        firstAckRange: 0n,
+        ranges: [],
+        offset: 0,
+        endOffset: ackFrame.length,
+      },
+    ])
+  })
+
+  test('does not emit ACK for ACK-only, PADDING-only, or CONNECTION_CLOSE-only packets', async () => {
+    const keys = await applicationTrafficKeys()
+    const destinationConnectionId = hexToBytes('01020304')
+    const tracker = new QuicAckReceiveTracker()
+    const payloads = [
+      encodeQuicAckFrame([1]),
+      encodeQuicPaddingFrame(3),
+      encodeQuicApplicationConnectionCloseFrame(0, new Uint8Array()),
+    ]
+    let largestReceivedPacketNumber: bigint | null = null
+
+    for (const [index, payload] of payloads.entries()) {
+      const packet = encryptQuicOneRttPacket(keys.client, {
+        destinationConnectionId,
+        packetNumber: index + 1,
+        packetNumberLength: 1,
+        payload,
+      })
+      const result = receiveQuicOneRttPacketFrames(
+        packet,
+        keys.client,
+        destinationConnectionId.length,
+        largestReceivedPacketNumber,
+        tracker,
+      )
+      largestReceivedPacketNumber = result.largestReceivedPacketNumber
+
+      expect(result.ackEliciting).toBe(false)
+      expect(result.ackFrame).toBeNull()
+    }
+
+    expect(largestReceivedPacketNumber).toBe(3n)
+    expect(tracker.snapshot()).toEqual({
+      receivedPacketNumbers: [],
+      largestReceivedPacketNumber: null,
+    })
+  })
+
+  test('parses STREAM packets as ack-eliciting without stream state', async () => {
+    const keys = await applicationTrafficKeys()
+    const destinationConnectionId = hexToBytes('01020304')
+    const tracker = new QuicAckReceiveTracker()
+    const payload = encodeQuicStreamFrame(0, 0, new Uint8Array([0x68, 0x69]), false)
+    const packet = encryptQuicOneRttPacket(keys.client, {
+      destinationConnectionId,
+      packetNumber: 11,
+      packetNumberLength: 2,
+      payload,
+    })
+    const result = receiveQuicOneRttPacketFrames(
+      packet,
+      keys.client,
+      destinationConnectionId.length,
+      null,
+      tracker,
+    )
+
+    expect(result.frames[0]?.type).toBe('stream')
+    expect(result.ackEliciting).toBe(true)
+    expect(result.ackFrame).not.toBeNull()
+    expect(result.ackSnapshot.largestReceivedPacketNumber).toBe(11n)
+  })
+
+  test('duplicate ack-eliciting packet numbers keep ACK output idempotent', async () => {
+    const keys = await applicationTrafficKeys()
+    const destinationConnectionId = hexToBytes('01020304')
+    const tracker = new QuicAckReceiveTracker()
+    const packet = encryptQuicOneRttPacket(keys.server, {
+      destinationConnectionId,
+      packetNumber: 21,
+      packetNumberLength: 2,
+      payload: concatBytes([encodeQuicPaddingFrame(1), encodeQuicPingFrame()]),
+    })
+    const first = receiveQuicOneRttPacketFrames(
+      packet,
+      keys.server,
+      destinationConnectionId.length,
+      null,
+      tracker,
+    )
+    const second = receiveQuicOneRttPacketFrames(
+      packet,
+      keys.server,
+      destinationConnectionId.length,
+      first.largestReceivedPacketNumber,
+      tracker,
+    )
+
+    expect(second.packetNumber).toBe(21n)
+    expect(second.largestReceivedPacketNumber).toBe(21n)
+    expect(second.ackSnapshot).toEqual(first.ackSnapshot)
+    if (first.ackFrame === null || second.ackFrame === null) {
+      throw new Error('expected ACK frames')
+    }
+    expect(bytesToHex(second.ackFrame)).toBe(bytesToHex(first.ackFrame))
+  })
+
+  test('rejects malformed frames after packet decryption', async () => {
+    const keys = await applicationTrafficKeys()
+    const destinationConnectionId = hexToBytes('01020304')
+    const tracker = new QuicAckReceiveTracker()
+    const packet = encryptQuicOneRttPacket(keys.server, {
+      destinationConnectionId,
+      packetNumber: 9,
+      packetNumberLength: 2,
+      payload: new Uint8Array([0x0a, 0x01, 0x05, 0xaa]),
+    })
+
+    expect(() =>
+      receiveQuicOneRttPacketFrames(
+        packet,
+        keys.server,
+        destinationConnectionId.length,
+        null,
+        tracker,
+      ),
+    ).toThrow('not enough bytes for QUIC STREAM frame data')
+    expect(tracker.snapshot().receivedPacketNumbers).toEqual([])
   })
 })
 
