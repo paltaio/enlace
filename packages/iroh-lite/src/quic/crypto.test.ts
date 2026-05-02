@@ -12,6 +12,7 @@ import {
 import {
   createQuicHeaderProtectionMask,
   decryptQuicAes128GcmPacket,
+  deriveQuicDirectionalKeys,
   deriveQuicInitialKeys,
   deriveQuicInitialSecrets,
   encryptQuicAes128GcmPacket,
@@ -44,6 +45,12 @@ describe('QUIC Initial key derivation', () => {
     expect(bytesToHex(keys.server.packetKey)).toBe('cf3a5331653c364c88f0f379b6067e37')
     expect(bytesToHex(keys.server.packetIv)).toBe('0ac1493ca1905853b0bba03e')
     expect(bytesToHex(keys.server.headerProtectionKey)).toBe('c206b8d9b9f0f37644430b490eeaa314')
+  })
+
+  test('rejects wrong-length traffic secrets', () => {
+    expect(() => deriveQuicDirectionalKeys(hexToBytes('00'))).toThrow(
+      'QUIC traffic secret must be 32 bytes',
+    )
   })
 })
 

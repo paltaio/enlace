@@ -1,11 +1,10 @@
 import { ecb, gcm } from '@noble/ciphers/aes.js'
-import { expand, extract } from '@noble/hashes/hkdf.js'
+import { extract } from '@noble/hashes/hkdf.js'
 import { sha256 } from '@noble/hashes/sha2.js'
-import { utf8ToBytes } from '@noble/hashes/utils.js'
 
-import { concatBytes, copyBytes, readU8, requireLength, writeU16BE } from '../bytes'
+import { copyBytes, readU8, requireLength } from '../bytes'
+import { hkdfExpandTls13LabelSha256 } from '../crypto/hkdf'
 
-const TLS13_LABEL_PREFIX = utf8ToBytes('tls13 ')
 const CLIENT_INITIAL_LABEL = 'client in'
 const SERVER_INITIAL_LABEL = 'server in'
 const QUIC_PACKET_KEY_LABEL = 'quic key'
@@ -30,12 +29,14 @@ export interface QuicInitialSecrets {
   readonly server: Uint8Array
 }
 
-export interface QuicInitialDirectionalKeys {
+export interface QuicDirectionalKeys {
   readonly secret: Uint8Array
   readonly packetKey: Uint8Array
   readonly packetIv: Uint8Array
   readonly headerProtectionKey: Uint8Array
 }
+
+export type QuicInitialDirectionalKeys = QuicDirectionalKeys
 
 export interface QuicInitialKeys {
   readonly client: QuicInitialDirectionalKeys
@@ -52,16 +53,51 @@ export function deriveQuicInitialSecrets(destinationConnectionId: Uint8Array): Q
   const initial = extract(sha256, destinationConnectionId, QUIC_V1_INITIAL_SALT)
   return {
     initial,
-    client: hkdfExpandLabel(initial, CLIENT_INITIAL_LABEL, QUIC_INITIAL_SECRET_LENGTH),
-    server: hkdfExpandLabel(initial, SERVER_INITIAL_LABEL, QUIC_INITIAL_SECRET_LENGTH),
+    client: hkdfExpandTls13LabelSha256(
+      initial,
+      CLIENT_INITIAL_LABEL,
+      new Uint8Array(),
+      QUIC_INITIAL_SECRET_LENGTH,
+    ),
+    server: hkdfExpandTls13LabelSha256(
+      initial,
+      SERVER_INITIAL_LABEL,
+      new Uint8Array(),
+      QUIC_INITIAL_SECRET_LENGTH,
+    ),
   }
 }
 
 export function deriveQuicInitialKeys(destinationConnectionId: Uint8Array): QuicInitialKeys {
   const secrets = deriveQuicInitialSecrets(destinationConnectionId)
   return {
-    client: deriveDirectionalKeys(secrets.client),
-    server: deriveDirectionalKeys(secrets.server),
+    client: deriveQuicDirectionalKeys(secrets.client),
+    server: deriveQuicDirectionalKeys(secrets.server),
+  }
+}
+
+export function deriveQuicDirectionalKeys(secret: Uint8Array): QuicDirectionalKeys {
+  requireLength(secret, QUIC_INITIAL_SECRET_LENGTH, 'QUIC traffic secret')
+  return {
+    secret,
+    packetKey: hkdfExpandTls13LabelSha256(
+      secret,
+      QUIC_PACKET_KEY_LABEL,
+      new Uint8Array(),
+      QUIC_AES_128_KEY_LENGTH,
+    ),
+    packetIv: hkdfExpandTls13LabelSha256(
+      secret,
+      QUIC_PACKET_IV_LABEL,
+      new Uint8Array(),
+      QUIC_AES_128_IV_LENGTH,
+    ),
+    headerProtectionKey: hkdfExpandTls13LabelSha256(
+      secret,
+      QUIC_HEADER_PROTECTION_KEY_LABEL,
+      new Uint8Array(),
+      QUIC_AES_128_KEY_LENGTH,
+    ),
   }
 }
 
@@ -145,36 +181,6 @@ export function headerProtectionSample(packet: Uint8Array, packetNumberOffset: n
   return copyBytes(
     packet.subarray(sampleOffset, sampleOffset + QUIC_HEADER_PROTECTION_SAMPLE_LENGTH),
   )
-}
-
-function deriveDirectionalKeys(secret: Uint8Array): QuicInitialDirectionalKeys {
-  return {
-    secret,
-    packetKey: hkdfExpandLabel(secret, QUIC_PACKET_KEY_LABEL, QUIC_AES_128_KEY_LENGTH),
-    packetIv: hkdfExpandLabel(secret, QUIC_PACKET_IV_LABEL, QUIC_AES_128_IV_LENGTH),
-    headerProtectionKey: hkdfExpandLabel(
-      secret,
-      QUIC_HEADER_PROTECTION_KEY_LABEL,
-      QUIC_AES_128_KEY_LENGTH,
-    ),
-  }
-}
-
-function hkdfExpandLabel(secret: Uint8Array, label: string, length: number): Uint8Array {
-  if (!Number.isInteger(length) || length < 0 || length > 0xffff) {
-    throw new RangeError('HKDF label length out of range')
-  }
-  const fullLabel = concatBytes([TLS13_LABEL_PREFIX, utf8ToBytes(label)])
-  if (fullLabel.length > 0xff) {
-    throw new RangeError('HKDF label too long')
-  }
-  const hkdfLabel = concatBytes([
-    writeU16BE(length),
-    new Uint8Array([fullLabel.length]),
-    fullLabel,
-    new Uint8Array([0]),
-  ])
-  return expand(sha256, secret, hkdfLabel, length)
 }
 
 function packetNumberToBigInt(packetNumber: number | bigint): bigint {
