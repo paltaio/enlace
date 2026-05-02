@@ -3,6 +3,7 @@ import { decodeVarIntNumber } from '../varint'
 
 export const QUIC_VERSION_1 = 0x00000001
 export const QUIC_MAX_PACKET_NUMBER = 0x3fffffffffffffffn
+export const QUIC_MAX_CONNECTION_ID_LENGTH = 20
 
 export const QuicLongHeaderPacketType = {
   Initial: 'initial',
@@ -211,6 +212,26 @@ export function readQuicPacketNumber(bytes: Uint8Array, offset: number, length: 
     packetNumber = packetNumber * 0x100 + readU8(bytes, offset + index)
   }
   return packetNumber
+}
+
+export function validateQuicConnectionIdLength(bytes: Uint8Array, name: string): void {
+  if (bytes.length > QUIC_MAX_CONNECTION_ID_LENGTH) {
+    throw new RangeError(`QUIC ${name} length out of range`)
+  }
+}
+
+export function encodeQuicTruncatedPacketNumber(
+  packetNumber: number | bigint,
+  length: number,
+): Uint8Array {
+  validatePacketNumberLength(length)
+  let remaining = quicPacketNumberToBigInt(packetNumber)
+  const bytes = new Uint8Array(length)
+  for (let index = length - 1; index >= 0; index -= 1) {
+    bytes[index] = Number(remaining & 0xffn)
+    remaining >>= 8n
+  }
+  return bytes
 }
 
 export function recoverQuicPacketNumber(

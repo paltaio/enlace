@@ -1,6 +1,5 @@
 import { describe, expect, test } from 'bun:test'
 
-import { concatBytes, readU8 } from '../bytes'
 import {
   rfc8448ClientHandshakeTrafficSecret,
   rfc8448ClientHello,
@@ -9,16 +8,13 @@ import {
   rfc8448ServerHello,
 } from '../testing/rfc8448-tls'
 import { bytesToHex } from '../testing/hex'
-import { encodeVarInt } from '../varint'
-import {
-  createQuicHeaderProtectionMask,
-  deriveQuicDirectionalKeys,
-  encryptQuicAes128GcmPacket,
-  headerProtectionSample,
-  type QuicDirectionalKeys,
-} from './crypto'
+import { deriveQuicDirectionalKeys, type QuicDirectionalKeys } from './crypto'
 import type { QuicCryptoFrame } from './frame'
-import { decryptQuicHandshakePacket, deriveQuicHandshakeKeysFromTlsCrypto } from './handshake'
+import {
+  decryptQuicHandshakePacket,
+  deriveQuicHandshakeKeysFromTlsCrypto,
+  encryptQuicHandshakePacket,
+} from './handshake'
 import { TlsHandshakeRole } from './tls-handshake'
 import { collectQuicTlsHandshakeMessages } from './tls-crypto-stream'
 
@@ -53,6 +49,43 @@ describe('QUIC Handshake key derivation', () => {
 })
 
 describe('QUIC Handshake packet decryption', () => {
+  test('protects and decrypts a Handshake packet', () => {
+    const keys = deriveQuicDirectionalKeys(rfc8448ServerHandshakeTrafficSecret)
+    const packet = encryptQuicHandshakePacket(keys, {
+      destinationConnectionId: new Uint8Array([0x01, 0x02, 0x03, 0x04]),
+      sourceConnectionId: new Uint8Array([0x06, 0x07, 0x08, 0x09, 0x0a]),
+      packetNumber: 7,
+      packetNumberLength: 2,
+      payload: rfc8448ServerHello,
+    })
+    const result = decryptQuicHandshakePacket(packet, keys)
+
+    expect(result.header.firstByte).toBe(0xe1)
+    expect(result.header.length).toBe(2 + rfc8448ServerHello.length + 16)
+    expect(result.header.packetNumberLength).toBe(2)
+    expect(result.header.packetNumber).toBe(7)
+    expect(result.packetNumber).toBe(7n)
+    expect(result.payload).toEqual(rfc8448ServerHello)
+    expect(result.endOffset).toBe(packet.length)
+  })
+
+  test('recovers wrapped Handshake packet numbers for nonce construction', () => {
+    const keys = deriveQuicDirectionalKeys(rfc8448ServerHandshakeTrafficSecret)
+    const payload = new Uint8Array(16)
+    const packet = encryptQuicHandshakePacket(keys, {
+      destinationConnectionId: new Uint8Array([0x01, 0x02, 0x03, 0x04]),
+      sourceConnectionId: new Uint8Array([0x06, 0x07, 0x08, 0x09, 0x0a]),
+      packetNumber: 256,
+      packetNumberLength: 1,
+      payload,
+    })
+    const result = decryptQuicHandshakePacket(packet, keys, 0, 256)
+
+    expect(result.header.packetNumber).toBe(0)
+    expect(result.packetNumber).toBe(256n)
+    expect(result.payload).toEqual(payload)
+  })
+
   test('unprotects and decrypts a protected Handshake packet', () => {
     const keys = deriveQuicDirectionalKeys(rfc8448ClientHandshakeTrafficSecret)
     const packet = createProtectedHandshakePacket(keys, 1, new Uint8Array([0x00]))
@@ -62,10 +95,25 @@ describe('QUIC Handshake packet decryption', () => {
     expect(result.header.length).toBe(20)
     expect(result.header.packetNumberLength).toBe(3)
     expect(result.header.packetNumber).toBe(1)
+    expect(result.packetNumber).toBe(1n)
     expect(result.header.packetNumberOffset).toBe(17)
     expect(result.header.payloadOffset).toBe(20)
     expect(result.payload).toEqual(new Uint8Array([0x00]))
     expect(result.endOffset).toBe(packet.length)
+  })
+
+  test('rejects oversized Handshake connection ids', () => {
+    const keys = deriveQuicDirectionalKeys(rfc8448ClientHandshakeTrafficSecret)
+
+    expect(() =>
+      encryptQuicHandshakePacket(keys, {
+        destinationConnectionId: new Uint8Array(21),
+        sourceConnectionId: new Uint8Array(),
+        packetNumber: 0,
+        packetNumberLength: 1,
+        payload: new Uint8Array(16),
+      }),
+    ).toThrow('QUIC destination connection id length out of range')
   })
 
   test('rejects truncated protected Handshake packets', () => {
@@ -83,42 +131,13 @@ function createProtectedHandshakePacket(
   packetNumber: number,
   plaintext: Uint8Array,
 ): Uint8Array {
-  const packetNumberBytes = new Uint8Array([
-    (packetNumber >>> 16) & 0xff,
-    (packetNumber >>> 8) & 0xff,
-    packetNumber & 0xff,
-  ])
-  const header = concatBytes([
-    new Uint8Array([0xe2]),
-    new Uint8Array([0x00, 0x00, 0x00, 0x01]),
-    new Uint8Array([0x04, 0x01, 0x02, 0x03, 0x04]),
-    new Uint8Array([0x05, 0x06, 0x07, 0x08, 0x09, 0x0a]),
-    encodeVarInt(packetNumberBytes.length + plaintext.length + 16),
-    packetNumberBytes,
-  ])
-  const ciphertext = encryptQuicAes128GcmPacket(keys, packetNumber, header, plaintext)
-  const packetNumberOffset = header.length - packetNumberBytes.length
-  return applyLongHeaderProtection(concatBytes([header, ciphertext]), packetNumberOffset, keys)
-}
-
-function applyLongHeaderProtection(
-  packet: Uint8Array,
-  packetNumberOffset: number,
-  keys: QuicDirectionalKeys,
-): Uint8Array {
-  const protectedPacket = new Uint8Array(packet)
-  const sample = headerProtectionSample(packet, packetNumberOffset)
-  const mask = createQuicHeaderProtectionMask(keys.headerProtectionKey, sample)
-  protectedPacket[0] = readU8(protectedPacket, 0) ^ (readU8(mask, 0) & 0x0f)
-
-  const packetNumberLength = (readU8(packet, 0) & 0x03) + 1
-  for (let index = 0; index < packetNumberLength; index += 1) {
-    const packetNumberIndex = packetNumberOffset + index
-    protectedPacket[packetNumberIndex] =
-      readU8(protectedPacket, packetNumberIndex) ^ readU8(mask, index + 1)
-  }
-
-  return protectedPacket
+  return encryptQuicHandshakePacket(keys, {
+    destinationConnectionId: new Uint8Array([0x01, 0x02, 0x03, 0x04]),
+    sourceConnectionId: new Uint8Array([0x06, 0x07, 0x08, 0x09, 0x0a]),
+    packetNumber,
+    packetNumberLength: 3,
+    payload: plaintext,
+  })
 }
 
 function cryptoFrame(cryptoOffset: number, data: Uint8Array): QuicCryptoFrame {

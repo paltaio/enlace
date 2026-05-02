@@ -5,16 +5,16 @@ import {
   type QuicAckReceiveSnapshot,
 } from './ack'
 import {
-  createQuicHeaderProtectionMask,
+  applyQuicHeaderProtection,
   decryptQuicAes128GcmPacket,
   encryptQuicAes128GcmPacket,
-  headerProtectionSample,
   removeQuicHeaderProtection,
   type QuicDirectionalKeys,
 } from './crypto'
 import type { QuicFrame } from './frame'
 import {
   QUIC_MAX_PACKET_NUMBER,
+  encodeQuicTruncatedPacketNumber,
   nextExpectedQuicPacketNumber,
   quicPacketNumberToBigInt,
   readQuicPacketNumber,
@@ -251,7 +251,7 @@ export function encryptQuicOneRttPacket(
   options: QuicOneRttPacketProtectionOptions,
 ): Uint8Array {
   validatePacketNumberLength(options.packetNumberLength)
-  const packetNumberBytes = encodeTruncatedPacketNumber(
+  const packetNumberBytes = encodeQuicTruncatedPacketNumber(
     options.packetNumber,
     options.packetNumberLength,
   )
@@ -427,34 +427,12 @@ function selectQuicOneRttPacketNumberLength(packetNumber: number | bigint): numb
   return 4
 }
 
-function encodeTruncatedPacketNumber(packetNumber: number | bigint, length: number): Uint8Array {
-  let remaining = quicPacketNumberToBigInt(packetNumber)
-  const bytes = new Uint8Array(length)
-  for (let index = length - 1; index >= 0; index -= 1) {
-    bytes[index] = Number(remaining & 0xffn)
-    remaining >>= 8n
-  }
-  return bytes
-}
-
 function applyShortHeaderProtection(
   packet: Uint8Array,
   packetNumberOffset: number,
   keys: QuicDirectionalKeys,
 ): Uint8Array {
-  const protectedPacket = new Uint8Array(packet)
-  const sample = headerProtectionSample(packet, packetNumberOffset)
-  const mask = createQuicHeaderProtectionMask(keys.headerProtectionKey, sample)
-  protectedPacket[0] = readU8(protectedPacket, 0) ^ (readU8(mask, 0) & 0x1f)
-
-  const packetNumberLength = (readU8(packet, 0) & 0x03) + 1
-  for (let index = 0; index < packetNumberLength; index += 1) {
-    const packetNumberIndex = packetNumberOffset + index
-    protectedPacket[packetNumberIndex] =
-      readU8(protectedPacket, packetNumberIndex) ^ readU8(mask, index + 1)
-  }
-
-  return protectedPacket
+  return applyQuicHeaderProtection(packet, packetNumberOffset, keys.headerProtectionKey, 0x1f)
 }
 
 function validateShortHeaderFirstByte(firstByte: number): void {

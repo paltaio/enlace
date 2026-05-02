@@ -20,6 +20,7 @@ export const QUIC_V1_INITIAL_SALT = new Uint8Array([
 export const QUIC_INITIAL_SECRET_LENGTH = 32
 export const QUIC_AES_128_KEY_LENGTH = 16
 export const QUIC_AES_128_IV_LENGTH = 12
+export const QUIC_AES_128_GCM_TAG_LENGTH = 16
 export const QUIC_HEADER_PROTECTION_SAMPLE_LENGTH = 16
 export const QUIC_HEADER_PROTECTION_MASK_LENGTH = 5
 
@@ -172,6 +173,29 @@ export function removeQuicHeaderProtection(
   }
 }
 
+export function applyQuicHeaderProtection(
+  packet: Uint8Array,
+  packetNumberOffset: number,
+  headerProtectionKey: Uint8Array,
+  firstByteMask: number,
+): Uint8Array {
+  validateFirstByteMask(firstByteMask)
+  const protectedPacket = copyBytes(packet)
+  const sample = headerProtectionSample(packet, packetNumberOffset)
+  const mask = createQuicHeaderProtectionMask(headerProtectionKey, sample)
+  protectedPacket[0] = readU8(protectedPacket, 0) ^ (readU8(mask, 0) & firstByteMask)
+
+  const packetNumberLength = (readU8(packet, 0) & 0x03) + 1
+  ensurePacketNumberBytes(protectedPacket, packetNumberOffset, packetNumberLength)
+  for (let index = 0; index < packetNumberLength; index += 1) {
+    const packetNumberIndex = packetNumberOffset + index
+    protectedPacket[packetNumberIndex] =
+      readU8(protectedPacket, packetNumberIndex) ^ readU8(mask, index + 1)
+  }
+
+  return protectedPacket
+}
+
 export function headerProtectionSample(packet: Uint8Array, packetNumberOffset: number): Uint8Array {
   validateOffset(packetNumberOffset, 'QUIC packet number offset')
   const sampleOffset = packetNumberOffset + 4
@@ -200,5 +224,11 @@ function ensurePacketNumberBytes(
 function validateOffset(offset: number, name: string): void {
   if (!Number.isSafeInteger(offset) || offset < 0) {
     throw new RangeError(`${name} out of range`)
+  }
+}
+
+function validateFirstByteMask(mask: number): void {
+  if (!Number.isInteger(mask) || mask < 0 || mask > 0xff) {
+    throw new RangeError('QUIC header protection first byte mask out of range')
   }
 }

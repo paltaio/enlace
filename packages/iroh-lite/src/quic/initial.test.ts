@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
+import { concatBytes } from '../bytes'
 import { bytesToHex } from '../testing/hex'
 import {
   rfc9001ClientInitialFrames,
@@ -9,9 +10,55 @@ import {
   rfc9001ServerInitialFrames,
 } from '../testing/rfc9001-quic'
 import { deriveQuicInitialKeys } from './crypto'
-import { decryptQuicInitialPacket } from './initial'
+import { decryptQuicInitialPacket, encryptQuicInitialPacket } from './initial'
 
 describe('QUIC Initial packet decryption', () => {
+  test('protects client Initial vector', () => {
+    const keys = deriveQuicInitialKeys(rfc9001DestinationConnectionId)
+    const packet = encryptQuicInitialPacket(keys.client, {
+      destinationConnectionId: rfc9001DestinationConnectionId,
+      sourceConnectionId: new Uint8Array(),
+      packetNumber: 2,
+      packetNumberLength: 4,
+      payload: concatBytes([
+        rfc9001ClientInitialFrames,
+        new Uint8Array(1162 - rfc9001ClientInitialFrames.length),
+      ]),
+    })
+
+    expect(bytesToHex(packet)).toBe(bytesToHex(rfc9001ProtectedClientInitialPacket))
+  })
+
+  test('protects server Initial vector', () => {
+    const keys = deriveQuicInitialKeys(rfc9001DestinationConnectionId)
+    const packet = encryptQuicInitialPacket(keys.server, {
+      destinationConnectionId: new Uint8Array(),
+      sourceConnectionId: new Uint8Array([0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5]),
+      packetNumber: 1,
+      packetNumberLength: 2,
+      payload: rfc9001ServerInitialFrames,
+    })
+
+    expect(bytesToHex(packet)).toBe(bytesToHex(rfc9001ProtectedServerInitialPacket))
+  })
+
+  test('recovers wrapped Initial packet numbers for nonce construction', () => {
+    const keys = deriveQuicInitialKeys(rfc9001DestinationConnectionId)
+    const payload = new Uint8Array(16)
+    const packet = encryptQuicInitialPacket(keys.client, {
+      destinationConnectionId: rfc9001DestinationConnectionId,
+      sourceConnectionId: new Uint8Array(),
+      packetNumber: 256,
+      packetNumberLength: 1,
+      payload,
+    })
+    const result = decryptQuicInitialPacket(packet, keys.client, 0, 256)
+
+    expect(result.header.packetNumber).toBe(0)
+    expect(result.packetNumber).toBe(256n)
+    expect(result.payload).toEqual(payload)
+  })
+
   test('unprotects and decrypts protected client Initial vector', () => {
     const keys = deriveQuicInitialKeys(rfc9001DestinationConnectionId)
     const result = decryptQuicInitialPacket(rfc9001ProtectedClientInitialPacket, keys.client)
@@ -20,6 +67,7 @@ describe('QUIC Initial packet decryption', () => {
     expect(result.header.length).toBe(1182)
     expect(result.header.packetNumberLength).toBe(4)
     expect(result.header.packetNumber).toBe(2)
+    expect(result.packetNumber).toBe(2n)
     expect(result.header.packetNumberOffset).toBe(18)
     expect(result.header.payloadOffset).toBe(22)
     expect(result.payload).toHaveLength(1162)
@@ -40,6 +88,7 @@ describe('QUIC Initial packet decryption', () => {
     expect(result.header.length).toBe(117)
     expect(result.header.packetNumberLength).toBe(2)
     expect(result.header.packetNumber).toBe(1)
+    expect(result.packetNumber).toBe(1n)
     expect(result.header.packetNumberOffset).toBe(18)
     expect(result.header.payloadOffset).toBe(20)
     expect(result.payload).toEqual(rfc9001ServerInitialFrames)
@@ -56,5 +105,19 @@ describe('QUIC Initial packet decryption', () => {
     expect(() => decryptQuicInitialPacket(truncated, keys.client)).toThrow(
       'not enough bytes for QUIC Initial packet',
     )
+  })
+
+  test('rejects oversized Initial connection ids', () => {
+    const keys = deriveQuicInitialKeys(rfc9001DestinationConnectionId)
+
+    expect(() =>
+      encryptQuicInitialPacket(keys.client, {
+        destinationConnectionId: new Uint8Array(21),
+        sourceConnectionId: new Uint8Array(),
+        packetNumber: 0,
+        packetNumberLength: 1,
+        payload: new Uint8Array(16),
+      }),
+    ).toThrow('QUIC destination connection id length out of range')
   })
 })
