@@ -1,0 +1,12 @@
+[package]
+name = "iroh-lite-native-echo"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "=1.0.102"
+iroh = { version = "=0.98.2", default-features = false, features = ["tls-ring", "test-utils"] }
+tokio = { version = "=1.52.1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time"] }

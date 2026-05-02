@@ -16,12 +16,13 @@
     "fmt": "oxfmt .",
     "fmt:check": "oxfmt --check .",
     "lint": "oxlint .",
-    "lint:type-aware": "oxlint --type-aware -D typescript/await-thenable -D typescript/no-floating-promises -D typescript/no-misused-promises .",
+    "lint:type-aware": "oxlint --type-aware .",
     "lint:fix": "oxlint --fix .",
     "test": "bun test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:browser": "tsc -p tsconfig.browser.json --noEmit",
-    "test:relay-interop": "IROH_RELAY_INTEROP=1 bun test --timeout=180000 src/relay/iroh-relay.interop.test.ts"
+    "test:relay-interop": "IROH_RELAY_INTEROP=1 bun test --timeout=180000 src/relay/iroh-relay.interop.test.ts",
+    "test:native-interop": "IROH_NATIVE_INTEROP=1 bun test --timeout=240000 src/quic/native-iroh.interop.test.ts"
   },
   "dependencies": {
     "@noble/ciphers": "2.2.0",
