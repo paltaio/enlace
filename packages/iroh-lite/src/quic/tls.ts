@@ -1,10 +1,14 @@
 import { copyBytes, readU8, readU16BE } from '../bytes'
+import { readTlsExtensions, type TlsExtension } from './tls-extension'
+
+export type { TlsExtension } from './tls-extension'
 
 export const TlsHandshakeKind = {
   ClientHello: 'client-hello',
   ServerHello: 'server-hello',
   EncryptedExtensions: 'encrypted-extensions',
   Certificate: 'certificate',
+  CertificateRequest: 'certificate-request',
   CertificateVerify: 'certificate-verify',
   Finished: 'finished',
   Unknown: 'unknown',
@@ -15,6 +19,7 @@ export const TlsHandshakeType = {
   ServerHello: 0x02,
   EncryptedExtensions: 0x08,
   Certificate: 0x0b,
+  CertificateRequest: 0x0d,
   CertificateVerify: 0x0f,
   Finished: 0x14,
 } as const
@@ -42,15 +47,9 @@ export type TlsHandshake =
 export type TlsOpaqueHandshakeKind =
   | typeof TlsHandshakeKind.EncryptedExtensions
   | typeof TlsHandshakeKind.Certificate
+  | typeof TlsHandshakeKind.CertificateRequest
   | typeof TlsHandshakeKind.CertificateVerify
   | typeof TlsHandshakeKind.Finished
-
-export interface TlsExtension {
-  readonly extensionType: number
-  readonly data: Uint8Array
-  readonly offset: number
-  readonly endOffset: number
-}
 
 export interface TlsClientHello {
   readonly legacyVersion: number
@@ -264,6 +263,8 @@ function opaqueTlsHandshakeKind(handshakeType: number): TlsOpaqueHandshakeKind |
       return TlsHandshakeKind.EncryptedExtensions
     case TlsHandshakeType.Certificate:
       return TlsHandshakeKind.Certificate
+    case TlsHandshakeType.CertificateRequest:
+      return TlsHandshakeKind.CertificateRequest
     case TlsHandshakeType.CertificateVerify:
       return TlsHandshakeKind.CertificateVerify
     case TlsHandshakeType.Finished:
@@ -306,7 +307,7 @@ function parseClientHello(bytes: Uint8Array): TlsClientHello {
     'TLS ClientHello compression methods',
   )
   pos = legacyCompressionMethods.endOffset
-  const extensions = readTlsExtensions(bytes, pos)
+  const extensions = readTlsExtensions(bytes, pos, 'TLS extensions', 'TLS extension data')
   requireEndOffset(extensions.endOffset, bytes.length, 'TLS ClientHello')
 
   return {
@@ -331,7 +332,7 @@ function parseServerHello(bytes: Uint8Array): TlsServerHello {
   pos += 2
   const legacyCompressionMethod = readU8(bytes, pos)
   pos += 1
-  const extensions = readTlsExtensions(bytes, pos)
+  const extensions = readTlsExtensions(bytes, pos, 'TLS extensions', 'TLS extension data')
   requireEndOffset(extensions.endOffset, bytes.length, 'TLS ServerHello')
 
   return {
@@ -372,43 +373,6 @@ function readCipherSuites(
     pos += 2
   }
   return { value: cipherSuites, endOffset }
-}
-
-function readTlsExtensions(
-  bytes: Uint8Array,
-  offset: number,
-): {
-  readonly value: readonly TlsExtension[]
-  readonly endOffset: number
-} {
-  const length = readU16BE(bytes, offset)
-  let pos = offset + 2
-  const endOffset = pos + length
-  if (bytes.length < endOffset) {
-    throw new RangeError('not enough bytes for TLS extensions')
-  }
-
-  const extensions: TlsExtension[] = []
-  while (pos < endOffset) {
-    const extensionOffset = pos
-    const extensionType = readU16BE(bytes, pos)
-    pos += 2
-    const dataLength = readU16BE(bytes, pos)
-    pos += 2
-    if (endOffset - pos < dataLength) {
-      throw new RangeError('not enough bytes for TLS extension data')
-    }
-    const dataEndOffset = pos + dataLength
-    extensions.push({
-      extensionType,
-      data: copyBytes(bytes.subarray(pos, dataEndOffset)),
-      offset: extensionOffset,
-      endOffset: dataEndOffset,
-    })
-    pos = dataEndOffset
-  }
-
-  return { value: extensions, endOffset }
 }
 
 function readTlsU8Vector(
