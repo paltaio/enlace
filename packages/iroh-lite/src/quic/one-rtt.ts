@@ -14,6 +14,7 @@ import {
 } from './crypto'
 import type { QuicFrame } from './frame'
 import {
+  QUIC_MAX_PACKET_NUMBER,
   nextExpectedQuicPacketNumber,
   quicPacketNumberToBigInt,
   readQuicPacketNumber,
@@ -57,6 +58,92 @@ export interface QuicOneRttPacketProtectionOptions {
   readonly packetNumber: number | bigint
   readonly packetNumberLength: number
   readonly payload: Uint8Array
+}
+
+export interface QuicOneRttPacketSendResult {
+  readonly packet: Uint8Array
+  readonly packetNumber: bigint
+  readonly nextPacketNumber: bigint
+}
+
+export class QuicOneRttSendState {
+  #nextPacketNumber: bigint
+
+  constructor(nextPacketNumber: number | bigint = 0) {
+    this.#nextPacketNumber = quicPacketNumberToBigInt(nextPacketNumber)
+  }
+
+  get nextPacketNumber(): bigint {
+    return this.#nextPacketNumber
+  }
+
+  send(
+    keys: QuicDirectionalKeys,
+    destinationConnectionId: Uint8Array,
+    payload: Uint8Array,
+  ): QuicOneRttPacketSendResult {
+    const packetNumber = quicPacketNumberToBigInt(this.#nextPacketNumber)
+    if (packetNumber === QUIC_MAX_PACKET_NUMBER) {
+      throw new RangeError('QUIC next packet number out of range')
+    }
+    const packet = encryptQuicOneRttPacket(keys, {
+      destinationConnectionId,
+      packetNumber,
+      packetNumberLength: selectQuicOneRttPacketNumberLength(packetNumber),
+      payload,
+    })
+    const nextPacketNumber = packetNumber + 1n
+    this.#nextPacketNumber = nextPacketNumber
+
+    return {
+      packet,
+      packetNumber,
+      nextPacketNumber,
+    }
+  }
+}
+
+export class QuicOneRttState {
+  readonly #sendState: QuicOneRttSendState
+  readonly #receiveState: QuicOneRttReceiveState
+
+  constructor(
+    nextPacketNumber: number | bigint = 0,
+    largestReceivedPacketNumber: number | bigint | null = null,
+  ) {
+    this.#sendState = new QuicOneRttSendState(nextPacketNumber)
+    this.#receiveState = new QuicOneRttReceiveState(largestReceivedPacketNumber)
+  }
+
+  get nextPacketNumber(): bigint {
+    return this.#sendState.nextPacketNumber
+  }
+
+  get largestReceivedPacketNumber(): bigint | null {
+    return this.#receiveState.largestReceivedPacketNumber
+  }
+
+  ackSnapshot(): QuicAckReceiveSnapshot {
+    return this.#receiveState.ackSnapshot()
+  }
+
+  send(
+    keys: QuicDirectionalKeys,
+    destinationConnectionId: Uint8Array,
+    payload: Uint8Array,
+  ): QuicOneRttPacketSendResult {
+    return this.#sendState.send(keys, destinationConnectionId, payload)
+  }
+
+  receive(
+    packet: Uint8Array,
+    keys: QuicDirectionalKeys,
+    destinationConnectionIdLength: number,
+    offset = 0,
+    ackDelay = 0,
+  ): QuicOneRttPacketFrameReceiveResult {
+    return this.#receiveState.receive(packet, keys, destinationConnectionIdLength, offset, ackDelay)
+  }
 }
 
 export class QuicOneRttReceiveState {
@@ -265,6 +352,20 @@ function validatePacketNumberLength(length: number): void {
   if (!Number.isSafeInteger(length) || length < 1 || length > 4) {
     throw new RangeError('QUIC packet number length out of range')
   }
+}
+
+function selectQuicOneRttPacketNumberLength(packetNumber: number | bigint): number {
+  const value = quicPacketNumberToBigInt(packetNumber)
+  if (value <= 0xffn) {
+    return 1
+  }
+  if (value <= 0xffffn) {
+    return 2
+  }
+  if (value <= 0xffffffn) {
+    return 3
+  }
+  return 4
 }
 
 function encodeTruncatedPacketNumber(packetNumber: number | bigint, length: number): Uint8Array {
