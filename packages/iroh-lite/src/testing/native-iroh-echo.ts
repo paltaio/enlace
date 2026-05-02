@@ -1,4 +1,4 @@
-import { hexToBytes } from './hex'
+import { bytesToHex, hexToBytes } from './hex'
 import { withTimeout } from './local-iroh-relay'
 
 export const nativeIrohEchoAlpn = new TextEncoder().encode('/iroh/echo/1')
@@ -7,6 +7,16 @@ export interface NativeIrohEchoServer {
   readonly endpointId: Uint8Array
   readonly endpointIdHex: string
   stop(): Promise<void>
+}
+
+export interface NativeIrohEchoClientOptions {
+  readonly relayUrl: string
+  readonly serverEndpointId: Uint8Array
+  readonly payload: Uint8Array
+}
+
+export interface NativeIrohEchoClientResult {
+  readonly payload: Uint8Array
 }
 
 export async function startNativeIrohEchoServer(relayUrl: string): Promise<NativeIrohEchoServer> {
@@ -55,6 +65,39 @@ export async function startNativeIrohEchoServer(relayUrl: string): Promise<Nativ
   }
 }
 
+export async function runNativeIrohEchoClient(
+  options: NativeIrohEchoClientOptions,
+): Promise<NativeIrohEchoClientResult> {
+  const proc = Bun.spawn(
+    ['cargo', 'run', '--quiet', '--manifest-path', nativeIrohEchoManifestPath(), '--', 'client'],
+    {
+      env: {
+        ...Bun.env,
+        CARGO_TARGET_DIR: Bun.env.IROH_NATIVE_ECHO_TARGET_DIR ?? nativeIrohEchoTargetDir(),
+        IROH_RELAY_URL: options.relayUrl,
+        IROH_SERVER_ENDPOINT_ID_HEX: bytesToHex(options.serverEndpointId),
+        IROH_ECHO_PAYLOAD_HEX: bytesToHex(options.payload),
+        RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  )
+  const stdout = streamToText(proc.stdout)
+  const stderr = streamToText(proc.stderr)
+  const exitCode = await waitForProcessExit(proc, 'native iroh echo client', 120_000)
+  const output = await stdout
+  const errorOutput = await stderr
+
+  if (exitCode !== 0) {
+    throw new Error(
+      `native iroh echo client exited with code ${exitCode}${processOutput(errorOutput)}`,
+    )
+  }
+
+  return parseClientResult(output)
+}
+
 async function readReadyEndpointId(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   proc: ReturnType<typeof Bun.spawn>,
@@ -98,7 +141,55 @@ function parseReadyEndpointId(line: string): string | null {
 
 async function processError(stderr: Promise<string>): Promise<string> {
   const output = (await stderr).trim()
-  return output.length === 0 ? '' : `\n${output}`
+  return processOutput(output)
+}
+
+function processOutput(output: string): string {
+  const trimmed = output.trim()
+  return trimmed.length === 0 ? '' : `\n${trimmed}`
+}
+
+async function waitForProcessExit(
+  proc: ReturnType<typeof Bun.spawn>,
+  label: string,
+  timeoutMs: number,
+): Promise<number> {
+  try {
+    return await withTimeout(proc.exited, label, timeoutMs)
+  } catch (error) {
+    proc.kill()
+    try {
+      await withTimeout(proc.exited, `${label} stop`, 2_000)
+    } catch {
+      proc.kill('SIGKILL')
+      await proc.exited
+    }
+    throw error
+  }
+}
+
+function parseClientResult(output: string): NativeIrohEchoClientResult {
+  for (const line of output.split('\n')) {
+    const result = parseClientResultLine(line)
+    if (result !== null) {
+      return result
+    }
+  }
+  throw new Error(`native iroh echo client did not report success${processOutput(output)}`)
+}
+
+function parseClientResultLine(line: string): NativeIrohEchoClientResult | null {
+  const prefix = 'IROH_NATIVE_ECHO_CLIENT_OK payload_hex='
+  if (!line.startsWith(prefix)) {
+    return null
+  }
+  const payloadHex = line.slice(prefix.length).trim()
+  if (!/^[0-9a-f]*$/.test(payloadHex) || payloadHex.length % 2 !== 0) {
+    throw new Error(`native iroh echo client printed invalid payload hex: ${payloadHex}`)
+  }
+  return {
+    payload: hexToBytes(payloadHex),
+  }
 }
 
 function nativeIrohEchoManifestPath(): string {

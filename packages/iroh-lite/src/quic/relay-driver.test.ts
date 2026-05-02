@@ -110,6 +110,52 @@ describe('QUIC relay datagram driver', () => {
     expect(serverComplete.connected).toBe(true)
   })
 
+  test('accepts a client Handshake packet coalesced with first 1-RTT stream packet', async () => {
+    const clientEndpointId = await endpointIdFromSecretKey(clientEndpointSecretKey)
+    const serverEndpointId = await endpointIdFromSecretKey(serverEndpointSecretKey)
+    const { client, server } = relayPair(clientEndpointId, serverEndpointId)
+    const clientInitial = await client.start()
+    const serverFlight = await server.receive(relayDeliver(clientEndpointId, clientInitial))
+    const clientFlight = await client.receive(
+      coalesceDatagrams(serverFlight.outgoing, serverEndpointId),
+    )
+    const request = client.sendStream(0, hexToBytes('70696e67'), true)
+    const received = await server.receive(
+      batchDatagrams(
+        [requireDatagram(clientFlight.outgoing[0]), request.datagrams],
+        clientEndpointId,
+      ),
+    )
+
+    expect(received.connected).toBe(true)
+    expect(received.streamOutputs[0]?.complete).toBe(true)
+    expect(bytesToHex(received.streamOutputs[0]?.data ?? new Uint8Array())).toBe('70696e67')
+  })
+
+  test('buffers first 1-RTT stream packet until client Handshake packet arrives', async () => {
+    const clientEndpointId = await endpointIdFromSecretKey(clientEndpointSecretKey)
+    const serverEndpointId = await endpointIdFromSecretKey(serverEndpointSecretKey)
+    const { client, server } = relayPair(clientEndpointId, serverEndpointId)
+    const clientInitial = await client.start()
+    const serverFlight = await server.receive(relayDeliver(clientEndpointId, clientInitial))
+    const clientFlight = await client.receive(
+      coalesceDatagrams(serverFlight.outgoing, serverEndpointId),
+    )
+    const request = client.sendStream(0, hexToBytes('70696e67'), true)
+    const buffered = await server.receive(relayDeliver(clientEndpointId, request.datagrams))
+
+    expect(buffered.connected).toBe(false)
+    expect(buffered.streamOutputs).toEqual([])
+
+    const received = await server.receive(
+      relayDeliver(clientEndpointId, requireDatagram(clientFlight.outgoing[0])),
+    )
+
+    expect(received.connected).toBe(true)
+    expect(received.streamOutputs[0]?.complete).toBe(true)
+    expect(bytesToHex(received.streamOutputs[0]?.data ?? new Uint8Array())).toBe('70696e67')
+  })
+
   test('honors relay batch segments around 1-RTT packets', async () => {
     const clientEndpointId = await endpointIdFromSecretKey(clientEndpointSecretKey)
     const serverEndpointId = await endpointIdFromSecretKey(serverEndpointSecretKey)

@@ -45,6 +45,7 @@ export class QuicRelayClientDriver {
   readonly #ecn: EcnCodepoint | null
   #serverInitialPacket: Uint8Array | null = null
   #serverHandshakePacket: Uint8Array | null = null
+  #pendingConnectedPackets: Uint8Array[] = []
   #connection: QuicConnectionState | null = null
 
   constructor(options: QuicRelayClientDriverOptions) {
@@ -68,8 +69,25 @@ export class QuicRelayClientDriver {
       return receiveConnectedDatagram(this.#connection, this.#peerEndpointId, this.#ecn, datagrams)
     }
 
-    let clientFlight: QuicClientHandshakeFlight | null = null
+    const outgoing: Datagrams[] = []
+    const streamOutputs: QuicStreamReceiveOutput[] = []
     for (const packet of splitRelayDatagramPackets(datagrams)) {
+      if (this.#connection !== null) {
+        receiveConnectedPacket(
+          this.#connection,
+          this.#peerEndpointId,
+          this.#ecn,
+          packet,
+          outgoing,
+          streamOutputs,
+        )
+        continue
+      }
+      if (isShortHeaderPacket(packet)) {
+        this.#pendingConnectedPackets.push(packet)
+        continue
+      }
+
       const packetType = quicRelayPacketType(packet)
       if (packetType === QuicLongHeaderPacketType.Initial) {
         this.#serverInitialPacket = packet
@@ -78,17 +96,25 @@ export class QuicRelayClientDriver {
       } else {
         throw new RangeError(`unsupported QUIC relay handshake packet type ${packetType}`)
       }
-      clientFlight = await this.maybeCompleteHandshake()
+      const clientFlight = await this.maybeCompleteHandshake()
+      if (clientFlight !== null) {
+        this.#connection = clientFlight.connection
+        outgoing.push(this.outgoing(clientFlight.packet))
+        drainPendingConnectedPackets(
+          this.#connection,
+          this.#peerEndpointId,
+          this.#ecn,
+          this.#pendingConnectedPackets,
+          outgoing,
+          streamOutputs,
+        )
+      }
     }
 
-    if (clientFlight === null) {
-      return emptyReceiveResult(false)
-    }
-    this.#connection = clientFlight.connection
     return {
-      outgoing: [this.outgoing(clientFlight.packet)],
-      streamOutputs: [],
-      connected: true,
+      outgoing,
+      streamOutputs,
+      connected: this.#connection !== null,
     }
   }
 
@@ -127,6 +153,7 @@ export class QuicRelayServerDriver {
   readonly #handshake: QuicServerHandshakeDriver
   readonly #ecn: EcnCodepoint | null
   #peerEndpointId: Uint8Array | null = null
+  #pendingConnectedPackets: Uint8Array[] = []
   #connection: QuicConnectionState | null = null
 
   constructor(options: QuicRelayServerDriverOptions) {
@@ -146,7 +173,24 @@ export class QuicRelayServerDriver {
     }
 
     const outgoing: Datagrams[] = []
+    const streamOutputs: QuicStreamReceiveOutput[] = []
     for (const packet of splitRelayDatagramPackets(datagrams)) {
+      if (this.#connection !== null) {
+        receiveConnectedPacket(
+          this.#connection,
+          peerEndpointId,
+          this.#ecn,
+          packet,
+          outgoing,
+          streamOutputs,
+        )
+        continue
+      }
+      if (isShortHeaderPacket(packet)) {
+        this.#pendingConnectedPackets.push(packet)
+        continue
+      }
+
       const packetType = quicRelayPacketType(packet)
       if (packetType === QuicLongHeaderPacketType.Initial) {
         const flight = await this.#handshake.receiveClientInitial(packet)
@@ -156,6 +200,14 @@ export class QuicRelayServerDriver {
       if (packetType === QuicLongHeaderPacketType.Handshake) {
         const complete = await this.#handshake.receiveClientHandshake(packet)
         this.#connection = complete.connection
+        drainPendingConnectedPackets(
+          this.#connection,
+          peerEndpointId,
+          this.#ecn,
+          this.#pendingConnectedPackets,
+          outgoing,
+          streamOutputs,
+        )
         continue
       }
       throw new RangeError(`unsupported QUIC relay handshake packet type ${packetType}`)
@@ -163,7 +215,7 @@ export class QuicRelayServerDriver {
 
     return {
       outgoing,
-      streamOutputs: [],
+      streamOutputs,
       connected: this.#connection !== null,
     }
   }
@@ -244,16 +296,40 @@ function receiveConnectedDatagram(
   const outgoing: Datagrams[] = []
   const streamOutputs: QuicStreamReceiveOutput[] = []
   for (const packet of splitRelayDatagramPackets(datagrams)) {
-    const received = connection.receive(packet)
-    streamOutputs.push(...received.streamOutputs)
-    if (received.ackPacket !== null) {
-      outgoing.push(packetToRelayDatagrams(peerEndpointId, ecn, received.ackPacket.packet))
-    }
+    receiveConnectedPacket(connection, peerEndpointId, ecn, packet, outgoing, streamOutputs)
   }
   return {
     outgoing,
     streamOutputs,
     connected: true,
+  }
+}
+
+function receiveConnectedPacket(
+  connection: QuicConnectionState,
+  peerEndpointId: Uint8Array,
+  ecn: EcnCodepoint | null,
+  packet: Uint8Array,
+  outgoing: Datagrams[],
+  streamOutputs: QuicStreamReceiveOutput[],
+): void {
+  const received = connection.receive(packet)
+  streamOutputs.push(...received.streamOutputs)
+  if (received.ackPacket !== null) {
+    outgoing.push(packetToRelayDatagrams(peerEndpointId, ecn, received.ackPacket.packet))
+  }
+}
+
+function drainPendingConnectedPackets(
+  connection: QuicConnectionState,
+  peerEndpointId: Uint8Array,
+  ecn: EcnCodepoint | null,
+  packets: Uint8Array[],
+  outgoing: Datagrams[],
+  streamOutputs: QuicStreamReceiveOutput[],
+): void {
+  for (const packet of packets.splice(0)) {
+    receiveConnectedPacket(connection, peerEndpointId, ecn, packet, outgoing, streamOutputs)
   }
 }
 
@@ -304,6 +380,14 @@ function quicRelayPacketType(packet: Uint8Array): QuicLongHeaderPacketTypeValue 
   return parseQuicLongHeader(packet).packetType
 }
 
+function isShortHeaderPacket(packet: Uint8Array): boolean {
+  const firstByte = packet[0]
+  if (firstByte === undefined) {
+    throw new RangeError('relay QUIC datagram is empty')
+  }
+  return (firstByte & 0x80) === 0
+}
+
 function requireConnection(connection: QuicConnectionState | null): QuicConnectionState {
   if (connection === null) {
     throw new RangeError('QUIC relay driver is not connected')
@@ -316,14 +400,6 @@ function requireEndpointId(endpointId: Uint8Array | null): Uint8Array {
     throw new RangeError('QUIC relay peer endpoint id is not known')
   }
   return endpointId
-}
-
-function emptyReceiveResult(connected: boolean): QuicRelayReceiveResult {
-  return {
-    outgoing: [],
-    streamOutputs: [],
-    connected,
-  }
 }
 
 function equalBytes(left: Uint8Array, right: Uint8Array): boolean {

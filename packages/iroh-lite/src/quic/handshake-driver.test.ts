@@ -108,6 +108,41 @@ describe('QUIC handshake driver', () => {
     expect(server.connection).toBeNull()
   })
 
+  test('builds server transport parameters from client Initial connection ids', async () => {
+    const serverEndpointId = await endpointIdFromSecretKey(serverEndpointSecretKey)
+    const client = new QuicClientHandshakeDriver(
+      clientOptions({ expectedServerEndpointId: serverEndpointId }),
+    )
+    const seenOriginalDestinationIds: string[] = []
+    const server = new QuicServerHandshakeDriver(
+      serverOptions({
+        transportParameters: ({ originalDestinationConnectionId }) => {
+          seenOriginalDestinationIds.push(bytesToHex(originalDestinationConnectionId))
+          return serverTransportParameters({ originalDestinationConnectionId })
+        },
+      }),
+    )
+    const start = await client.start()
+
+    await server.receiveClientInitial(start.packet)
+
+    expect(seenOriginalDestinationIds).toEqual([bytesToHex(initialDestinationConnectionId)])
+  })
+
+  test('resends cached server flight for duplicate client Initial packets', async () => {
+    const serverEndpointId = await endpointIdFromSecretKey(serverEndpointSecretKey)
+    const client = new QuicClientHandshakeDriver(
+      clientOptions({ expectedServerEndpointId: serverEndpointId }),
+    )
+    const server = new QuicServerHandshakeDriver(serverOptions())
+    const start = await client.start()
+    const first = await server.receiveClientInitial(start.packet)
+    const duplicate = await server.receiveClientInitial(start.packet)
+
+    expect(duplicate.initialPacket).toEqual(first.initialPacket)
+    expect(duplicate.handshakePacket).toEqual(first.handshakePacket)
+  })
+
   test('rejects ALPN mismatch before committing client connection state', async () => {
     const serverEndpointId = await endpointIdFromSecretKey(serverEndpointSecretKey)
     const client = new QuicClientHandshakeDriver(

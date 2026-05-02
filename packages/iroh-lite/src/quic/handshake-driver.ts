@@ -63,11 +63,19 @@ export interface QuicServerHandshakeDriverOptions {
   readonly x25519PrivateKey: Uint8Array
   readonly endpointSecretKey: Uint8Array
   readonly selectedAlpn: Uint8Array
-  readonly transportParameters: Uint8Array
+  readonly transportParameters:
+    | Uint8Array
+    | ((input: QuicServerTransportParametersInput) => Uint8Array)
   readonly sourceConnectionId: Uint8Array
   readonly certificateRequest?: boolean
   readonly initialPacketNumber?: number | bigint
   readonly handshakePacketNumber?: number | bigint
+}
+
+export interface QuicServerTransportParametersInput {
+  readonly originalDestinationConnectionId: Uint8Array
+  readonly initialSourceConnectionId: Uint8Array
+  readonly peerSourceConnectionId: Uint8Array
 }
 
 export interface QuicClientInitialFlight {
@@ -101,6 +109,7 @@ interface QuicServerInitialState {
   readonly peerConnectionId: Uint8Array
   readonly handshakeKeys: QuicHandshakeKeys
   readonly messages: readonly QuicTlsHandshakeMessage[]
+  readonly serverFlight: QuicServerHandshakeFlight
 }
 
 interface QuicClientStartedState {
@@ -242,7 +251,7 @@ export class QuicServerHandshakeDriver {
 
   async receiveClientInitial(packet: Uint8Array): Promise<QuicServerHandshakeFlight> {
     if (this.#initial !== null) {
-      throw new RangeError('QUIC server handshake already started')
+      return this.#initial.serverFlight
     }
     const prefix = parseQuicInitialPacketHeaderPrefix(packet)
     const initialKeys = deriveQuicInitialKeys(prefix.destinationConnectionId)
@@ -252,8 +261,13 @@ export class QuicServerHandshakeDriver {
       clientTransportParameters(clientHello.handshake),
       clientInitial.header.sourceConnectionId,
     )
+    const transportParameters = serverTransportParameters(this.#options.transportParameters, {
+      originalDestinationConnectionId: prefix.destinationConnectionId,
+      initialSourceConnectionId: this.#options.sourceConnectionId,
+      peerSourceConnectionId: clientInitial.header.sourceConnectionId,
+    })
     validateServerTransportParameterConnectionIds(
-      parseQuicTransportParameters(this.#options.transportParameters, QuicEndpointRole.Server),
+      parseQuicTransportParameters(transportParameters, QuicEndpointRole.Server),
       prefix.destinationConnectionId,
       this.#options.sourceConnectionId,
     )
@@ -272,7 +286,7 @@ export class QuicServerHandshakeDriver {
       serverHandshakeTrafficSecret: handshake.secrets.serverHandshakeTrafficSecret,
       endpointSecretKey: this.#options.endpointSecretKey,
       selectedAlpn: this.#options.selectedAlpn,
-      transportParameters: this.#options.transportParameters,
+      transportParameters,
       ...(this.#options.certificateRequest === undefined
         ? {}
         : { certificateRequest: this.#options.certificateRequest }),
@@ -295,14 +309,7 @@ export class QuicServerHandshakeDriver {
     })
     const messages = [clientHello, serverHello.message, ...serverFlight.messages]
 
-    this.#initial = {
-      initialDestinationConnectionId: copyBytes(prefix.destinationConnectionId),
-      peerConnectionId: copyBytes(clientInitial.header.sourceConnectionId),
-      handshakeKeys,
-      messages,
-    }
-
-    return {
+    const serverFlightResult = {
       initialPacket,
       handshakePacket,
       initialPacketNumber: BigInt(initialPacketNumber),
@@ -310,6 +317,16 @@ export class QuicServerHandshakeDriver {
       serverHello: serverHello.message,
       encryptedMessages: serverFlight.messages,
     }
+
+    this.#initial = {
+      initialDestinationConnectionId: copyBytes(prefix.destinationConnectionId),
+      peerConnectionId: copyBytes(clientInitial.header.sourceConnectionId),
+      handshakeKeys,
+      messages,
+      serverFlight: serverFlightResult,
+    }
+
+    return serverFlightResult
   }
 
   async receiveClientHandshake(packet: Uint8Array): Promise<QuicServerHandshakeComplete> {
@@ -405,6 +422,15 @@ function clientTransportParameters(clientHello: TlsClientHelloHandshake): QuicTr
     throw new RangeError('TLS ClientHello must include QUIC transport parameters')
   }
   return parseQuicTransportParameters(extension.data, QuicEndpointRole.Client)
+}
+
+function serverTransportParameters(
+  transportParameters: Uint8Array | ((input: QuicServerTransportParametersInput) => Uint8Array),
+  input: QuicServerTransportParametersInput,
+): Uint8Array {
+  return typeof transportParameters === 'function'
+    ? transportParameters(input)
+    : transportParameters
 }
 
 function validateClientTransportParameterConnectionIds(
