@@ -10,9 +10,19 @@ import {
   type GossipTopicMessage,
 } from './wire'
 
+const lazyDispatchDelayMs = 5
+const graftTimeoutMs = 80
+const retryGraftTimeoutMs = 40
+const messageCacheRetentionMs = 30_000
+const messageIdRetentionMs = 90_000
+const defaultMaxMessageSize = 4096
+const minMaxMessageSize = 512
+const ihaveEntryMaxEncodedSize = 35
+
 export interface GossipProtocolStateOptions {
   readonly me: Uint8Array
   readonly peerData?: Uint8Array | null
+  readonly maxMessageSize?: number
 }
 
 export type GossipProtocolInEvent =
@@ -123,12 +133,14 @@ type TopicOutEvent =
 
 export class GossipProtocolState {
   readonly #me: Uint8Array
+  readonly #maxMessageSize: number
   #peerData: Uint8Array | null
   readonly #topics = new Map<string, GossipTopicProtocolState>()
   readonly #peerTopics = new Map<string, PeerTopicMembership>()
 
   constructor(options: GossipProtocolStateOptions) {
     this.#me = validatePeerId(options.me)
+    this.#maxMessageSize = validateMaxMessageSize(options.maxMessageSize ?? defaultMaxMessageSize)
     this.#peerData = copyOptionalBytes(options.peerData ?? new Uint8Array())
   }
 
@@ -144,22 +156,29 @@ export class GossipProtocolState {
     return this.#topics.get(topicKey(topicId))?.hasActivePeers() ?? false
   }
 
-  handle(event: GossipProtocolInEvent): readonly GossipProtocolOutEvent[] {
+  handle(
+    event: GossipProtocolInEvent,
+    nowMs = monotonicNowMs(),
+  ): readonly GossipProtocolOutEvent[] {
     if (event.type === 'peer-disconnected') {
-      const out = this.handleAllTopics(event)
+      const out = this.handleAllTopics(event, nowMs)
       this.#peerTopics.delete(peerKey(event.peer))
       return out
     }
     if (event.type === 'update-peer-data') {
       this.#peerData = copyOptionalBytes(event.peerData)
-      return this.handleAllTopics(event)
+      return this.handleAllTopics(event, nowMs)
     }
     if (event.type === 'timer-expired') {
       const topicId = validateGossipTopicId(event.timer.topicId)
-      return this.handleTopicEvent(topicId, {
-        type: 'timer-expired',
-        timer: event.timer.value,
-      })
+      return this.handleTopicEvent(
+        topicId,
+        {
+          type: 'timer-expired',
+          timer: event.timer.value,
+        },
+        nowMs,
+      )
     }
 
     const topicId = validateGossipTopicId(event.topicId)
@@ -167,7 +186,7 @@ export class GossipProtocolState {
       this.requireTopic(topicId)
     }
     if (event.type === 'command' && event.command.type === 'quit') {
-      const out = this.handleTopicEvent(topicId, event)
+      const out = this.handleTopicEvent(topicId, event, nowMs)
       this.#topics.delete(bytesKey(topicId))
       return [...out, ...this.removeTopicMemberships(topicId)]
     }
@@ -177,17 +196,18 @@ export class GossipProtocolState {
         return []
       }
       this.trackPeerTopic(event.peer, topicId)
-      return this.mapTopicOut(topicId, topic.handle(event))
+      return this.mapTopicOut(topicId, topic.handle(event, nowMs))
     }
-    return this.handleTopicEvent(topicId, event)
+    return this.handleTopicEvent(topicId, event, nowMs)
   }
 
   private handleAllTopics(
     event: GossipProtocolPeerDisconnected | GossipProtocolUpdatePeerData,
+    nowMs: number,
   ): readonly GossipProtocolOutEvent[] {
     const out: GossipProtocolOutEvent[] = []
     for (const topic of this.#topics.values()) {
-      out.push(...this.mapTopicOut(topic.topicId(), topic.handle(event)))
+      out.push(...this.mapTopicOut(topic.topicId(), topic.handle(event, nowMs)))
     }
     return out
   }
@@ -195,12 +215,13 @@ export class GossipProtocolState {
   private handleTopicEvent(
     topicId: Uint8Array,
     event: GossipProtocolCommandEvent | { readonly type: 'timer-expired'; readonly timer: unknown },
+    nowMs: number,
   ): readonly GossipProtocolOutEvent[] {
     const topic = this.#topics.get(bytesKey(topicId))
     if (topic === undefined) {
       return []
     }
-    return this.mapTopicOut(topicId, topic.handle(event))
+    return this.mapTopicOut(topicId, topic.handle(event, nowMs))
   }
 
   private requireTopic(topicId: Uint8Array): GossipTopicProtocolState {
@@ -210,6 +231,7 @@ export class GossipProtocolState {
       return topic
     }
     const nextTopic = new GossipTopicProtocolState({
+      maxMessageSize: this.#maxMessageSize,
       me: this.#me,
       peerData: this.#peerData,
       topicId,
@@ -303,19 +325,50 @@ interface PeerTopicMembership {
   readonly topics: Set<string>
 }
 
+type TopicTimer =
+  | { readonly type: 'dispatch-lazy-push' }
+  | { readonly type: 'send-graft'; readonly id: Uint8Array }
+
+interface LazyPushPeerQueue {
+  readonly peer: Uint8Array
+  readonly messages: GossipIHaveEntry[]
+}
+
+type MissingMessageQueue = MissingMessageSource[]
+
+interface MissingMessageSource {
+  readonly peer: Uint8Array
+  readonly round: number
+}
+
+interface CachedGossipMessage {
+  readonly message: GossipBroadcastMessage
+  readonly expiresAtMs: number
+}
+
 class GossipTopicProtocolState {
   readonly #me: Uint8Array
+  readonly #maxMessageSize: number
   readonly #topicId: Uint8Array
   #peerData: Uint8Array | null
   readonly #neighbors = new Map<string, Uint8Array>()
+  readonly #eagerPeers = new Map<string, Uint8Array>()
+  readonly #lazyPeers = new Map<string, Uint8Array>()
+  readonly #lazyPushQueue = new Map<string, LazyPushPeerQueue>()
+  readonly #missingMessages = new Map<string, MissingMessageQueue>()
+  readonly #graftTimerScheduled = new Set<string>()
+  readonly #cache = new Map<string, CachedGossipMessage>()
   readonly #peerDataByPeer = new Map<string, Uint8Array>()
-  readonly #seenMessages = new Set<string>()
+  readonly #seenMessages = new Map<string, number>()
+  #dispatchTimerScheduled = false
 
   constructor(options: {
+    readonly maxMessageSize: number
     readonly me: Uint8Array
     readonly peerData: Uint8Array | null
     readonly topicId: Uint8Array
   }) {
+    this.#maxMessageSize = validateMaxMessageSize(options.maxMessageSize)
     this.#me = validatePeerId(options.me)
     this.#peerData = copyOptionalBytes(options.peerData)
     this.#topicId = validateGossipTopicId(options.topicId)
@@ -336,23 +389,29 @@ class GossipTopicProtocolState {
       | GossipProtocolPeerDisconnected
       | GossipProtocolUpdatePeerData
       | { readonly type: 'timer-expired'; readonly timer: unknown },
+    nowMs: number,
   ): readonly TopicOutEvent[] {
+    this.expireCaches(nowMs)
     if (event.type === 'command') {
-      return this.handleCommand(event.command)
+      return this.handleCommand(event.command, nowMs)
     }
     if (event.type === 'recv-message') {
-      return this.handleMessage(validatePeerId(event.peer), event.message)
+      return this.handleMessage(validatePeerId(event.peer), event.message, nowMs)
     }
     if (event.type === 'peer-disconnected') {
       return this.removeNeighbor(event.peer)
     }
     if (event.type === 'update-peer-data') {
       this.#peerData = copyOptionalBytes(event.peerData)
+      return []
+    }
+    if (isTopicTimer(event.timer)) {
+      return this.handleTimer(event.timer, nowMs)
     }
     return []
   }
 
-  private handleCommand(command: GossipProtocolCommand): readonly TopicOutEvent[] {
+  private handleCommand(command: GossipProtocolCommand, nowMs: number): readonly TopicOutEvent[] {
     if (command.type === 'join') {
       return command.peers.map((peer) => ({
         type: 'send-message',
@@ -369,8 +428,13 @@ class GossipTopicProtocolState {
         content,
         scope: broadcastScope(command.scope),
       }
-      this.#seenMessages.add(bytesKey(message.id))
-      return this.sendToNeighbors(message)
+      const out: TopicOutEvent[] = []
+      if (message.scope.type === 'swarm') {
+        this.storeGossip(message, nowMs)
+        out.push(...this.lazyPush(message, this.#me))
+      }
+      out.push(...this.eagerPush(message, this.#me))
+      return out
     }
     const out: TopicOutEvent[] = []
     for (const peer of this.#neighbors.values()) {
@@ -385,11 +449,15 @@ class GossipTopicProtocolState {
     return out
   }
 
-  private handleMessage(peer: Uint8Array, message: GossipTopicMessage): readonly TopicOutEvent[] {
+  private handleMessage(
+    peer: Uint8Array,
+    message: GossipTopicMessage,
+    nowMs: number,
+  ): readonly TopicOutEvent[] {
     if (message.layer === 'swarm') {
       return this.handleSwarmMessage(peer, message)
     }
-    return this.handleGossipMessage(peer, message)
+    return this.handleGossipMessage(peer, message, nowMs)
   }
 
   private handleSwarmMessage(
@@ -430,15 +498,32 @@ class GossipTopicProtocolState {
   private handleGossipMessage(
     peer: Uint8Array,
     message: Exclude<GossipTopicMessage, { readonly layer: 'swarm' }>,
+    nowMs: number,
   ): readonly TopicOutEvent[] {
-    if (message.type === 'prune' || message.type === 'graft' || message.type === 'ihave') {
+    if (message.type === 'prune') {
+      this.addLazy(peer)
       return []
+    }
+    if (message.type === 'graft') {
+      this.addEager(peer)
+      if (message.id === null) {
+        return []
+      }
+      const cached = this.#cache.get(bytesKey(message.id))?.message
+      if (cached === undefined) {
+        return []
+      }
+      return [{ type: 'send-message', peer: copyBytes(peer), message: copyTopicMessage(cached) }]
+    }
+    if (message.type === 'ihave') {
+      return this.handleIHave(peer, message.messages, nowMs)
     }
     if (!equalBytes(message.id, blake3(message.content))) {
       return []
     }
     const key = bytesKey(message.id)
-    if (this.#seenMessages.has(key)) {
+    if (this.hasSeenMessage(key, nowMs)) {
+      this.addLazy(peer)
       return [
         {
           type: 'send-message',
@@ -447,26 +532,26 @@ class GossipTopicProtocolState {
         },
       ]
     }
-    this.#seenMessages.add(key)
-    const out: TopicOutEvent[] = [
-      {
-        type: 'emit-event',
-        event: {
-          type: 'received',
-          deliveredFrom: copyBytes(peer),
-          id: copyBytes(message.id),
-          payload: copyBytes(message.content),
-          scope: copyDeliveryScope(message.scope),
-        },
-      },
-    ]
+    const out: TopicOutEvent[] = []
+    let deliveredMessage = message
     if (message.scope.type === 'swarm') {
-      out.push(
-        ...this.sendToNeighbors(
-          { ...message, scope: { type: 'swarm', round: message.scope.round + 1 } },
-          peer,
-        ),
-      )
+      deliveredMessage = { ...message, scope: { type: 'swarm', round: message.scope.round + 1 } }
+      this.storeGossip(deliveredMessage, nowMs)
+      this.#graftTimerScheduled.delete(key)
+      this.#missingMessages.delete(key)
+    }
+    out.push({
+      type: 'emit-event',
+      event: {
+        type: 'received',
+        deliveredFrom: copyBytes(peer),
+        id: copyBytes(deliveredMessage.id),
+        payload: copyBytes(deliveredMessage.content),
+        scope: copyDeliveryScope(deliveredMessage.scope),
+      },
+    })
+    if (message.scope.type === 'swarm') {
+      out.push(...this.eagerPush(deliveredMessage, peer), ...this.lazyPush(deliveredMessage, peer))
     }
     return out
   }
@@ -481,6 +566,7 @@ class GossipTopicProtocolState {
       return out
     }
     this.#neighbors.set(key, copyBytes(peer))
+    this.addEager(peer)
     return [
       ...out,
       {
@@ -497,6 +583,10 @@ class GossipTopicProtocolState {
       return []
     }
     this.#neighbors.delete(key)
+    this.#eagerPeers.delete(key)
+    this.#lazyPeers.delete(key)
+    this.#lazyPushQueue.delete(key)
+    this.removeMissingFromPeer(key)
     return [
       {
         type: 'emit-event',
@@ -520,19 +610,200 @@ class GossipTopicProtocolState {
     return [{ type: 'peer-data', peer: validatePeerId(peer.id), peerData }]
   }
 
-  private sendToNeighbors(
-    message: GossipBroadcastMessage,
-    exceptPeer?: Uint8Array,
-  ): readonly TopicOutEvent[] {
-    const exceptKey = exceptPeer === undefined ? null : peerKey(exceptPeer)
+  private eagerPush(message: GossipBroadcastMessage, sender: Uint8Array): readonly TopicOutEvent[] {
+    const senderKey = peerKey(sender)
     const out: TopicOutEvent[] = []
-    for (const [key, peer] of this.#neighbors) {
-      if (key === exceptKey) {
+    for (const [key, peer] of this.#eagerPeers) {
+      if (key === senderKey) {
         continue
       }
       out.push({ type: 'send-message', peer: copyBytes(peer), message: copyTopicMessage(message) })
     }
     return out
+  }
+
+  private lazyPush(message: GossipBroadcastMessage, sender: Uint8Array): readonly TopicOutEvent[] {
+    if (message.scope.type !== 'swarm') {
+      return []
+    }
+    const senderKey = peerKey(sender)
+    for (const [key, peer] of this.#lazyPeers) {
+      if (key === senderKey) {
+        continue
+      }
+      let queue = this.#lazyPushQueue.get(key)
+      if (queue === undefined) {
+        queue = { peer: copyBytes(peer), messages: [] }
+        this.#lazyPushQueue.set(key, queue)
+      }
+      queue.messages.push({ id: copyBytes(message.id), round: message.scope.round })
+    }
+    if (this.#lazyPushQueue.size === 0 || this.#dispatchTimerScheduled) {
+      return []
+    }
+    this.#dispatchTimerScheduled = true
+    return [
+      {
+        type: 'schedule-timer',
+        delayMs: lazyDispatchDelayMs,
+        timer: { type: 'dispatch-lazy-push' },
+      },
+    ]
+  }
+
+  private handleIHave(
+    peer: Uint8Array,
+    messages: readonly GossipIHaveEntry[],
+    nowMs: number,
+  ): readonly TopicOutEvent[] {
+    const out: TopicOutEvent[] = []
+    for (const message of messages) {
+      const key = bytesKey(message.id)
+      if (this.hasSeenMessage(key, nowMs)) {
+        continue
+      }
+      let queue = this.#missingMessages.get(key)
+      if (queue === undefined) {
+        queue = []
+        this.#missingMessages.set(key, queue)
+      }
+      queue.push({ peer: copyBytes(peer), round: message.round })
+      if (this.#graftTimerScheduled.has(key)) {
+        continue
+      }
+      this.#graftTimerScheduled.add(key)
+      out.push({
+        type: 'schedule-timer',
+        delayMs: graftTimeoutMs,
+        timer: { type: 'send-graft', id: copyBytes(message.id) },
+      })
+    }
+    return out
+  }
+
+  private handleTimer(timer: TopicTimer, nowMs: number): readonly TopicOutEvent[] {
+    if (timer.type === 'dispatch-lazy-push') {
+      this.#dispatchTimerScheduled = false
+      const out: TopicOutEvent[] = []
+      for (const queue of this.#lazyPushQueue.values()) {
+        if (queue.messages.length === 0) {
+          continue
+        }
+        for (const chunk of this.chunkIHaveMessages(queue.messages)) {
+          out.push({
+            type: 'send-message',
+            peer: copyBytes(queue.peer),
+            message: {
+              layer: 'gossip',
+              type: 'ihave',
+              messages: chunk,
+            },
+          })
+        }
+      }
+      this.#lazyPushQueue.clear()
+      return out
+    }
+
+    const id = validateMessageId(timer.id)
+    const key = bytesKey(id)
+    this.#graftTimerScheduled.delete(key)
+    if (this.hasSeenMessage(key, nowMs)) {
+      return []
+    }
+    const queue = this.#missingMessages.get(key)
+    const next = queue?.shift()
+    if (queue !== undefined && queue.length === 0) {
+      this.#missingMessages.delete(key)
+    }
+    if (next === undefined) {
+      return []
+    }
+    this.addEager(next.peer)
+    return [
+      {
+        type: 'send-message',
+        peer: copyBytes(next.peer),
+        message: { layer: 'gossip', type: 'graft', id, round: next.round },
+      },
+      {
+        type: 'schedule-timer',
+        delayMs: retryGraftTimeoutMs,
+        timer: { type: 'send-graft', id },
+      },
+    ]
+  }
+
+  private storeGossip(message: GossipBroadcastMessage, nowMs: number): void {
+    const key = bytesKey(message.id)
+    this.#seenMessages.set(key, nowMs + messageIdRetentionMs)
+    this.#cache.set(key, {
+      message: copyGossipBroadcastMessage(message),
+      expiresAtMs: nowMs + messageCacheRetentionMs,
+    })
+  }
+
+  private hasSeenMessage(key: string, nowMs: number): boolean {
+    const expiresAtMs = this.#seenMessages.get(key)
+    if (expiresAtMs === undefined) {
+      return false
+    }
+    if (expiresAtMs <= nowMs) {
+      this.#seenMessages.delete(key)
+      return false
+    }
+    return true
+  }
+
+  private expireCaches(nowMs: number): void {
+    for (const [key, expiresAtMs] of this.#seenMessages) {
+      if (expiresAtMs <= nowMs) {
+        this.#seenMessages.delete(key)
+      }
+    }
+    for (const [key, cached] of this.#cache) {
+      if (cached.expiresAtMs <= nowMs) {
+        this.#cache.delete(key)
+      }
+    }
+  }
+
+  private addEager(peer: Uint8Array): void {
+    const key = peerKey(peer)
+    this.#lazyPeers.delete(key)
+    this.#lazyPushQueue.delete(key)
+    this.#eagerPeers.set(key, copyBytes(peer))
+  }
+
+  private addLazy(peer: Uint8Array): void {
+    const key = peerKey(peer)
+    this.#eagerPeers.delete(key)
+    this.#lazyPeers.set(key, copyBytes(peer))
+  }
+
+  private removeMissingFromPeer(peerMapKey: string): void {
+    for (const [id, queue] of this.#missingMessages) {
+      const nextQueue = queue.filter((entry) => peerKey(entry.peer) !== peerMapKey)
+      if (nextQueue.length === 0) {
+        this.#missingMessages.delete(id)
+      } else {
+        this.#missingMessages.set(id, nextQueue)
+      }
+    }
+  }
+
+  private chunkIHaveMessages(
+    messages: readonly GossipIHaveEntry[],
+  ): readonly (readonly GossipIHaveEntry[])[] {
+    const chunkLength = Math.max(
+      1,
+      Math.floor((this.#maxMessageSize - 3) / ihaveEntryMaxEncodedSize),
+    )
+    const chunks: GossipIHaveEntry[][] = []
+    for (let offset = 0; offset < messages.length; offset += chunkLength) {
+      chunks.push(messages.slice(offset, offset + chunkLength).map(copyIHaveEntry))
+    }
+    return chunks
   }
 
   private forwardJoin(peer: Uint8Array, peerData: Uint8Array | null): readonly TopicOutEvent[] {
@@ -567,6 +838,29 @@ function broadcastScope(scope: GossipBroadcastScope | undefined): GossipDelivery
 function validatePeerId(peer: Uint8Array): Uint8Array {
   requireLength(peer, 32, 'gossip peer id')
   return copyBytes(peer)
+}
+
+function validateMessageId(id: Uint8Array): Uint8Array {
+  requireLength(id, 32, 'gossip message id')
+  return copyBytes(id)
+}
+
+function validateMaxMessageSize(size: number): number {
+  if (!Number.isInteger(size) || size < minMaxMessageSize) {
+    throw new RangeError(`gossip max message size must be at least ${minMaxMessageSize}`)
+  }
+  return size
+}
+
+function isTopicTimer(timer: unknown): timer is TopicTimer {
+  if (typeof timer !== 'object' || timer === null || !('type' in timer)) {
+    return false
+  }
+  const type = timer.type
+  if (type === 'dispatch-lazy-push') {
+    return true
+  }
+  return type === 'send-graft' && 'id' in timer && timer.id instanceof Uint8Array
 }
 
 function copyOptionalBytes(bytes: Uint8Array | null): Uint8Array | null {
@@ -611,6 +905,15 @@ function copyTopicMessage(message: GossipTopicMessage): GossipTopicMessage {
     return { ...message, messages: message.messages.map(copyIHaveEntry) }
   }
   return { ...message }
+}
+
+function copyGossipBroadcastMessage(message: GossipBroadcastMessage): GossipBroadcastMessage {
+  return {
+    ...message,
+    id: copyBytes(message.id),
+    content: copyBytes(message.content),
+    scope: copyDeliveryScope(message.scope),
+  }
 }
 
 function copyPeerInfo(peer: GossipPeerInfo): GossipPeerInfo {
@@ -672,4 +975,8 @@ function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
     diff |= (left[index] ?? 0) ^ (right[index] ?? 0)
   }
   return diff === 0
+}
+
+function monotonicNowMs(): number {
+  return performance.now()
 }
