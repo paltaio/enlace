@@ -240,6 +240,7 @@ export async function startNativeIrohGossipClientSender(
       IROH_GOSSIP_STAY_OPEN: '1',
       RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
     },
+    stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
   })
@@ -247,7 +248,8 @@ export async function startNativeIrohGossipClientSender(
   const stderr = streamToText(proc.stderr)
 
   async function stop(): Promise<void> {
-    await stopProcess(proc, 'native iroh gossip client sender stop')
+    await closeProcessStdin(proc)
+    await waitForStopOrKill(proc, 'native iroh gossip client sender stop')
   }
 
   try {
@@ -491,11 +493,38 @@ async function stopProcess(proc: ReturnType<typeof Bun.spawn>, label: string): P
     return
   }
   proc.kill()
+  await waitForStopOrKill(proc, label)
+}
+
+async function waitForStopOrKill(proc: ReturnType<typeof Bun.spawn>, label: string): Promise<void> {
+  if (proc.exitCode !== null) {
+    return
+  }
   try {
     await withTimeout(proc.exited, label, 2_000)
   } catch {
-    proc.kill('SIGKILL')
-    await proc.exited
+    proc.kill()
+    try {
+      await withTimeout(proc.exited, `${label} after terminate`, 2_000)
+      return
+    } catch {
+      proc.kill('SIGKILL')
+      await proc.exited
+    }
+  }
+}
+
+async function closeProcessStdin(proc: ReturnType<typeof Bun.spawn>): Promise<void> {
+  const stdin = proc.stdin
+  if (typeof stdin !== 'object' || stdin === null) {
+    return
+  }
+  try {
+    stdin.end()
+  } catch {
+    if (proc.exitCode === null) {
+      proc.kill()
+    }
   }
 }
 

@@ -8,7 +8,7 @@ use iroh::{
 };
 use iroh_gossip::{ALPN as GOSSIP_ALPN, api::Event as GossipEvent, net::Gossip, proto::TopicId};
 use n0_future::StreamExt;
-use tokio::io;
+use tokio::io::{self, AsyncReadExt};
 use tokio::time::{Duration, timeout};
 
 mod gossip_vectors;
@@ -122,7 +122,9 @@ async fn run_gossip_client_send() -> Result<()> {
         hex(&payload)
     );
     if std::env::var("IROH_GOSSIP_STAY_OPEN").as_deref() == Ok("1") {
-        std::future::pending::<()>().await;
+        let mut stdin = io::stdin();
+        let mut buffer = [0u8; 1];
+        let _ = stdin.read(&mut buffer).await;
     }
     router.shutdown().await?;
     Ok(())

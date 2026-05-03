@@ -4,6 +4,7 @@ import { createEndpoint, createGossip } from '@paltaio/iroh-lite'
 
 import { startLocalIrohRelay, withTimeout } from '../testing/local-iroh-relay'
 import {
+  runNativeIrohGossipClientSend,
   startNativeIrohGossipClientSender,
   startNativeIrohGossipServer,
   type NativeIrohGossipEvent,
@@ -91,6 +92,64 @@ describe('native iroh gossip interop', () => {
     },
     150_000,
   )
+
+  interopTest(
+    'accepts native leave and rejoin over relay',
+    async () => {
+      const relay = await startLocalIrohRelay()
+      const endpoint = await createEndpoint({ relayUrl: relay.url })
+      const gossip = createGossip(endpoint)
+      const subscription = gossip.subscribe({ topicId })
+      const events = subscription.events()
+      const nextPayload = new TextEncoder().encode('hello again from native iroh gossip')
+      let nativeSender: Awaited<ReturnType<typeof startNativeIrohGossipClientSender>> | null = null
+
+      try {
+        const firstSender = await runNativeIrohGossipClientSend({
+          relayUrl: relay.url,
+          serverEndpointId: endpoint.endpointId,
+          topicId,
+          payload,
+        })
+        const first = await withTimeout(nextMessage(events), 'first native message', 120_000)
+        expect(first).toEqual({
+          type: 'message',
+          topicId,
+          deliveredFrom: firstSender.endpointId,
+          id: expect.any(Uint8Array),
+          payload,
+          scope: { type: 'swarm', round: 1 },
+        })
+
+        expect(
+          await withTimeout(nextNeighborDown(events), 'native neighbor-down', 120_000),
+        ).toEqual(firstSender.endpointId)
+
+        nativeSender = await startNativeIrohGossipClientSender({
+          relayUrl: relay.url,
+          serverEndpointId: endpoint.endpointId,
+          topicId,
+          payload: nextPayload,
+        })
+        const second = await withTimeout(nextMessage(events), 'second native message', 120_000)
+        expect(second).toEqual({
+          type: 'message',
+          topicId,
+          deliveredFrom: nativeSender.endpointId,
+          id: expect.any(Uint8Array),
+          payload: nextPayload,
+          scope: { type: 'swarm', round: 1 },
+        })
+      } finally {
+        subscription.close()
+        gossip.close()
+        endpoint.close()
+        await nativeSender?.stop()
+        await relay.stop()
+      }
+    },
+    180_000,
+  )
 })
 
 async function nextMessage(events: AsyncIterable<{ readonly type: string }>): Promise<unknown> {
@@ -100,6 +159,17 @@ async function nextMessage(events: AsyncIterable<{ readonly type: string }>): Pr
     }
   }
   throw new Error('gossip events closed before message')
+}
+
+async function nextNeighborDown(
+  events: AsyncIterable<{ readonly type: string; readonly peer?: Uint8Array }>,
+): Promise<Uint8Array> {
+  for await (const event of events) {
+    if (event.type === 'neighbor-down' && event.peer !== undefined) {
+      return event.peer
+    }
+  }
+  throw new Error('gossip events closed before neighbor-down')
 }
 
 async function nextNativeMessage(native: {
