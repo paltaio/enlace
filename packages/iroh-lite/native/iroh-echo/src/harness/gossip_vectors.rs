@@ -1,9 +1,12 @@
+use std::{collections::BTreeSet, net::SocketAddr};
+
 use anyhow::{Result, bail};
 use bytes::Bytes;
-use iroh::{PublicKey, SecretKey};
+use iroh::{PublicKey, RelayUrl, SecretKey};
 use iroh_gossip::proto::{self, Command, InEvent, OutEvent, PeerData, Scope, TopicId};
 use n0_future::time::Instant;
 use rand::{SeedableRng, rngs::StdRng};
+use serde::{Deserialize, Serialize};
 
 const TOPIC_ID: [u8; 32] = [
     0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
@@ -12,6 +15,14 @@ const TOPIC_ID: [u8; 32] = [
 pub(crate) const ALPN: &[u8] = b"/iroh-gossip/1";
 const PAYLOAD: &[u8] = b"hello gossip";
 const REPAIR_PAYLOAD: &[u8] = b"repair gossip";
+const RELAY_URL: &str = "https://relay.example.com/";
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct AddrInfo {
+    relay_url: Option<RelayUrl>,
+    direct_addresses: BTreeSet<SocketAddr>,
+}
 
 pub(crate) struct BroadcastFrames {
     pub(crate) topic_id: TopicId,
@@ -36,6 +47,10 @@ pub fn run() -> Result<()> {
     let prune = prune_message(peer_a, peer_b, peer_c, topic)?;
     let ihave = ihave_message(peer_a, peer_b, peer_c, topic)?;
     let graft = graft_message(peer_a, peer_b, peer_c, topic)?;
+    let empty_addr_info = postcard::to_stdvec(&AddrInfo::default())?;
+    let relay_peer_data = relay_peer_data()?;
+    let direct_peer_data = direct_peer_data()?;
+    let relay_join = join_message_with_peer_data(peer_b, peer_a, topic, relay_peer_data.clone())?;
 
     println!("IROH_GOSSIP_VECTOR alpn_hex={}", hex(ALPN));
     println!("IROH_GOSSIP_VECTOR topic_id_hex={}", hex(topic.as_bytes()));
@@ -48,6 +63,13 @@ pub fn run() -> Result<()> {
     println!(
         "IROH_GOSSIP_VECTOR join_message_frame_hex={}",
         hex(&length_prefixed(&topic_message_payload(&join, topic)?)?)
+    );
+    println!(
+        "IROH_GOSSIP_VECTOR relay_join_message_frame_hex={}",
+        hex(&length_prefixed(&topic_message_payload(
+            &relay_join,
+            topic
+        )?)?)
     );
     println!(
         "IROH_GOSSIP_VECTOR neighbor_message_frame_hex={}",
@@ -102,6 +124,24 @@ pub fn run() -> Result<()> {
         "IROH_GOSSIP_VECTOR repair_payload_hex={}",
         hex(REPAIR_PAYLOAD)
     );
+    println!(
+        "IROH_GOSSIP_VECTOR peer_data_empty_hex={}",
+        hex(PeerData::default().as_bytes())
+    );
+    println!(
+        "IROH_GOSSIP_VECTOR addr_info_empty_hex={}",
+        hex(&empty_addr_info)
+    );
+    println!("IROH_GOSSIP_VECTOR relay_url={RELAY_URL}");
+    println!(
+        "IROH_GOSSIP_VECTOR relay_peer_data_hex={}",
+        hex(relay_peer_data.as_bytes())
+    );
+    println!("IROH_GOSSIP_VECTOR direct_addr=127.0.0.1:12345");
+    println!(
+        "IROH_GOSSIP_VECTOR direct_peer_data_hex={}",
+        hex(direct_peer_data.as_bytes())
+    );
     Ok(())
 }
 
@@ -135,6 +175,21 @@ fn join_message(
     topic: TopicId,
 ) -> Result<proto::Message<PublicKey>> {
     let mut state = state(joiner, 1);
+    let out = state.handle(
+        InEvent::Command(topic, Command::Join(vec![bootstrap])),
+        Instant::now(),
+        None,
+    );
+    require_send_message(out, bootstrap, "join")
+}
+
+fn join_message_with_peer_data(
+    joiner: PublicKey,
+    bootstrap: PublicKey,
+    topic: TopicId,
+    peer_data: PeerData,
+) -> Result<proto::Message<PublicKey>> {
+    let mut state = state_with_peer_data(joiner, peer_data, 1);
     let out = state.handle(
         InEvent::Command(topic, Command::Join(vec![bootstrap])),
         Instant::now(),
@@ -360,9 +415,17 @@ fn receive(
 }
 
 fn state(peer: PublicKey, seed: u64) -> proto::State<PublicKey, StdRng> {
+    state_with_peer_data(peer, PeerData::default(), seed)
+}
+
+fn state_with_peer_data(
+    peer: PublicKey,
+    peer_data: PeerData,
+    seed: u64,
+) -> proto::State<PublicKey, StdRng> {
     proto::State::new(
         peer,
-        PeerData::default(),
+        peer_data,
         proto::Config::default(),
         StdRng::seed_from_u64(seed),
     )
@@ -448,6 +511,23 @@ fn length_prefixed(payload: &[u8]) -> Result<Vec<u8>> {
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(payload);
     Ok(out)
+}
+
+fn relay_peer_data() -> Result<PeerData> {
+    let relay_url: RelayUrl = RELAY_URL.parse()?;
+    let info = AddrInfo {
+        relay_url: Some(relay_url),
+        direct_addresses: BTreeSet::new(),
+    };
+    Ok(PeerData::new(postcard::to_stdvec(&info)?))
+}
+
+fn direct_peer_data() -> Result<PeerData> {
+    let info = AddrInfo {
+        relay_url: None,
+        direct_addresses: BTreeSet::from(["127.0.0.1:12345".parse()?]),
+    };
+    Ok(PeerData::new(postcard::to_stdvec(&info)?))
 }
 
 fn peer_from_seed(seed: u8) -> PublicKey {

@@ -145,7 +145,9 @@ export function encodeGossipStreamHeader(header: GossipStreamHeader): Uint8Array
   return encodeGossipStreamFrame(validateGossipTopicId(header.topicId))
 }
 
-export function encodeGossipSwarmJoinMessage(peerData = new Uint8Array()): Uint8Array {
+export function encodeGossipSwarmJoinMessage(
+  peerData: Uint8Array | null = new Uint8Array(),
+): Uint8Array {
   return encodeGossipStreamFrame(
     concatBytes([encodePostcardLen(0), encodePostcardLen(0), encodeOptionalPeerData(peerData)]),
   )

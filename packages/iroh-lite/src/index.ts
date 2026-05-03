@@ -42,6 +42,8 @@ export {
   RelayWebSocketClient,
   connectRelayWebSocket,
 } from './relay/client'
+export { decodeGossipPeerDataAddrInfo, encodeGossipPeerDataAddrInfo } from './gossip/peer-data'
+export type { GossipPeerDataAddrInfo } from './gossip/peer-data'
 export type {
   ConnectRelayWebSocketOptions,
   RelayBrowserWebSocket,

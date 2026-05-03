@@ -28,6 +28,8 @@ const vector = {
   topicIdHex: '101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f',
   streamHeaderFrameHex: '00000020101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f',
   joinMessageFrameHex: '0000000400000100',
+  relayJoinMessageFrameHex:
+    '000000210000011d011a68747470733a2f2f72656c61792e6578616d706c652e636f6d2f00',
   neighborMessageFrameHex: '000000050004000100',
   forwardJoinMessageFrameHex:
     '000000250001ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1010006',
@@ -45,6 +47,7 @@ const vector = {
     '00000024010201283d8b10fc0413e78cb9eb40037257fc8a8cbac07b6ed30d6e77d134ee79176f00',
   broadcastPayloadHex: '68656c6c6f20676f73736970',
   repairPayloadHex: '72657061697220676f73736970',
+  relayPeerDataHex: '011a68747470733a2f2f72656c61792e6578616d706c652e636f6d2f00',
   peerAHex: '8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c',
   peerCHex: 'ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1',
 }
@@ -81,6 +84,22 @@ describe('gossip wire frames', () => {
 
   test('encodes native join message frame', () => {
     expect(bytesToHex(encodeGossipSwarmJoinMessage())).toBe(vector.joinMessageFrameHex)
+  })
+
+  test('encodes native join message frame with relay peer data', () => {
+    expect(bytesToHex(encodeGossipSwarmJoinMessage(hexToBytes(vector.relayPeerDataHex)))).toBe(
+      vector.relayJoinMessageFrameHex,
+    )
+  })
+
+  test('decodes native join message frame with relay peer data', () => {
+    const frame = decodeGossipStreamFrame(hexToBytes(vector.relayJoinMessageFrameHex))
+
+    expect(decodeGossipTopicMessage(frame.payload)).toEqual({
+      layer: 'swarm',
+      type: 'join',
+      peerData: hexToBytes(vector.relayPeerDataHex),
+    })
   })
 
   test('decodes native neighbor message frame', () => {
