@@ -11,6 +11,7 @@ const peerA = hexToBytes('8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf37488
 const peerB = hexToBytes('ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1')
 const peerC = hexToBytes('c352229ac4bcb6f633f773596a30ad8b2dfb0256f2ca8db78dd085eec828d838')
 const peerD = hexToBytes('4ca37a63d42514dd1df5974786fe9f66098ab283429a5534f38e75c7b6f46735')
+const peerE = hexToBytes('630abef7d2ec016d768865e83187b6dbb82bb87e1b1179f4018536da6afc5f9b')
 const peerData = hexToBytes('011a68747470733a2f2f72656c61792e6578616d706c652e636f6d2f00')
 
 describe('gossip protocol state', () => {
@@ -477,6 +478,240 @@ describe('gossip protocol state', () => {
     expect(() => new GossipProtocolState({ me: peerA, maxMessageSize: 511 })).toThrow(RangeError)
   })
 
+  test('active view capacity evicts old high-priority neighbor to passive view', () => {
+    const state = new GossipProtocolState({ me: peerA, activeViewCapacity: 1 })
+    joinTopic(state, topicA)
+    receiveJoin(state, topicA, peerB)
+
+    const out = state.handle({
+      type: 'recv-message',
+      peer: peerC,
+      topicId: topicA,
+      message: { layer: 'swarm', type: 'join', peerData: new Uint8Array() },
+    })
+
+    expect(out).toEqual([
+      {
+        type: 'emit-event',
+        topicId: topicA,
+        event: { type: 'neighbor-down', peer: peerB },
+      },
+      {
+        type: 'send-message',
+        peer: peerB,
+        topicId: topicA,
+        message: { layer: 'swarm', type: 'disconnect', alive: true, respond: false },
+      },
+      { type: 'disconnect-peer', peer: peerB },
+      {
+        type: 'emit-event',
+        topicId: topicA,
+        event: { type: 'neighbor-up', peer: peerC },
+      },
+      {
+        type: 'send-message',
+        peer: peerC,
+        topicId: topicA,
+        message: {
+          layer: 'swarm',
+          type: 'neighbor',
+          priority: 'high',
+          peerData: new Uint8Array(),
+        },
+      },
+    ])
+  })
+
+  test('low-priority neighbor request is refused when active view is full', () => {
+    const state = new GossipProtocolState({ me: peerA, activeViewCapacity: 1 })
+    joinTopic(state, topicA)
+    receiveJoin(state, topicA, peerB)
+
+    expect(
+      state.handle({
+        type: 'recv-message',
+        peer: peerC,
+        topicId: topicA,
+        message: {
+          layer: 'swarm',
+          type: 'neighbor',
+          priority: 'low',
+          peerData: new Uint8Array(),
+        },
+      }),
+    ).toEqual([
+      {
+        type: 'send-message',
+        peer: peerC,
+        topicId: topicA,
+        message: { layer: 'swarm', type: 'disconnect', alive: true, respond: false },
+      },
+      { type: 'disconnect-peer', peer: peerC },
+    ])
+  })
+
+  test('forward join stores passive peers at PRWL and forwards with decremented TTL', () => {
+    const state = joinedStateWithNeighbors()
+
+    const out = state.handle({
+      type: 'recv-message',
+      peer: peerB,
+      topicId: topicA,
+      message: {
+        layer: 'swarm',
+        type: 'forward-join',
+        peer: { id: peerD, peerData },
+        ttl: 3,
+      },
+    })
+
+    expect(out).toEqual([
+      { type: 'peer-data', peer: peerD, peerData },
+      {
+        type: 'send-message',
+        peer: peerC,
+        topicId: topicA,
+        message: {
+          layer: 'swarm',
+          type: 'forward-join',
+          peer: { id: peerD, peerData },
+          ttl: 2,
+        },
+      },
+    ])
+  })
+
+  test('disconnect refills active view from passive peers', () => {
+    const state = new GossipProtocolState({ me: peerA, activeViewCapacity: 2 })
+    joinTopic(state, topicA)
+    receiveJoin(state, topicA, peerB)
+    receiveNeighbor(state, topicA, peerB)
+    receiveJoin(state, topicA, peerC)
+    receiveNeighbor(state, topicA, peerC)
+    state.handle({
+      type: 'recv-message',
+      peer: peerB,
+      topicId: topicA,
+      message: {
+        layer: 'swarm',
+        type: 'forward-join',
+        peer: { id: peerD, peerData },
+        ttl: 3,
+      },
+    })
+
+    const out = state.handle({ type: 'peer-disconnected', peer: peerB })
+    const timer = onlyTimer(out)
+
+    expect(out).toEqual([
+      {
+        type: 'emit-event',
+        topicId: topicA,
+        event: { type: 'neighbor-down', peer: peerB },
+      },
+      { type: 'disconnect-peer', peer: peerB },
+      {
+        type: 'send-message',
+        peer: peerD,
+        topicId: topicA,
+        message: {
+          layer: 'swarm',
+          type: 'neighbor',
+          priority: 'low',
+          peerData: new Uint8Array(),
+        },
+      },
+      timer,
+    ])
+    expect(timer.delayMs).toBe(500)
+
+    expect(
+      state.handle({
+        type: 'timer-expired',
+        timer: timer.timer,
+      }),
+    ).toEqual([{ type: 'disconnect-peer', peer: peerD }])
+  })
+
+  test('alive disconnect keeps passive peer after connection close', () => {
+    const state = new GossipProtocolState({ me: peerA, activeViewCapacity: 1 })
+    joinTopic(state, topicA)
+    receiveJoin(state, topicA, peerB)
+    state.handle({
+      type: 'recv-message',
+      peer: peerC,
+      topicId: topicA,
+      message: { layer: 'swarm', type: 'join', peerData: new Uint8Array() },
+    })
+
+    expect(state.handle({ type: 'peer-disconnected', peer: peerB })).toEqual([])
+    const out = state.handle({ type: 'peer-disconnected', peer: peerC })
+    const timer = onlyTimer(out)
+
+    expect(out).toEqual([
+      {
+        type: 'emit-event',
+        topicId: topicA,
+        event: { type: 'neighbor-down', peer: peerC },
+      },
+      { type: 'disconnect-peer', peer: peerC },
+      {
+        type: 'send-message',
+        peer: peerB,
+        topicId: topicA,
+        message: {
+          layer: 'swarm',
+          type: 'neighbor',
+          priority: 'high',
+          peerData: new Uint8Array(),
+        },
+      },
+      timer,
+    ])
+  })
+
+  test('pending neighbor timeout disconnects failed probe and skips pending passive peers', () => {
+    const state = new GossipProtocolState({ me: peerA, activeViewCapacity: 3 })
+    joinTopic(state, topicA)
+    receiveJoin(state, topicA, peerB)
+    receiveNeighbor(state, topicA, peerB)
+    receiveJoin(state, topicA, peerC)
+    receiveNeighbor(state, topicA, peerC)
+    receiveForwardJoin(state, topicA, peerB, peerD)
+    receiveForwardJoin(state, topicA, peerB, peerE)
+
+    const firstRefill = state.handle({ type: 'peer-disconnected', peer: peerB })
+    const firstTimer = onlyTimer(firstRefill)
+    expect(sendMessages(firstRefill)).toEqual([
+      expect.objectContaining({
+        peer: peerD,
+        message: expect.objectContaining({ type: 'neighbor', priority: 'low' }),
+      }),
+    ])
+
+    const secondRefill = state.handle({ type: 'peer-disconnected', peer: peerC })
+    const secondTimer = onlyTimer(secondRefill)
+    expect(sendMessages(secondRefill)).toEqual([
+      expect.objectContaining({
+        peer: peerE,
+        message: expect.objectContaining({ type: 'neighbor', priority: 'high' }),
+      }),
+    ])
+
+    expect(
+      state.handle({
+        type: 'timer-expired',
+        timer: firstTimer.timer,
+      }),
+    ).toEqual([{ type: 'disconnect-peer', peer: peerD }])
+    expect(
+      state.handle({
+        type: 'timer-expired',
+        timer: secondTimer.timer,
+      }),
+    ).toEqual([{ type: 'disconnect-peer', peer: peerE }])
+  })
+
   test('network disconnect waits until peer leaves all topics', () => {
     const state = new GossipProtocolState({ me: peerA })
     joinTopic(state, topicA)
@@ -567,6 +802,39 @@ function receiveJoin(state: GossipProtocolState, topicId: Uint8Array, peer: Uint
     peer,
     topicId,
     message: { layer: 'swarm', type: 'join', peerData: new Uint8Array() },
+  })
+}
+
+function receiveNeighbor(state: GossipProtocolState, topicId: Uint8Array, peer: Uint8Array): void {
+  state.handle({
+    type: 'recv-message',
+    peer,
+    topicId,
+    message: {
+      layer: 'swarm',
+      type: 'neighbor',
+      priority: 'high',
+      peerData: new Uint8Array(),
+    },
+  })
+}
+
+function receiveForwardJoin(
+  state: GossipProtocolState,
+  topicId: Uint8Array,
+  sender: Uint8Array,
+  peer: Uint8Array,
+): void {
+  state.handle({
+    type: 'recv-message',
+    peer: sender,
+    topicId,
+    message: {
+      layer: 'swarm',
+      type: 'forward-join',
+      peer: { id: peer, peerData },
+      ttl: 3,
+    },
   })
 }
 

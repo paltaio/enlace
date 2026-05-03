@@ -15,6 +15,11 @@ const graftTimeoutMs = 80
 const retryGraftTimeoutMs = 40
 const messageCacheRetentionMs = 30_000
 const messageIdRetentionMs = 90_000
+const activeViewCapacity = 5
+const passiveViewCapacity = 30
+const activeRandomWalkLength = 6
+const passiveRandomWalkLength = 3
+const pendingNeighborTimeoutMs = 500
 const defaultMaxMessageSize = 4096
 const minMaxMessageSize = 512
 const ihaveEntryMaxEncodedSize = 35
@@ -23,6 +28,8 @@ export interface GossipProtocolStateOptions {
   readonly me: Uint8Array
   readonly peerData?: Uint8Array | null
   readonly maxMessageSize?: number
+  readonly activeViewCapacity?: number
+  readonly passiveViewCapacity?: number
 }
 
 export type GossipProtocolInEvent =
@@ -134,6 +141,8 @@ type TopicOutEvent =
 export class GossipProtocolState {
   readonly #me: Uint8Array
   readonly #maxMessageSize: number
+  readonly #activeViewCapacity: number
+  readonly #passiveViewCapacity: number
   #peerData: Uint8Array | null
   readonly #topics = new Map<string, GossipTopicProtocolState>()
   readonly #peerTopics = new Map<string, PeerTopicMembership>()
@@ -141,6 +150,14 @@ export class GossipProtocolState {
   constructor(options: GossipProtocolStateOptions) {
     this.#me = validatePeerId(options.me)
     this.#maxMessageSize = validateMaxMessageSize(options.maxMessageSize ?? defaultMaxMessageSize)
+    this.#activeViewCapacity = validateViewCapacity(
+      options.activeViewCapacity ?? activeViewCapacity,
+      'active',
+    )
+    this.#passiveViewCapacity = validateViewCapacity(
+      options.passiveViewCapacity ?? passiveViewCapacity,
+      'passive',
+    )
     this.#peerData = copyOptionalBytes(options.peerData ?? new Uint8Array())
   }
 
@@ -231,8 +248,10 @@ export class GossipProtocolState {
       return topic
     }
     const nextTopic = new GossipTopicProtocolState({
+      activeViewCapacity: this.#activeViewCapacity,
       maxMessageSize: this.#maxMessageSize,
       me: this.#me,
+      passiveViewCapacity: this.#passiveViewCapacity,
       peerData: this.#peerData,
       topicId,
     })
@@ -327,6 +346,7 @@ interface PeerTopicMembership {
 
 type TopicTimer =
   | { readonly type: 'dispatch-lazy-push' }
+  | { readonly type: 'pending-neighbor'; readonly peer: Uint8Array }
   | { readonly type: 'send-graft'; readonly id: Uint8Array }
 
 interface LazyPushPeerQueue {
@@ -348,10 +368,15 @@ interface CachedGossipMessage {
 
 class GossipTopicProtocolState {
   readonly #me: Uint8Array
+  readonly #activeViewCapacity: number
   readonly #maxMessageSize: number
+  readonly #passiveViewCapacity: number
   readonly #topicId: Uint8Array
   #peerData: Uint8Array | null
   readonly #neighbors = new Map<string, Uint8Array>()
+  readonly #passivePeers = new Map<string, Uint8Array>()
+  readonly #pendingNeighborRequests = new Set<string>()
+  readonly #aliveDisconnectPeers = new Set<string>()
   readonly #eagerPeers = new Map<string, Uint8Array>()
   readonly #lazyPeers = new Map<string, Uint8Array>()
   readonly #lazyPushQueue = new Map<string, LazyPushPeerQueue>()
@@ -363,13 +388,17 @@ class GossipTopicProtocolState {
   #dispatchTimerScheduled = false
 
   constructor(options: {
+    readonly activeViewCapacity: number
     readonly maxMessageSize: number
     readonly me: Uint8Array
+    readonly passiveViewCapacity: number
     readonly peerData: Uint8Array | null
     readonly topicId: Uint8Array
   }) {
+    this.#activeViewCapacity = validateViewCapacity(options.activeViewCapacity, 'active')
     this.#maxMessageSize = validateMaxMessageSize(options.maxMessageSize)
     this.#me = validatePeerId(options.me)
+    this.#passiveViewCapacity = validateViewCapacity(options.passiveViewCapacity, 'passive')
     this.#peerData = copyOptionalBytes(options.peerData)
     this.#topicId = validateGossipTopicId(options.topicId)
   }
@@ -446,6 +475,13 @@ class GossipTopicProtocolState {
       out.push({ type: 'disconnect-peer', peer: copyBytes(peer) })
     }
     this.#neighbors.clear()
+    this.#passivePeers.clear()
+    this.#pendingNeighborRequests.clear()
+    this.#aliveDisconnectPeers.clear()
+    this.#eagerPeers.clear()
+    this.#lazyPeers.clear()
+    this.#lazyPushQueue.clear()
+    this.#missingMessages.clear()
     return out
   }
 
@@ -466,31 +502,29 @@ class GossipTopicProtocolState {
   ): readonly TopicOutEvent[] {
     if (message.type === 'join') {
       return [
-        ...this.addNeighbor(peer, message.peerData),
-        {
-          type: 'send-message',
-          peer: copyBytes(peer),
-          message: {
-            layer: 'swarm',
-            type: 'neighbor',
-            priority: 'high',
-            peerData: copyOptionalBytes(this.#peerData),
-          },
-        },
+        ...this.addActive(peer, message.peerData, 'high', true),
         ...this.forwardJoin(peer, message.peerData),
       ]
     }
     if (message.type === 'neighbor') {
-      return this.addNeighbor(peer, message.peerData)
+      const key = peerKey(peer)
+      const isReply = this.#pendingNeighborRequests.delete(key)
+      return this.addActive(peer, message.peerData, message.priority, !isReply)
     }
     if (message.type === 'disconnect') {
-      return [...this.removeNeighbor(peer), { type: 'disconnect-peer', peer: copyBytes(peer) }]
+      return this.handleDisconnectMessage(peer, message.alive)
     }
     if (message.type === 'forward-join') {
-      return this.addPeerData(message.peer)
+      return this.handleForwardJoin(peer, message)
     }
-    if (message.type === 'shuffle' || message.type === 'shuffle-reply') {
-      return message.nodes.flatMap((node) => this.addPeerData(node))
+    if (message.type === 'shuffle') {
+      return this.handleShuffle(peer, message)
+    }
+    if (message.type === 'shuffle-reply') {
+      return [
+        ...message.nodes.flatMap((node) => this.addPassive(node.id, node.peerData)),
+        ...this.refillActiveFromPassive(),
+      ]
     }
     return []
   }
@@ -556,44 +590,301 @@ class GossipTopicProtocolState {
     return out
   }
 
-  private addNeighbor(peer: Uint8Array, data: Uint8Array | null): readonly TopicOutEvent[] {
+  private addActive(
+    peer: Uint8Array,
+    data: Uint8Array | null,
+    priority: 'high' | 'low',
+    reply: boolean,
+  ): readonly TopicOutEvent[] {
     if (equalBytes(peer, this.#me)) {
       return []
     }
     const key = peerKey(peer)
-    const out = this.addPeerData({ id: peer, peerData: data })
+    const out: TopicOutEvent[] = [...this.addPeerData({ id: peer, peerData: data })]
     if (this.#neighbors.has(key)) {
-      return out
+      if (!reply) {
+        return out
+      }
+      return [...out, ...this.sendNeighbor(peer, priority)]
     }
+    if (priority === 'low' && this.#neighbors.size >= this.#activeViewCapacity) {
+      return [
+        ...out,
+        {
+          type: 'send-message',
+          peer: copyBytes(peer),
+          message: { layer: 'swarm', type: 'disconnect', alive: true, respond: false },
+        },
+        { type: 'disconnect-peer', peer: copyBytes(peer) },
+      ]
+    }
+    if (this.#neighbors.size >= this.#activeViewCapacity) {
+      const evicted = firstMapValue(this.#neighbors)
+      if (evicted !== undefined) {
+        out.push(...this.removeActive(evicted, { keepPassive: true, sendDisconnect: true }))
+      }
+    }
+    this.#passivePeers.delete(key)
+    this.#pendingNeighborRequests.delete(key)
+    this.#aliveDisconnectPeers.delete(key)
     this.#neighbors.set(key, copyBytes(peer))
     this.addEager(peer)
-    return [
-      ...out,
-      {
-        type: 'emit-event',
-        event: { type: 'neighbor-up', peer: copyBytes(peer) },
-      },
-    ]
+    out.push({
+      type: 'emit-event',
+      event: { type: 'neighbor-up', peer: copyBytes(peer) },
+    })
+    if (reply) {
+      out.push(...this.sendNeighbor(peer, priority))
+    }
+    return out
   }
 
   private removeNeighbor(peer: Uint8Array): readonly TopicOutEvent[] {
+    const active = this.removeActive(peer, { keepPassive: false, sendDisconnect: false })
+    if (active.length !== 0) {
+      return [...active, ...this.refillActiveFromPassive()]
+    }
+    const key = peerKey(peer)
+    if (this.#aliveDisconnectPeers.delete(key)) {
+      return []
+    }
+    this.#passivePeers.delete(key)
+    this.#pendingNeighborRequests.delete(key)
+    this.#aliveDisconnectPeers.delete(key)
+    this.#peerDataByPeer.delete(key)
+    return []
+  }
+
+  private removeActive(
+    peer: Uint8Array,
+    options: { readonly keepPassive: boolean; readonly sendDisconnect: boolean },
+  ): readonly TopicOutEvent[] {
     const key = peerKey(peer)
     const knownPeer = this.#neighbors.get(key)
     if (knownPeer === undefined) {
       return []
     }
     this.#neighbors.delete(key)
+    this.#pendingNeighborRequests.delete(key)
     this.#eagerPeers.delete(key)
     this.#lazyPeers.delete(key)
     this.#lazyPushQueue.delete(key)
     this.removeMissingFromPeer(key)
-    return [
+    const out: TopicOutEvent[] = [
       {
         type: 'emit-event',
         event: { type: 'neighbor-down', peer: copyBytes(knownPeer) },
       },
-      { type: 'disconnect-peer', peer: copyBytes(knownPeer) },
     ]
+    if (options.sendDisconnect) {
+      out.push({
+        type: 'send-message',
+        peer: copyBytes(knownPeer),
+        message: { layer: 'swarm', type: 'disconnect', alive: true, respond: false },
+      })
+    }
+    out.push({ type: 'disconnect-peer', peer: copyBytes(knownPeer) })
+    if (options.keepPassive) {
+      this.addPassive(knownPeer, this.#peerDataByPeer.get(key) ?? null)
+      this.#aliveDisconnectPeers.add(key)
+    }
+    return out
+  }
+
+  private handleDisconnectMessage(peer: Uint8Array, alive: boolean): readonly TopicOutEvent[] {
+    const active = this.removeActive(peer, { keepPassive: alive, sendDisconnect: false })
+    if (active.length !== 0) {
+      return [...active, ...this.refillActiveFromPassive()]
+    }
+    if (!alive) {
+      const key = peerKey(peer)
+      this.#passivePeers.delete(key)
+      this.#aliveDisconnectPeers.delete(key)
+      this.#peerDataByPeer.delete(key)
+    }
+    return [{ type: 'disconnect-peer', peer: copyBytes(peer) }]
+  }
+
+  private sendNeighbor(peer: Uint8Array, priority: 'high' | 'low'): readonly TopicOutEvent[] {
+    const key = peerKey(peer)
+    if (this.#pendingNeighborRequests.has(key)) {
+      return []
+    }
+    this.#pendingNeighborRequests.add(key)
+    return [
+      {
+        type: 'send-message',
+        peer: copyBytes(peer),
+        message: {
+          layer: 'swarm',
+          type: 'neighbor',
+          priority,
+          peerData: copyOptionalBytes(this.#peerData),
+        },
+      },
+    ]
+  }
+
+  private addPassive(peer: Uint8Array, data: Uint8Array | null): readonly TopicOutEvent[] {
+    const out = this.addPeerData({ id: peer, peerData: data })
+    if (equalBytes(peer, this.#me)) {
+      return out
+    }
+    const key = peerKey(peer)
+    if (this.#neighbors.has(key) || this.#passivePeers.has(key)) {
+      return out
+    }
+    if (this.#passivePeers.size >= this.#passiveViewCapacity) {
+      const evictedKey = this.#passivePeers.keys().next().value
+      if (typeof evictedKey === 'string') {
+        this.#passivePeers.delete(evictedKey)
+      }
+    }
+    this.#passivePeers.set(key, copyBytes(peer))
+    return out
+  }
+
+  private refillActiveFromPassive(): readonly TopicOutEvent[] {
+    if (this.#neighbors.size + this.#pendingNeighborRequests.size >= this.#activeViewCapacity) {
+      return []
+    }
+    const peer = this.firstPassiveWithoutPending()
+    if (peer === undefined) {
+      return []
+    }
+    const priority = this.#neighbors.size === 0 ? 'high' : 'low'
+    return [
+      ...this.sendNeighbor(peer, priority),
+      {
+        type: 'schedule-timer',
+        delayMs: pendingNeighborTimeoutMs,
+        timer: { type: 'pending-neighbor', peer: copyBytes(peer) },
+      },
+    ]
+  }
+
+  private handlePendingNeighbor(peer: Uint8Array): readonly TopicOutEvent[] {
+    const key = peerKey(peer)
+    if (!this.#pendingNeighborRequests.delete(key)) {
+      return []
+    }
+    this.#passivePeers.delete(key)
+    this.#aliveDisconnectPeers.delete(key)
+    this.#peerDataByPeer.delete(key)
+    return [{ type: 'disconnect-peer', peer: copyBytes(peer) }, ...this.refillActiveFromPassive()]
+  }
+
+  private handleForwardJoin(
+    sender: Uint8Array,
+    message: Extract<GossipTopicMessage, { readonly type: 'forward-join' }>,
+  ): readonly TopicOutEvent[] {
+    const out: TopicOutEvent[] = []
+    const peer = message.peer.id
+    const key = peerKey(peer)
+    if (this.#neighbors.has(key) || message.ttl <= 0 || this.#neighbors.size <= 1) {
+      out.push(...this.addPeerData(message.peer), ...this.sendNeighbor(peer, 'high'))
+      return out
+    }
+    if (message.ttl === passiveRandomWalkLength) {
+      out.push(...this.addPassive(peer, message.peer.peerData))
+    }
+    if (this.#pendingNeighborRequests.has(key)) {
+      return out
+    }
+    const next = this.pickActiveExcept([sender])
+    if (next === undefined) {
+      return out
+    }
+    out.push({
+      type: 'send-message',
+      peer: next,
+      message: {
+        layer: 'swarm',
+        type: 'forward-join',
+        peer: copyPeerInfo(message.peer),
+        ttl: Math.max(0, message.ttl - 1),
+      },
+    })
+    return out
+  }
+
+  private handleShuffle(
+    peer: Uint8Array,
+    message: Extract<GossipTopicMessage, { readonly type: 'shuffle' }>,
+  ): readonly TopicOutEvent[] {
+    if (message.ttl <= 0 || this.#neighbors.size <= 1) {
+      return [
+        ...message.nodes.flatMap((node) => this.addPassive(node.id, node.peerData)),
+        {
+          type: 'send-message',
+          peer: copyBytes(message.origin),
+          message: {
+            layer: 'swarm',
+            type: 'shuffle-reply',
+            nodes: this.peerSample(message.nodes.length),
+          },
+        },
+      ]
+    }
+    const next = this.pickActiveExcept([message.origin, peer])
+    if (next === undefined) {
+      return []
+    }
+    return [
+      {
+        type: 'send-message',
+        peer: next,
+        message: {
+          layer: 'swarm',
+          type: 'shuffle',
+          origin: copyBytes(message.origin),
+          nodes: message.nodes.map(copyPeerInfo),
+          ttl: Math.max(0, message.ttl - 1),
+        },
+      },
+    ]
+  }
+
+  private pickActiveExcept(peers: readonly Uint8Array[]): Uint8Array | undefined {
+    const excluded = new Set(peers.map(peerKey))
+    for (const [key, peer] of this.#neighbors) {
+      if (!excluded.has(key)) {
+        return copyBytes(peer)
+      }
+    }
+    return undefined
+  }
+
+  private firstPassiveWithoutPending(): Uint8Array | undefined {
+    for (const [key, peer] of this.#passivePeers) {
+      if (!this.#pendingNeighborRequests.has(key)) {
+        return copyBytes(peer)
+      }
+    }
+    return undefined
+  }
+
+  private peerSample(count: number): readonly GossipPeerInfo[] {
+    const out: GossipPeerInfo[] = []
+    for (const peer of this.#passivePeers.values()) {
+      out.push({
+        id: copyBytes(peer),
+        peerData: copyOptionalBytes(this.#peerDataByPeer.get(peerKey(peer)) ?? null),
+      })
+      if (out.length >= count) {
+        return out
+      }
+    }
+    for (const peer of this.#neighbors.values()) {
+      out.push({
+        id: copyBytes(peer),
+        peerData: copyOptionalBytes(this.#peerDataByPeer.get(peerKey(peer)) ?? null),
+      })
+      if (out.length >= count) {
+        return out
+      }
+    }
+    return out
   }
 
   private addPeerData(peer: GossipPeerInfo): readonly TopicOutEvent[] {
@@ -703,6 +994,9 @@ class GossipTopicProtocolState {
       }
       this.#lazyPushQueue.clear()
       return out
+    }
+    if (timer.type === 'pending-neighbor') {
+      return this.handlePendingNeighbor(timer.peer)
     }
 
     const id = validateMessageId(timer.id)
@@ -820,7 +1114,7 @@ class GossipTopicProtocolState {
           layer: 'swarm',
           type: 'forward-join',
           peer: peerInfo,
-          ttl: 6,
+          ttl: activeRandomWalkLength,
         },
       })
     }
@@ -852,6 +1146,13 @@ function validateMaxMessageSize(size: number): number {
   return size
 }
 
+function validateViewCapacity(size: number, name: string): number {
+  if (!Number.isInteger(size) || size < 1) {
+    throw new RangeError(`gossip ${name} view capacity must be at least 1`)
+  }
+  return size
+}
+
 function isTopicTimer(timer: unknown): timer is TopicTimer {
   if (typeof timer !== 'object' || timer === null || !('type' in timer)) {
     return false
@@ -859,6 +1160,9 @@ function isTopicTimer(timer: unknown): timer is TopicTimer {
   const type = timer.type
   if (type === 'dispatch-lazy-push') {
     return true
+  }
+  if (type === 'pending-neighbor') {
+    return 'peer' in timer && timer.peer instanceof Uint8Array
   }
   return type === 'send-graft' && 'id' in timer && timer.id instanceof Uint8Array
 }
@@ -964,6 +1268,13 @@ function bytesKey(bytes: Uint8Array): string {
 
 function topicKey(topicId: Uint8Array): string {
   return bytesKey(validateGossipTopicId(topicId))
+}
+
+function firstMapValue<T>(map: ReadonlyMap<string, T>): T | undefined {
+  for (const value of map.values()) {
+    return value
+  }
+  return undefined
 }
 
 function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
