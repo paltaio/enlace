@@ -33,6 +33,24 @@ describe('public endpoint API', () => {
     }
   })
 
+  test('falls back to the next relay URL when the first one is unavailable', async () => {
+    const relay = await startLocalIrohRelay()
+    const endpoint = await createEndpoint({ relayUrls: ['http://127.0.0.1:9', relay.url] })
+
+    try {
+      expect(endpoint.relayUrl.toString()).toBe(new URL(relay.url).toString())
+    } finally {
+      endpoint.close()
+      await relay.stop()
+    }
+  })
+
+  test('rejects empty relay URL lists', async () => {
+    await expect(createEndpoint({ relayUrls: [] })).rejects.toThrow(
+      'at least one relay URL is required',
+    )
+  })
+
   test('connects, accepts, and exchanges one bidi stream', async () => {
     const relay = await startLocalIrohRelay()
     const client = await createEndpoint({ relayUrl: relay.url })

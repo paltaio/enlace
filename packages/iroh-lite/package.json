@@ -9,6 +9,7 @@
     "./gossip": "./src/gossip.ts",
     "./varint": "./src/varint.ts",
     "./relay/client": "./src/relay/client.ts",
+    "./relay/defaults": "./src/relay/defaults.ts",
     "./relay/frames": "./src/relay/frames.ts",
     "./relay/handshake": "./src/relay/handshake.ts",
     "./relay/url": "./src/relay/url.ts",

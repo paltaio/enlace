@@ -9,8 +9,11 @@ export {
 export type {
   IrohEndpointAcceptOptions,
   IrohEndpointAddress,
+  IrohEndpointBaseOptions,
   IrohEndpointConnectOptions,
   IrohEndpointOptions,
+  IrohEndpointRelayUrlOptions,
+  IrohEndpointRelayUrlsOptions,
   IrohStreamRead,
 } from './endpoint'
 export { IrohGossip, IrohGossipSubscription, createGossip } from './gossip'
@@ -46,6 +49,13 @@ export type {
   RelayWebSocketConstructor,
   RelayWebSocketReceiveFrame,
 } from './relay/client'
+export {
+  n0AsiaPacificRelayUrl,
+  n0DefaultRelayUrls,
+  n0EuropeRelayUrl,
+  n0NaEastRelayUrl,
+  n0NaWestRelayUrl,
+} from './relay/defaults'
 export {
   FrameType,
   MAX_FRAME_SIZE,

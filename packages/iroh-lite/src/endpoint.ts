@@ -12,11 +12,22 @@ import type { QuicStreamReceiveOutput } from './quic/streams'
 import type { RelayWebSocketConstructor } from './relay/client'
 import type { RelayUrlInput } from './relay/url'
 
-export interface IrohEndpointOptions {
-  readonly relayUrl: RelayUrlInput
+export interface IrohEndpointBaseOptions {
   readonly secretKey?: Uint8Array
   readonly WebSocket?: RelayWebSocketConstructor
 }
+
+export interface IrohEndpointRelayUrlOptions extends IrohEndpointBaseOptions {
+  readonly relayUrl: RelayUrlInput
+  readonly relayUrls?: never
+}
+
+export interface IrohEndpointRelayUrlsOptions extends IrohEndpointBaseOptions {
+  readonly relayUrl?: never
+  readonly relayUrls: readonly RelayUrlInput[]
+}
+
+export type IrohEndpointOptions = IrohEndpointRelayUrlOptions | IrohEndpointRelayUrlsOptions
 
 export interface IrohEndpointAddress {
   readonly endpointId: Uint8Array
@@ -38,7 +49,17 @@ export interface IrohStreamRead {
 }
 
 export async function createEndpoint(options: IrohEndpointOptions): Promise<IrohEndpoint> {
-  return new IrohEndpoint(await InternalEndpoint.createRelayOnly(endpointOptions(options)))
+  const failures: string[] = []
+  for (const relayUrl of relayUrlCandidates(options)) {
+    try {
+      return new IrohEndpoint(
+        await InternalEndpoint.createRelayOnly(endpointOptions(options, relayUrl)),
+      )
+    } catch (error) {
+      failures.push(errorMessage(error))
+    }
+  }
+  throw new Error(`no relay URL connected: ${failures.join('; ')}`)
 }
 
 export class IrohEndpoint {
@@ -157,8 +178,11 @@ export class IrohUniStream {
   }
 }
 
-function endpointOptions(options: IrohEndpointOptions): EndpointCreateRelayOnlyOptions {
-  const out: EndpointCreateRelayOnlyOptions = { relayUrl: options.relayUrl }
+function endpointOptions(
+  options: IrohEndpointOptions,
+  relayUrl: RelayUrlInput,
+): EndpointCreateRelayOnlyOptions {
+  const out: EndpointCreateRelayOnlyOptions = { relayUrl }
   if (options.secretKey !== undefined) {
     Object.assign(out, { secretKey: options.secretKey })
   }
@@ -166,6 +190,23 @@ function endpointOptions(options: IrohEndpointOptions): EndpointCreateRelayOnlyO
     Object.assign(out, { WebSocket: options.WebSocket })
   }
   return out
+}
+
+function relayUrlCandidates(options: IrohEndpointOptions): readonly RelayUrlInput[] {
+  if (options.relayUrls !== undefined) {
+    if (options.relayUrls.length === 0) {
+      throw new Error('at least one relay URL is required')
+    }
+    return options.relayUrls
+  }
+  return [options.relayUrl]
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message
+  }
+  return String(error)
 }
 
 function streamRead(output: QuicStreamReceiveOutput): IrohStreamRead {
