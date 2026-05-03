@@ -377,40 +377,47 @@ class GossipActor {
 
   private sendMessage(event: GossipProtocolSendMessage): void {
     const runtime = this.requirePeer(event.peer)
-    runtime.queue.push(event)
-    if (runtime.connection !== undefined) {
-      this.flushRuntime(runtime)
+    if (runtime.state.type === 'active') {
+      runtime.state.sendQueue.push(event)
+      this.flushRuntime(runtime, runtime.state)
       return
     }
-    this.dial(runtime)
+    runtime.state.queue.push(event)
+    this.dial(runtime, runtime.state)
   }
 
-  private dial(runtime: PeerRuntime): void {
-    if (runtime.dialing !== null) {
+  private dial(runtime: PeerRuntime, state: PeerPendingState): void {
+    if (state.dialing !== null) {
       return
     }
     const address = this.#addressBook.get(bytesKey(runtime.peer))
     if (address === undefined) {
       return
     }
-    runtime.dialing = this.#endpoint
+    state.dialing = this.#endpoint
       .connect({ address, alpn: gossipAlpn })
       .then((connection) => {
-        runtime.dialing = null
+        if (runtime.state !== state) {
+          closeConnection(connection)
+          return
+        }
+        state.dialing = null
         this.activateConnection(connection, 'outbound')
-        this.flushRuntime(runtime)
       })
       .catch(() => {
-        runtime.dialing = null
+        if (runtime.state !== state) {
+          return
+        }
+        state.dialing = null
         this.processOut(this.#state.handle({ type: 'peer-disconnected', peer: runtime.peer }))
       })
   }
 
   private activateConnection(connection: IrohConnection, direction: PeerConnectionDirection): void {
     const runtime = this.requirePeer(connection.peerEndpointId)
-    if (runtime.connection !== undefined && runtime.connection !== connection) {
+    if (runtime.state.type === 'active' && runtime.state.connection !== connection) {
       const preferred = this.preferredDirection(runtime.peer)
-      if (runtime.direction === preferred) {
+      if (runtime.state.direction === preferred) {
         closeConnection(connection)
         return
       }
@@ -418,16 +425,36 @@ class GossipActor {
         closeConnection(connection)
         return
       }
-      closeRuntime(runtime)
+      runtime.state.otherConnections.add(runtime.state.connection)
+      closeWriterSet(runtime.state.writers)
+      runtime.state = {
+        type: 'active',
+        sendQueue: runtime.state.sendQueue,
+        connection,
+        direction,
+        writers: new Map(),
+        otherConnections: runtime.state.otherConnections,
+      }
+    } else if (runtime.state.type === 'pending') {
+      runtime.state = {
+        type: 'active',
+        sendQueue: runtime.state.queue,
+        connection,
+        direction,
+        writers: new Map(),
+        otherConnections: new Set(),
+      }
+    } else {
+      runtime.state.direction = direction
     }
-    runtime.connection = connection
-    runtime.direction = direction
     void this.readIncoming(runtime, connection)
-    this.flushRuntime(runtime)
+    if (runtime.state.type === 'active') {
+      this.flushRuntime(runtime, runtime.state)
+    }
   }
 
   private async readIncoming(runtime: PeerRuntime, connection: IrohConnection): Promise<void> {
-    while (!this.#closed && runtime.connection === connection) {
+    while (!this.#closed && this.hasRuntimeConnection(runtime, connection)) {
       try {
         const stream = await connection.acceptUniStream()
         void this.readIncomingStream(runtime, connection, stream)
@@ -452,7 +479,7 @@ class GossipActor {
         return
       }
       const header = decodeGossipStreamHeader(headerPayload)
-      while (!this.#closed && runtime.connection === connection) {
+      while (!this.#closed && this.hasRuntimeConnection(runtime, connection)) {
         const payload = await reader.readFrame()
         if (payload === null) {
           return
@@ -471,49 +498,46 @@ class GossipActor {
     }
   }
 
-  private flushRuntime(runtime: PeerRuntime): void {
-    const connection = runtime.connection
-    if (connection === undefined) {
-      return
-    }
-    while (runtime.queue.length !== 0) {
-      const event = runtime.queue.shift()
+  private flushRuntime(runtime: PeerRuntime, state: PeerActiveState): void {
+    while (state.sendQueue.length !== 0) {
+      const event = state.sendQueue.shift()
       if (event === undefined) {
         return
       }
       try {
-        this.writer(runtime, connection, event.topicId).writeFrame(
-          encodeTopicMessage(event.message),
-        )
+        this.writer(state, event.topicId).writeFrame(encodeTopicMessage(event.message))
       } catch {
-        this.peerDisconnected(runtime, connection)
+        this.peerDisconnected(runtime, state.connection)
         return
       }
     }
   }
 
-  private writer(
-    runtime: PeerRuntime,
-    connection: IrohConnection,
-    topicId: Uint8Array,
-  ): GossipTopicStreamWriter {
+  private writer(state: PeerActiveState, topicId: Uint8Array): GossipTopicStreamWriter {
     const key = bytesKey(topicId)
-    const writer = runtime.writers.get(key)
+    const writer = state.writers.get(key)
     if (writer !== undefined) {
       return writer
     }
-    const nextWriter = new GossipTopicStreamWriter(connection.openUniStream(), topicId)
-    runtime.writers.set(key, nextWriter)
+    const nextWriter = new GossipTopicStreamWriter(state.connection.openUniStream(), topicId)
+    state.writers.set(key, nextWriter)
     return nextWriter
   }
 
   private peerDisconnected(runtime: PeerRuntime, connection: IrohConnection): void {
-    if (runtime.connection !== connection) {
+    if (runtime.state.type !== 'active') {
       return
     }
+    if (runtime.state.otherConnections.delete(connection)) {
+      closeConnection(connection)
+      return
+    }
+    if (runtime.state.connection !== connection) {
+      return
+    }
+    const sendQueue = runtime.state.sendQueue
     closeRuntime(runtime)
-    delete runtime.connection
-    delete runtime.direction
+    runtime.state = { type: 'pending', queue: sendQueue, dialing: null }
     this.processOut(this.#state.handle({ type: 'peer-disconnected', peer: runtime.peer }))
   }
 
@@ -550,9 +574,7 @@ class GossipActor {
     }
     const nextRuntime: PeerRuntime = {
       peer: copyBytes(peer),
-      queue: [],
-      writers: new Map(),
-      dialing: null,
+      state: { type: 'pending', queue: [], dialing: null },
     }
     this.#peers.set(key, nextRuntime)
     return nextRuntime
@@ -564,11 +586,11 @@ class GossipActor {
 
   private async peerReady(peer: Uint8Array): Promise<void> {
     const runtime = this.requirePeer(peer)
-    if (runtime.connection !== undefined) {
+    if (runtime.state.type === 'active') {
       return
     }
-    if (runtime.dialing !== null) {
-      await runtime.dialing
+    if (runtime.state.dialing !== null) {
+      await runtime.state.dialing
     }
   }
 
@@ -579,15 +601,35 @@ class GossipActor {
       }
     }
   }
+
+  private hasRuntimeConnection(runtime: PeerRuntime, connection: IrohConnection): boolean {
+    return (
+      runtime.state.type === 'active' &&
+      (runtime.state.connection === connection || runtime.state.otherConnections.has(connection))
+    )
+  }
 }
 
 interface PeerRuntime {
   readonly peer: Uint8Array
+  state: PeerState
+}
+
+type PeerState = PeerPendingState | PeerActiveState
+
+interface PeerPendingState {
+  readonly type: 'pending'
   readonly queue: GossipProtocolSendMessage[]
-  readonly writers: Map<string, GossipTopicStreamWriter>
-  connection?: IrohConnection
-  direction?: PeerConnectionDirection
   dialing: Promise<void> | null
+}
+
+interface PeerActiveState {
+  readonly type: 'active'
+  readonly sendQueue: GossipProtocolSendMessage[]
+  readonly connection: IrohConnection
+  direction: PeerConnectionDirection
+  readonly writers: Map<string, GossipTopicStreamWriter>
+  readonly otherConnections: Set<IrohConnection>
 }
 
 type PeerConnectionDirection = 'inbound' | 'outbound'
@@ -704,14 +746,22 @@ function encodeTopicMessage(message: GossipTopicMessage): Uint8Array {
 }
 
 function closeRuntime(runtime: PeerRuntime): void {
-  for (const writer of runtime.writers.values()) {
-    finishWriter(writer)
+  if (runtime.state.type !== 'active') {
+    return
   }
-  runtime.writers.clear()
-  const connection = runtime.connection
-  if (connection !== undefined) {
+  closeWriterSet(runtime.state.writers)
+  closeConnection(runtime.state.connection)
+  for (const connection of runtime.state.otherConnections) {
     closeConnection(connection)
   }
+  runtime.state.otherConnections.clear()
+}
+
+function closeWriterSet(writers: Map<string, GossipTopicStreamWriter>): void {
+  for (const writer of writers.values()) {
+    finishWriter(writer)
+  }
+  writers.clear()
 }
 
 function closeConnection(connection: IrohConnection): void {

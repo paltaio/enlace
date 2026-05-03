@@ -31,6 +31,7 @@ pub(crate) struct BroadcastFrames {
     pub(crate) payload: &'static [u8],
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn run() -> Result<()> {
     let frames = broadcast_frames()?;
     let peer_a = peer_from_seed(1);
@@ -485,11 +486,11 @@ fn require_schedule_timer_named(
 ) -> Result<proto::Timer<PublicKey>> {
     let mut events = Vec::new();
     for event in out {
-        if let OutEvent::ScheduleTimer(_, timer) = &event {
-            if format!("{timer:?}").contains(name) {
-                let timer = timer.clone();
-                return Ok(timer);
-            }
+        if let OutEvent::ScheduleTimer(_, timer) = &event
+            && format!("{timer:?}").contains(name)
+        {
+            let timer = timer.clone();
+            return Ok(timer);
         }
         events.push(event);
     }
