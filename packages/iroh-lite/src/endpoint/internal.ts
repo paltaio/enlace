@@ -28,6 +28,10 @@ import type { QuicStreamReceiveOutput } from '../quic/streams'
 
 const defaultFlowControlLimit = 65536n
 const connectionIdLength = 8
+const relayPingIntervalMs = 15_000
+const relayPingTimeoutMs = 5_000
+const relayReconnectMinDelayMs = 10
+const relayReconnectMaxDelayMs = 16_000
 
 type EndpointConnectionDriver = QuicRelayClientDriver | QuicRelayServerDriver
 
@@ -59,20 +63,20 @@ export class Endpoint {
   readonly relayUrl: URL
   readonly endpointId: Uint8Array
   readonly #secretKey: Uint8Array
-  readonly #relayClient: RelayWebSocketClient
+  readonly #relayTransport: ReconnectingRelayTransport
   readonly #relayRouter: RelayDatagramRouter
 
   private constructor(options: {
     readonly relayUrl: URL
     readonly endpointId: Uint8Array
     readonly secretKey: Uint8Array
-    readonly relayClient: RelayWebSocketClient
+    readonly relayTransport: ReconnectingRelayTransport
   }) {
     this.relayUrl = new URL(options.relayUrl)
     this.endpointId = copyBytes(options.endpointId)
     this.#secretKey = copyBytes(options.secretKey)
-    this.#relayClient = options.relayClient
-    this.#relayRouter = new RelayDatagramRouter(options.relayClient)
+    this.#relayTransport = options.relayTransport
+    this.#relayRouter = new RelayDatagramRouter(options.relayTransport)
   }
 
   static async createRelayOnly(options: EndpointCreateRelayOnlyOptions): Promise<Endpoint> {
@@ -84,11 +88,16 @@ export class Endpoint {
     if (!equalBytes(relayClient.endpointId, endpointId)) {
       throw new Error('relay authenticated unexpected endpoint id')
     }
+    const relayTransport = new ReconnectingRelayTransport({
+      connectOptions,
+      endpointId,
+      initialClient: relayClient,
+    })
     return new Endpoint({
       relayUrl: normalizeRelayUrl(options.relayUrl),
       endpointId,
       secretKey,
-      relayClient,
+      relayTransport,
     })
   }
 
@@ -145,7 +154,7 @@ export class Endpoint {
   }
 
   close(code?: number, reason?: string): void {
-    this.#relayClient.close(code, reason)
+    this.#relayTransport.close(code, reason)
   }
 
   private requireRelayUrl(relayUrl: RelayUrlInput): void {
@@ -165,8 +174,200 @@ interface RelayDatagramQueue {
   readonly waiters: RelayDatagramWaiter[]
 }
 
+export class ReconnectingRelayTransport {
+  readonly endpointId: Uint8Array
+  readonly #connectOptions: ConnectRelayWebSocketOptions
+  #client: RelayWebSocketClient | null
+  #connectPromise: Promise<RelayWebSocketClient> | null = null
+  #pingInterval: ReturnType<typeof globalThis.setInterval> | null = null
+  #pingTimeout: ReturnType<typeof globalThis.setTimeout> | null = null
+  #pendingPing: Uint8Array | null = null
+  #backoffMs = relayReconnectMinDelayMs
+  #established = false
+  #closed = false
+
+  constructor(options: {
+    readonly connectOptions: ConnectRelayWebSocketOptions
+    readonly endpointId: Uint8Array
+    readonly initialClient: RelayWebSocketClient
+  }) {
+    this.#connectOptions = options.connectOptions
+    this.endpointId = copyBytes(options.endpointId)
+    this.#client = options.initialClient
+  }
+
+  sendDatagrams(datagrams: Datagrams): void {
+    if (this.#closed) {
+      throw new Error('relay transport is closed')
+    }
+    const client = this.#client
+    if (client === null) {
+      return
+    }
+    try {
+      client.sendDatagrams(datagrams)
+    } catch {
+      this.disconnectClient(client)
+    }
+  }
+
+  async receive(): Promise<RelayWebSocketReceiveFrame | null> {
+    while (!this.#closed) {
+      const client = await this.connectedClient()
+      if (this.#closed) {
+        return null
+      }
+      try {
+        const frame = await client.receive()
+        if (frame === null) {
+          this.disconnectClient(client)
+          continue
+        }
+        if (frame.type === 'pong') {
+          this.handlePong(frame.data)
+        }
+        return frame
+      } catch {
+        this.disconnectClient(client)
+      }
+    }
+    return null
+  }
+
+  close(code?: number, reason?: string): void {
+    if (this.#closed) {
+      return
+    }
+    this.#closed = true
+    this.clearPingTimers()
+    const client = this.#client
+    this.#client = null
+    if (client !== null) {
+      closeRelayClientQuietly(client, code, reason)
+    }
+  }
+
+  private async connectedClient(): Promise<RelayWebSocketClient> {
+    const client = this.#client
+    if (client !== null) {
+      this.ensurePingInterval()
+      return client
+    }
+    const existing = this.#connectPromise
+    if (existing !== null) {
+      return await existing
+    }
+    const connecting = this.connectLoop()
+    this.#connectPromise = connecting
+    try {
+      return await connecting
+    } finally {
+      if (this.#connectPromise === connecting) {
+        this.#connectPromise = null
+      }
+    }
+  }
+
+  private async connectLoop(): Promise<RelayWebSocketClient> {
+    while (!this.#closed) {
+      try {
+        const client = await connectRelayWebSocket(this.#connectOptions)
+        if (this.#closed) {
+          closeRelayClientQuietly(client)
+          break
+        }
+        if (!equalBytes(client.endpointId, this.endpointId)) {
+          closeRelayClientQuietly(client)
+          throw new Error('relay authenticated unexpected endpoint id')
+        }
+        this.#client = client
+        this.ensurePingInterval()
+        return client
+      } catch {
+        await sleep(this.nextReconnectDelayMs())
+      }
+    }
+    throw new Error('relay transport is closed')
+  }
+
+  private disconnectClient(client: RelayWebSocketClient): void {
+    if (this.#client !== client) {
+      return
+    }
+    this.#client = null
+    this.clearPingTimers()
+    if (this.#established) {
+      this.#backoffMs = relayReconnectMinDelayMs
+    }
+    this.#established = false
+    closeRelayClientQuietly(client)
+  }
+
+  private ensurePingInterval(): void {
+    if (this.#pingInterval !== null || this.#closed) {
+      return
+    }
+    this.sendPing()
+    this.#pingInterval = globalThis.setInterval(() => {
+      this.sendPing()
+    }, relayPingIntervalMs)
+  }
+
+  private sendPing(): void {
+    const client = this.#client
+    if (client === null || this.#closed) {
+      return
+    }
+    const data = randomPingData()
+    this.#pendingPing = data
+    this.clearPingTimeout()
+    try {
+      client.sendPing(data)
+    } catch {
+      this.disconnectClient(client)
+      return
+    }
+    this.#pingTimeout = globalThis.setTimeout(() => {
+      this.disconnectClient(client)
+    }, relayPingTimeoutMs)
+  }
+
+  private handlePong(data: Uint8Array): void {
+    const pending = this.#pendingPing
+    if (pending === null || !equalBytes(pending, data)) {
+      return
+    }
+    this.#pendingPing = null
+    this.#established = true
+    this.#backoffMs = relayReconnectMinDelayMs
+    this.clearPingTimeout()
+  }
+
+  private clearPingTimers(): void {
+    if (this.#pingInterval !== null) {
+      globalThis.clearInterval(this.#pingInterval)
+      this.#pingInterval = null
+    }
+    this.clearPingTimeout()
+    this.#pendingPing = null
+  }
+
+  private clearPingTimeout(): void {
+    if (this.#pingTimeout !== null) {
+      globalThis.clearTimeout(this.#pingTimeout)
+      this.#pingTimeout = null
+    }
+  }
+
+  private nextReconnectDelayMs(): number {
+    const delay = jitterDelay(this.#backoffMs)
+    this.#backoffMs = Math.min(this.#backoffMs * 2, relayReconnectMaxDelayMs)
+    return delay
+  }
+}
+
 class RelayDatagramRouter {
-  readonly #relayClient: RelayWebSocketClient
+  readonly #relayTransport: ReconnectingRelayTransport
   readonly #connectionIdRoutes = new Map<string, Connection>()
   readonly #connectionQueues = new Map<Connection, RelayDatagramQueue>()
   readonly #acceptingConnections: Connection[] = []
@@ -174,8 +375,9 @@ class RelayDatagramRouter {
   #readLoopStarted = false
   #terminalError: Error | null = null
 
-  constructor(relayClient: RelayWebSocketClient) {
-    this.#relayClient = relayClient
+  constructor(relayTransport: ReconnectingRelayTransport) {
+    this.#relayTransport = relayTransport
+    this.ensureReadLoop()
   }
 
   registerConnectionId(connectionId: Uint8Array, connection: Connection): void {
@@ -205,7 +407,7 @@ class RelayDatagramRouter {
   }
 
   sendDatagrams(datagrams: Datagrams): void {
-    this.#relayClient.sendDatagrams(datagrams)
+    this.#relayTransport.sendDatagrams(datagrams)
   }
 
   async receiveDatagrams(connection: Connection): Promise<Datagrams> {
@@ -234,9 +436,8 @@ class RelayDatagramRouter {
   private async readLoop(): Promise<void> {
     try {
       while (true) {
-        const frame = await this.#relayClient.receive()
+        const frame = await this.#relayTransport.receive()
         if (frame === null) {
-          this.fail(new Error('relay websocket closed before QUIC datagram'))
           return
         }
         if (frame.type === 'datagrams') {
@@ -585,6 +786,33 @@ function randomConnectionId(): Uint8Array {
   return crypto.getRandomValues(new Uint8Array(connectionIdLength))
 }
 
+function randomPingData(): Uint8Array {
+  return crypto.getRandomValues(new Uint8Array(8))
+}
+
+function jitterDelay(milliseconds: number): number {
+  const values = crypto.getRandomValues(new Uint32Array(1))
+  return Math.floor(milliseconds * (0.5 + (values[0] ?? 0) / 0xffffffff))
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    globalThis.setTimeout(resolve, milliseconds)
+  })
+}
+
+function closeRelayClientQuietly(
+  client: RelayWebSocketClient,
+  code?: number,
+  reason?: string,
+): void {
+  try {
+    client.close(code, reason)
+  } catch {
+    // Surface the relay failure that caused the close, not cleanup errors.
+  }
+}
+
 function routeKeyForDatagrams(datagrams: Datagrams): string {
   const packet = splitRelayDatagramPackets(datagrams)[0]
   if (packet === undefined) {
@@ -611,11 +839,13 @@ function routeKey(bytes: Uint8Array): string {
 function ignoreRelayControlFrame(
   frame: Exclude<RelayWebSocketReceiveFrame, { readonly type: 'datagrams' }>,
 ): void {
-  if (frame.type === 'status' || frame.type === 'pong' || frame.type === 'restarting') {
+  if (
+    frame.type === 'status' ||
+    frame.type === 'pong' ||
+    frame.type === 'restarting' ||
+    frame.type === 'endpoint-gone'
+  ) {
     return
-  }
-  if (frame.type === 'endpoint-gone') {
-    throw new Error('relay peer endpoint disconnected')
   }
   if (frame.type === 'health') {
     throw new Error(`relay reported health problem: ${frame.problem}`)
