@@ -4,7 +4,7 @@ export interface LocalIrohRelay {
 }
 
 export async function startLocalIrohRelay(): Promise<LocalIrohRelay> {
-  const manifestPath = await findIrohRelayManifest()
+  const binaryPath = await irohRelayBinaryPath()
   const port = reserveLocalPort()
   const configPath = `${temporaryDirectory()}/iroh-relay-${crypto.randomUUID()}.toml`
   await Bun.write(
@@ -17,31 +17,14 @@ export async function startLocalIrohRelay(): Promise<LocalIrohRelay> {
     ].join('\n'),
   )
 
-  const proc = Bun.spawn(
-    [
-      'cargo',
-      'run',
-      '--quiet',
-      '--manifest-path',
-      manifestPath,
-      '--features',
-      'server',
-      '--bin',
-      'iroh-relay',
-      '--',
-      '--dev',
-      '--config-path',
-      configPath,
-    ],
-    {
-      env: {
-        ...Bun.env,
-        RUST_LOG: Bun.env.RUST_LOG ?? 'iroh_relay=info',
-      },
-      stdout: 'pipe',
-      stderr: 'pipe',
+  const proc = Bun.spawn([binaryPath, '--dev', '--config-path', configPath], {
+    env: {
+      ...Bun.env,
+      RUST_LOG: Bun.env.RUST_LOG ?? 'iroh_relay=info',
     },
-  )
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
   const stdout = streamToText(proc.stdout)
   const stderr = streamToText(proc.stderr)
   const url = `http://127.0.0.1:${port}`
@@ -96,10 +79,14 @@ async function waitForRelay(
   throw new Error(`iroh-relay did not become ready at ${url}`)
 }
 
-async function findIrohRelayManifest(): Promise<string> {
-  if (Bun.env.IROH_RELAY_MANIFEST !== undefined) {
-    return Bun.env.IROH_RELAY_MANIFEST
+async function irohRelayBinaryPath(): Promise<string> {
+  if (Bun.env.IROH_RELAY_BIN !== undefined) {
+    return Bun.env.IROH_RELAY_BIN
   }
+  return `${dirname(await findIrohRelayManifest())}/target/debug/iroh-relay`
+}
+
+async function findIrohRelayManifest(): Promise<string> {
   const home = Bun.env.HOME
   if (home === undefined) {
     throw new Error('HOME is required to find local iroh-relay crate')
@@ -122,6 +109,11 @@ async function findIrohRelayManifest(): Promise<string> {
     throw new Error(`local iroh-relay crate not found${formatProcessOutput(stdout, stderr)}`)
   }
   return stdout
+}
+
+function dirname(path: string): string {
+  const index = path.lastIndexOf('/')
+  return index === -1 ? '.' : path.slice(0, index)
 }
 
 function reserveLocalPort(): number {

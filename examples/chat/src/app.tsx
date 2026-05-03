@@ -30,6 +30,7 @@ const tabId = globalThis.crypto.randomUUID()
 const channelName = `enlace-chat:${param('room', 'default')}`
 const secretKeyStorageKey = `${channelName}:secret-key`
 const peerInvitesStorageKey = `${channelName}:peer-invites`
+const activeViewCapacity = 16
 const peerDialRetryMs = 1_500
 const peerDialTimeoutMs = 2_000
 
@@ -437,6 +438,7 @@ async function openBackend(): Promise<ChatBackend> {
     kind: 'iroh-lite',
     seed,
     channel,
+    activeViewCapacity,
     relayUrls: relayUrlInputs(),
     secretKey: sessionSecretKey(),
   })

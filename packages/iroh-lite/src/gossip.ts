@@ -8,6 +8,7 @@ import {
   type GossipProtocolCommand,
   type GossipProtocolEmitEvent,
   type GossipProtocolOutEvent,
+  type GossipProtocolStateOptions,
   type GossipProtocolSendMessage,
 } from './gossip/state'
 import {
@@ -32,7 +33,9 @@ import {
 } from './gossip/wire'
 
 export interface IrohGossipOptions {
+  readonly activeViewCapacity?: number
   readonly maxMessageSize?: number
+  readonly passiveViewCapacity?: number
 }
 
 export interface IrohGossipSubscribeOptions {
@@ -260,15 +263,18 @@ class GossipActor {
 
   constructor(endpoint: IrohEndpoint, options: IrohGossipOptions) {
     this.#endpoint = endpoint
-    const stateOptions = {
+    const stateOptions: GossipProtocolStateOptions = {
       me: endpoint.endpointId,
       peerData: encodeGossipPeerDataAddrInfo({ relayUrl: endpoint.relayUrl }),
+      ...(options.activeViewCapacity === undefined
+        ? {}
+        : { activeViewCapacity: options.activeViewCapacity }),
+      ...(options.maxMessageSize === undefined ? {} : { maxMessageSize: options.maxMessageSize }),
+      ...(options.passiveViewCapacity === undefined
+        ? {}
+        : { passiveViewCapacity: options.passiveViewCapacity }),
     }
-    this.#state = new GossipProtocolState(
-      options.maxMessageSize === undefined
-        ? stateOptions
-        : { ...stateOptions, maxMessageSize: options.maxMessageSize },
-    )
+    this.#state = new GossipProtocolState(stateOptions)
     this.#scheduler = new GossipTimerScheduler({
       onTimer: (timer, nowMs) => {
         this.processOut(this.#state.handle({ type: 'timer-expired', timer }, nowMs))
@@ -604,7 +610,12 @@ class GossipActor {
   }
 
   private updatePeerData(peer: Uint8Array, peerData: Uint8Array): void {
-    const decoded = decodeGossipPeerDataAddrInfo(peerData)
+    let decoded: ReturnType<typeof decodeGossipPeerDataAddrInfo>
+    try {
+      decoded = decodeGossipPeerDataAddrInfo(peerData)
+    } catch {
+      return
+    }
     if (decoded.relayUrl === null) {
       return
     }

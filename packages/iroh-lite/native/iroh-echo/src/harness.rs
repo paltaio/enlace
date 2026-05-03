@@ -8,6 +8,7 @@ use iroh::{
 };
 use iroh_gossip::{ALPN as GOSSIP_ALPN, api::Event as GossipEvent, net::Gossip, proto::TopicId};
 use n0_future::StreamExt;
+use std::io::Write as _;
 use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::time::{Duration, timeout};
 
@@ -117,6 +118,12 @@ async fn run_gossip_client_send() -> Result<()> {
     let endpoint = gossip_endpoint(relay_url.clone()).await?;
     let (router, gossip) =
         spawn_gossip_router(endpoint, Some(bootstrap_addr(bootstrap, relay_url)))?;
+    println!(
+        "IROH_NATIVE_GOSSIP_CLIENT_SEND_STARTED endpoint_id_hex={} topic_id_hex={}",
+        hex(router.endpoint().id().as_bytes()),
+        hex(topic_id.as_bytes())
+    );
+    std::io::stdout().flush()?;
     let mut topic = gossip.subscribe_and_join(topic_id, vec![bootstrap]).await?;
 
     topic.broadcast(Bytes::from(payload.clone())).await?;
@@ -143,6 +150,12 @@ async fn run_gossip_client_recv() -> Result<()> {
     let endpoint = gossip_endpoint(relay_url.clone()).await?;
     let (router, gossip) =
         spawn_gossip_router(endpoint, Some(bootstrap_addr(bootstrap, relay_url)))?;
+    println!(
+        "IROH_NATIVE_GOSSIP_CLIENT_RECV_STARTED endpoint_id_hex={} topic_id_hex={}",
+        hex(router.endpoint().id().as_bytes()),
+        hex(topic_id.as_bytes())
+    );
+    std::io::stdout().flush()?;
     let mut topic = gossip.subscribe_and_join(topic_id, vec![bootstrap]).await?;
     println!(
         "IROH_NATIVE_GOSSIP_CLIENT_RECV_READY endpoint_id_hex={} topic_id_hex={}",

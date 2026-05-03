@@ -156,6 +156,63 @@ describe('QUIC relay datagram driver', () => {
     expect(bytesToHex(received.streamOutputs[0]?.data ?? new Uint8Array())).toBe('70696e67')
   })
 
+  test('ignores client Handshake packet that arrives before client Initial', async () => {
+    const clientEndpointId = await endpointIdFromSecretKey(clientEndpointSecretKey)
+    const serverEndpointId = await endpointIdFromSecretKey(serverEndpointSecretKey)
+    const { client, server } = relayPair(clientEndpointId, serverEndpointId)
+    const { client: reorderedClient, server: referenceServer } = relayPair(
+      clientEndpointId,
+      serverEndpointId,
+    )
+    const reorderedClientInitial = await reorderedClient.start()
+    const referenceServerFlight = await referenceServer.receive(
+      relayDeliver(clientEndpointId, reorderedClientInitial),
+    )
+    const reorderedClientFlight = await reorderedClient.receive(
+      coalesceDatagrams(referenceServerFlight.outgoing, serverEndpointId),
+    )
+    const preInitialHandshake = requireDatagram(reorderedClientFlight.outgoing[0])
+    const clientInitial = await client.start()
+
+    const ignored = await server.receive(relayDeliver(clientEndpointId, preInitialHandshake))
+    expect(ignored.connected).toBe(false)
+    expect(ignored.outgoing).toEqual([])
+
+    const serverFlight = await server.receive(relayDeliver(clientEndpointId, clientInitial))
+    expect(serverFlight.connected).toBe(false)
+
+    const clientFlight = await client.receive(
+      coalesceDatagrams(serverFlight.outgoing, serverEndpointId),
+    )
+    const connected = await server.receive(
+      relayDeliver(clientEndpointId, requireDatagram(clientFlight.outgoing[0])),
+    )
+    expect(connected.connected).toBe(true)
+  })
+
+  test('ignores duplicate long-header packets after connection is established', async () => {
+    const clientEndpointId = await endpointIdFromSecretKey(clientEndpointSecretKey)
+    const serverEndpointId = await endpointIdFromSecretKey(serverEndpointSecretKey)
+    const { client, server } = relayPair(clientEndpointId, serverEndpointId)
+    const clientInitial = await client.start()
+    const serverFlight = await server.receive(relayDeliver(clientEndpointId, clientInitial))
+    const clientFlight = await client.receive(
+      coalesceDatagrams(serverFlight.outgoing, serverEndpointId),
+    )
+    const clientHandshake = requireDatagram(clientFlight.outgoing[0])
+    const serverComplete = await server.receive(relayDeliver(clientEndpointId, clientHandshake))
+    expect(serverComplete.connected).toBe(true)
+
+    const request = client.sendStream(0, hexToBytes('70696e67'), true)
+    const received = await server.receive(
+      batchDatagrams([clientHandshake, request.datagrams], clientEndpointId),
+    )
+
+    expect(received.connected).toBe(true)
+    expect(received.streamOutputs[0]?.complete).toBe(true)
+    expect(bytesToHex(received.streamOutputs[0]?.data ?? new Uint8Array())).toBe('70696e67')
+  })
+
   test('honors relay batch segments around 1-RTT packets', async () => {
     const clientEndpointId = await endpointIdFromSecretKey(clientEndpointSecretKey)
     const serverEndpointId = await endpointIdFromSecretKey(serverEndpointSecretKey)

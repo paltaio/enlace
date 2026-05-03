@@ -18,6 +18,8 @@ const hexPattern = /^[0-9a-f]*$/u
 export interface IrohLiteChatBackendOptions {
   readonly seed: Uint8Array
   readonly channel: string
+  readonly activeViewCapacity?: number
+  readonly passiveViewCapacity?: number
   readonly relayUrl?: RelayUrlInput
   readonly relayUrls?: readonly RelayUrlInput[]
   readonly secretKey?: Uint8Array
@@ -28,7 +30,7 @@ export async function createIrohLiteChatBackend(
   options: IrohLiteChatBackendOptions,
 ): Promise<IrohLiteChatBackend> {
   const endpoint = await createFirstEndpoint(options)
-  const topic = createGossip(endpoint).subscribe({
+  const topic = createGossip(endpoint, gossipOptions(options)).subscribe({
     topicId: await chatTopicId(options.seed, options.channel),
   })
   return new IrohLiteChatBackend(endpoint, topic)
@@ -165,6 +167,23 @@ function relayUrlCandidates(options: IrohLiteChatBackendOptions): readonly Relay
     return [options.relayUrl]
   }
   throw new Error('at least one relay URL is required')
+}
+
+function gossipOptions(options: IrohLiteChatBackendOptions): {
+  readonly activeViewCapacity?: number
+  readonly passiveViewCapacity?: number
+} {
+  const out: {
+    activeViewCapacity?: number
+    passiveViewCapacity?: number
+  } = {}
+  if (options.activeViewCapacity !== undefined) {
+    out.activeViewCapacity = options.activeViewCapacity
+  }
+  if (options.passiveViewCapacity !== undefined) {
+    out.passiveViewCapacity = options.passiveViewCapacity
+  }
+  return out
 }
 
 function errorMessage(error: unknown): string {

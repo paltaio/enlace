@@ -90,19 +90,15 @@ export type NativeIrohGossipEvent =
   | { readonly type: 'lagged' }
 
 export async function startNativeIrohEchoServer(relayUrl: string): Promise<NativeIrohEchoServer> {
-  const proc = Bun.spawn(
-    ['cargo', 'run', '--quiet', '--manifest-path', nativeIrohEchoManifestPath()],
-    {
-      env: {
-        ...Bun.env,
-        CARGO_TARGET_DIR: Bun.env.IROH_NATIVE_ECHO_TARGET_DIR ?? nativeIrohEchoTargetDir(),
-        IROH_RELAY_URL: relayUrl,
-        RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
-      },
-      stdout: 'pipe',
-      stderr: 'pipe',
+  const proc = Bun.spawn(nativeIrohEchoCommand(), {
+    env: {
+      ...Bun.env,
+      IROH_RELAY_URL: relayUrl,
+      RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
     },
-  )
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
   const reader = proc.stdout.getReader()
   const stderr = streamToText(proc.stderr)
 
@@ -138,21 +134,17 @@ export async function startNativeIrohEchoServer(relayUrl: string): Promise<Nativ
 export async function runNativeIrohEchoClient(
   options: NativeIrohEchoClientOptions,
 ): Promise<NativeIrohEchoClientResult> {
-  const proc = Bun.spawn(
-    ['cargo', 'run', '--quiet', '--manifest-path', nativeIrohEchoManifestPath(), '--', 'client'],
-    {
-      env: {
-        ...Bun.env,
-        CARGO_TARGET_DIR: Bun.env.IROH_NATIVE_ECHO_TARGET_DIR ?? nativeIrohEchoTargetDir(),
-        IROH_RELAY_URL: options.relayUrl,
-        IROH_SERVER_ENDPOINT_ID_HEX: bytesToHex(options.serverEndpointId),
-        IROH_ECHO_PAYLOAD_HEX: bytesToHex(options.payload),
-        RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
-      },
-      stdout: 'pipe',
-      stderr: 'pipe',
+  const proc = Bun.spawn(nativeIrohEchoCommand('client'), {
+    env: {
+      ...Bun.env,
+      IROH_RELAY_URL: options.relayUrl,
+      IROH_SERVER_ENDPOINT_ID_HEX: bytesToHex(options.serverEndpointId),
+      IROH_ECHO_PAYLOAD_HEX: bytesToHex(options.payload),
+      RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
     },
-  )
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
   const stdout = streamToText(proc.stdout)
   const stderr = streamToText(proc.stderr)
   const exitCode = await waitForProcessExit(proc, 'native iroh echo client', 120_000)
@@ -171,28 +163,16 @@ export async function runNativeIrohEchoClient(
 export async function runNativeIrohGossipSender(
   options: NativeIrohGossipSendOptions,
 ): Promise<NativeIrohGossipSendResult> {
-  const proc = Bun.spawn(
-    [
-      'cargo',
-      'run',
-      '--quiet',
-      '--manifest-path',
-      nativeIrohEchoManifestPath(),
-      '--',
-      'gossip-send',
-    ],
-    {
-      env: {
-        ...Bun.env,
-        CARGO_TARGET_DIR: Bun.env.IROH_NATIVE_ECHO_TARGET_DIR ?? nativeIrohEchoTargetDir(),
-        IROH_RELAY_URL: options.relayUrl,
-        IROH_SERVER_ENDPOINT_ID_HEX: bytesToHex(options.serverEndpointId),
-        RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
-      },
-      stdout: 'pipe',
-      stderr: 'pipe',
+  const proc = Bun.spawn(nativeIrohEchoCommand('gossip-send'), {
+    env: {
+      ...Bun.env,
+      IROH_RELAY_URL: options.relayUrl,
+      IROH_SERVER_ENDPOINT_ID_HEX: bytesToHex(options.serverEndpointId),
+      RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
     },
-  )
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
   const stdout = streamToText(proc.stdout)
   const stderr = streamToText(proc.stderr)
   const exitCode = await waitForProcessExit(proc, 'native iroh gossip sender', 120_000)
@@ -211,30 +191,18 @@ export async function runNativeIrohGossipSender(
 export async function runNativeIrohGossipClientSend(
   options: NativeIrohGossipClientSendOptions,
 ): Promise<NativeIrohGossipClientSendResult> {
-  const proc = Bun.spawn(
-    [
-      'cargo',
-      'run',
-      '--quiet',
-      '--manifest-path',
-      nativeIrohEchoManifestPath(),
-      '--',
-      'gossip-client-send',
-    ],
-    {
-      env: {
-        ...Bun.env,
-        CARGO_TARGET_DIR: Bun.env.IROH_NATIVE_ECHO_TARGET_DIR ?? nativeIrohEchoTargetDir(),
-        IROH_RELAY_URL: options.relayUrl,
-        IROH_SERVER_ENDPOINT_ID_HEX: bytesToHex(options.serverEndpointId),
-        IROH_GOSSIP_TOPIC_ID_HEX: bytesToHex(options.topicId),
-        IROH_GOSSIP_PAYLOAD_HEX: bytesToHex(options.payload),
-        RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
-      },
-      stdout: 'pipe',
-      stderr: 'pipe',
+  const proc = Bun.spawn(nativeIrohEchoCommand('gossip-client-send'), {
+    env: {
+      ...Bun.env,
+      IROH_RELAY_URL: options.relayUrl,
+      IROH_SERVER_ENDPOINT_ID_HEX: bytesToHex(options.serverEndpointId),
+      IROH_GOSSIP_TOPIC_ID_HEX: bytesToHex(options.topicId),
+      IROH_GOSSIP_PAYLOAD_HEX: bytesToHex(options.payload),
+      RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
     },
-  )
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
   const stdout = streamToText(proc.stdout)
   const stderr = streamToText(proc.stderr)
   const exitCode = await waitForProcessExit(proc, 'native iroh gossip client send', 120_000)
@@ -256,7 +224,6 @@ export async function startNativeIrohGossipClientSender(
   const proc = Bun.spawn(nativeIrohEchoCommand('gossip-client-send'), {
     env: {
       ...Bun.env,
-      CARGO_TARGET_DIR: Bun.env.IROH_NATIVE_ECHO_TARGET_DIR ?? nativeIrohEchoTargetDir(),
       IROH_RELAY_URL: options.relayUrl,
       IROH_SERVER_ENDPOINT_ID_HEX: bytesToHex(options.serverEndpointId),
       IROH_GOSSIP_TOPIC_ID_HEX: bytesToHex(options.topicId),
@@ -278,11 +245,11 @@ export async function startNativeIrohGossipClientSender(
 
   try {
     const result = await withTimeout(
-      readGossipClientSendResult(lines, proc, stderr),
+      readGossipClientSendStarted(lines, proc, stderr),
       'native iroh gossip client sender ready',
       120_000,
     )
-    return { ...result, stop }
+    return { ...result, payload: new Uint8Array(options.payload), stop }
   } catch (error) {
     await stop()
     throw error
@@ -295,7 +262,6 @@ export async function startNativeIrohGossipClientReceiver(
   const proc = Bun.spawn(nativeIrohEchoCommand('gossip-client-recv'), {
     env: {
       ...Bun.env,
-      CARGO_TARGET_DIR: Bun.env.IROH_NATIVE_ECHO_TARGET_DIR ?? nativeIrohEchoTargetDir(),
       IROH_RELAY_URL: options.relayUrl,
       IROH_SERVER_ENDPOINT_ID_HEX: bytesToHex(options.serverEndpointId),
       IROH_GOSSIP_TOPIC_ID_HEX: bytesToHex(options.topicId),
@@ -335,30 +301,18 @@ export async function startNativeIrohGossipServer(
   relayUrl: string,
   topicId: Uint8Array,
 ): Promise<NativeIrohGossipServer> {
-  const proc = Bun.spawn(
-    [
-      'cargo',
-      'run',
-      '--quiet',
-      '--manifest-path',
-      nativeIrohEchoManifestPath(),
-      '--',
-      'gossip-server',
-    ],
-    {
-      env: {
-        ...Bun.env,
-        CARGO_TARGET_DIR: Bun.env.IROH_NATIVE_ECHO_TARGET_DIR ?? nativeIrohEchoTargetDir(),
-        IROH_RELAY_URL: relayUrl,
-        IROH_GOSSIP_TOPIC_ID_HEX: bytesToHex(topicId),
-        IROH_GOSSIP_STDIN_COMMANDS: '1',
-        RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
-      },
-      stdin: 'pipe',
-      stdout: 'pipe',
-      stderr: 'pipe',
+  const proc = Bun.spawn(nativeIrohEchoCommand('gossip-server'), {
+    env: {
+      ...Bun.env,
+      IROH_RELAY_URL: relayUrl,
+      IROH_GOSSIP_TOPIC_ID_HEX: bytesToHex(topicId),
+      IROH_GOSSIP_STDIN_COMMANDS: '1',
+      RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
     },
-  )
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
   const lines = new ProcessLineReader(proc.stdout.getReader())
   const stderr = streamToText(proc.stderr)
 
@@ -445,14 +399,14 @@ async function readGossipEvent(
   }
 }
 
-async function readGossipClientSendResult(
+async function readGossipClientSendStarted(
   lines: ProcessLineReader,
   proc: ReturnType<typeof Bun.spawn>,
   stderr: Promise<string>,
-): Promise<NativeIrohGossipClientSendResult> {
+): Promise<Pick<NativeIrohGossipClientSendResult, 'endpointId' | 'endpointIdHex' | 'topicId'>> {
   while (true) {
     const line = await lines.readLine(proc, stderr, 'native iroh gossip client sender')
-    const result = parseGossipClientSendResultLine(line)
+    const result = parseGossipClientSendStartedLine(line)
     if (result !== null) {
       return result
     }
@@ -775,6 +729,27 @@ function parseGossipClientSendResultLine(line: string): NativeIrohGossipClientSe
   }
 }
 
+function parseGossipClientSendStartedLine(
+  line: string,
+): Pick<NativeIrohGossipClientSendResult, 'endpointId' | 'endpointIdHex' | 'topicId'> | null {
+  const match =
+    /^IROH_NATIVE_GOSSIP_CLIENT_SEND_STARTED endpoint_id_hex=([0-9a-f]{64}) topic_id_hex=([0-9a-f]{64})$/.exec(
+      line,
+    )
+  if (match === null) {
+    return null
+  }
+  const [, endpointIdHex, topicIdHex] = match
+  if (endpointIdHex === undefined || topicIdHex === undefined) {
+    throw new Error(`native iroh gossip client send printed invalid started line: ${line}`)
+  }
+  return {
+    endpointId: hexToBytes(endpointIdHex),
+    endpointIdHex,
+    topicId: hexToBytes(topicIdHex),
+  }
+}
+
 function parseGossipClientRecvReadyLine(line: string): {
   readonly endpointId: Uint8Array
   readonly endpointIdHex: string
@@ -837,24 +812,23 @@ function parseGossipServerBroadcastLine(line: string): Uint8Array | null {
   return hexToBytes(payloadHex)
 }
 
-function nativeIrohEchoManifestPath(): string {
-  return new URL('../../native/iroh-echo/Cargo.toml', import.meta.url).pathname
-}
-
-function nativeIrohEchoCommand(mode: string): string[] {
-  return ['cargo', 'run', '--quiet', '--manifest-path', nativeIrohEchoManifestPath(), '--', mode]
+function nativeIrohEchoCommand(mode?: string): string[] {
+  const command = [nativeIrohEchoBinaryPath()]
+  if (mode !== undefined) {
+    command.push(mode)
+  }
+  return command
 }
 
 function streamToText(stream: ReadableStream<Uint8Array>): Promise<string> {
   return new Response(stream).text()
 }
 
-function nativeIrohEchoTargetDir(): string {
-  return `${temporaryDirectory()}/iroh-lite-native-echo-target`
-}
-
-function temporaryDirectory(): string {
-  return (Bun.env.TMPDIR ?? '/tmp').replace(/\/$/, '')
+function nativeIrohEchoBinaryPath(): string {
+  return (
+    Bun.env.IROH_NATIVE_ECHO_BIN ??
+    new URL('../../native/iroh-echo/target/debug/iroh-lite-native-echo', import.meta.url).pathname
+  )
 }
 
 class ProcessLineReader {

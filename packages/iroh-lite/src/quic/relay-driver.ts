@@ -171,6 +171,7 @@ export class QuicRelayServerDriver {
   readonly #handshake: QuicServerHandshakeDriver
   readonly #ecn: EcnCodepoint | null
   #peerEndpointId: Uint8Array | null = null
+  #clientInitialReceived = false
   #pendingConnectedPackets: Uint8Array[] = []
   #connection: QuicConnectionState | null = null
 
@@ -216,10 +217,14 @@ export class QuicRelayServerDriver {
       const packetType = quicRelayPacketType(packet)
       if (packetType === QuicLongHeaderPacketType.Initial) {
         const flight = await this.#handshake.receiveClientInitial(packet)
+        this.#clientInitialReceived = true
         outgoing.push(...serverFlightToDatagrams(peerEndpointId, this.#ecn, flight))
         continue
       }
       if (packetType === QuicLongHeaderPacketType.Handshake) {
+        if (!this.#clientInitialReceived) {
+          continue
+        }
         const complete = await this.#handshake.receiveClientHandshake(packet)
         this.#connection = complete.connection
         closed = drainPendingConnectedPackets(
@@ -357,6 +362,9 @@ function receiveConnectedPacket(
   outgoing: Datagrams[],
   streamOutputs: QuicStreamReceiveOutput[],
 ): boolean {
+  if (!isShortHeaderPacket(packet)) {
+    return false
+  }
   const received = connection.receive(packet)
   streamOutputs.push(...received.streamOutputs)
   if (received.ackPacket !== null) {

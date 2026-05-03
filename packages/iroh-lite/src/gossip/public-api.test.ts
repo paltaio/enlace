@@ -181,6 +181,38 @@ describe('public gossip API', () => {
       await relay.stop()
     }
   })
+
+  test('uses configured active view capacity for larger rooms', async () => {
+    const relay = await startLocalIrohRelay()
+    const endpoints = await Promise.all(
+      Array.from({ length: 7 }, () => createEndpoint({ relayUrl: relay.url })),
+    )
+    const topics = endpoints.map((endpoint) =>
+      createGossip(endpoint, { activeViewCapacity: 6 }).subscribe({ topicId }),
+    )
+    const hub = endpoints[0]
+    const hubTopic = topics[0]
+
+    try {
+      if (hub === undefined || hubTopic === undefined) {
+        throw new Error('expected hub endpoint')
+      }
+      const hubJoins = nextEvents(hubTopic.events(), 'join', 6)
+
+      await Promise.all(topics.slice(1).map((topic) => topic.joinPeer({ peer: hub.address })))
+      await withTimeout(hubJoins, 'hub gossip joins', 5_000)
+
+      expect(hubTopic.neighbors()).toHaveLength(6)
+    } finally {
+      for (const topic of topics) {
+        topic.close()
+      }
+      for (const endpoint of endpoints) {
+        endpoint.close()
+      }
+      await relay.stop()
+    }
+  })
 })
 
 async function expectRejects(promise: Promise<unknown>, message: string): Promise<void> {
