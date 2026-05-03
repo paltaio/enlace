@@ -6,7 +6,6 @@ import { n0DefaultRelayUrls, randomSecretKey } from '../../../packages/iroh-lite
 
 import { createChatBackend, type ChatBackend, type ChatMessage } from './backend'
 import './styles.css'
-import type { WasmChatModule } from './wasm-backend'
 
 declare module 'preact' {
   namespace JSX {
@@ -434,16 +433,6 @@ function ResetConfirm({ onCancel, onConfirm }: ResetConfirmProps) {
 async function openBackend(): Promise<ChatBackend> {
   const seed = await seedBytes(param('room', 'default'))
   const channel = param('channel', 'chat')
-  const kind = param('backend', 'iroh-lite')
-  if (kind === 'wasm') {
-    return await createChatBackend({
-      kind: 'wasm',
-      seed,
-      channel,
-      module: await loadWasmModule(),
-      options: {},
-    })
-  }
   return await createChatBackend({
     kind: 'iroh-lite',
     seed,
@@ -714,27 +703,6 @@ async function seedBytes(room: string): Promise<Uint8Array> {
 
 function messageText(message: ChatMessage): string {
   return decoder.decode(message.payload)
-}
-
-async function loadWasmModule(): Promise<WasmChatModule> {
-  const moduleUrl = param('wasm', './pkg/enlace_wasm.js')
-  const loaded: unknown = await import(/* @vite-ignore */ moduleUrl)
-  if (!isObject(loaded)) {
-    throw new TypeError('wasm module did not load')
-  }
-  const initializer = Object.getOwnPropertyDescriptor(loaded, 'default')?.value
-  if (typeof initializer === 'function') {
-    await initializer()
-  }
-  const namespace = Object.getOwnPropertyDescriptor(loaded, 'Namespace')?.value
-  if (!isObject(namespace)) {
-    throw new TypeError('wasm module has no Namespace export')
-  }
-  const open = Object.getOwnPropertyDescriptor(namespace, 'open')?.value
-  if (typeof open !== 'function') {
-    throw new TypeError('wasm Namespace has no open function')
-  }
-  return { Namespace: { open } }
 }
 
 function inviteSignal(value: unknown): InviteSignal {

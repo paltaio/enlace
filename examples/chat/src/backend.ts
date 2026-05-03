@@ -2,13 +2,8 @@ import type { RelayWebSocketConstructor } from '../../../packages/iroh-lite/src/
 import type { RelayUrlInput } from '../../../packages/iroh-lite/src/relay/url'
 
 import { createIrohLiteChatBackend } from './iroh-lite-backend'
-import {
-  createWasmChatBackend,
-  type WasmChatModule,
-  type WasmChatNamespaceOptions,
-} from './wasm-backend'
 
-export type ChatBackendKind = 'iroh-lite' | 'wasm'
+export type ChatBackendKind = 'iroh-lite'
 
 export interface ChatMessage {
   readonly payload: Uint8Array
@@ -37,19 +32,8 @@ export interface IrohLiteChatBackendOptions extends ChatBackendBaseOptions {
   readonly WebSocket?: RelayWebSocketConstructor
 }
 
-export interface WasmChatBackendOptions extends ChatBackendBaseOptions {
-  readonly kind: 'wasm'
-  readonly module: WasmChatModule
-  readonly options?: WasmChatNamespaceOptions
-}
-
-export type ChatBackendOptions = IrohLiteChatBackendOptions | WasmChatBackendOptions
+export type ChatBackendOptions = IrohLiteChatBackendOptions
 
 export async function createChatBackend(options: ChatBackendOptions): Promise<ChatBackend> {
-  switch (options.kind) {
-    case 'iroh-lite':
-      return await createIrohLiteChatBackend(options)
-    case 'wasm':
-      return await createWasmChatBackend(options)
-  }
+  return await createIrohLiteChatBackend(options)
 }
