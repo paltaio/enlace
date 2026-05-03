@@ -7,8 +7,10 @@ import {
   decodeGossipStreamHeader,
   decodeGossipTopicMessage,
   encodeGossipBroadcastMessage,
+  encodeGossipStreamFrame,
   encodeGossipStreamHeader,
   encodeGossipSwarmJoinMessage,
+  GossipFrameReader,
   gossipAlpn,
 } from './wire'
 
@@ -76,4 +78,66 @@ describe('gossip wire frames', () => {
       bytesToHex(encodeGossipBroadcastMessage({ content: hexToBytes(vector.broadcastPayloadHex) })),
     ).toBe(vector.broadcastMessageFrameHex)
   })
+
+  test('reads frames from arbitrary stream chunks', async () => {
+    const frames = concatFrames([
+      encodeGossipStreamFrame(new Uint8Array([1, 2, 3])),
+      encodeGossipStreamFrame(new Uint8Array([4])),
+    ])
+    const reader = new GossipFrameReader(
+      chunkedStream([
+        frames.subarray(0, 2),
+        frames.subarray(2, 7),
+        frames.subarray(7),
+        new Uint8Array(),
+      ]),
+    )
+
+    expect(await reader.readFrame()).toEqual(new Uint8Array([1, 2, 3]))
+    expect(await reader.readFrame()).toEqual(new Uint8Array([4]))
+    expect(await reader.readFrame()).toBeNull()
+  })
+
+  test('rejects oversized frames', async () => {
+    const reader = new GossipFrameReader(
+      chunkedStream([encodeGossipStreamFrame(new Uint8Array(2))]),
+      {
+        maxFrameSize: 1,
+      },
+    )
+
+    await expect(reader.readFrame()).rejects.toThrow('gossip stream frame exceeds max size')
+  })
+
+  test('rejects incomplete final frames', async () => {
+    const reader = new GossipFrameReader(chunkedStream([hexToBytes('00000002ff')]))
+
+    await expect(reader.readFrame()).rejects.toThrow('incomplete gossip stream frame')
+  })
 })
+
+function concatFrames(frames: readonly Uint8Array[]): Uint8Array {
+  const length = frames.reduce((sum, frame) => sum + frame.length, 0)
+  const out = new Uint8Array(length)
+  let offset = 0
+  for (const frame of frames) {
+    out.set(frame, offset)
+    offset += frame.length
+  }
+  return out
+}
+
+function chunkedStream(chunks: readonly Uint8Array[]): {
+  read(): Promise<{ readonly data: Uint8Array; readonly complete: boolean }>
+} {
+  const queue = [...chunks]
+  return {
+    async read(): Promise<{ readonly data: Uint8Array; readonly complete: boolean }> {
+      const data = queue.shift() ?? new Uint8Array()
+      return {
+        data,
+        complete: queue.length === 0,
+      }
+    },
+  }
+}

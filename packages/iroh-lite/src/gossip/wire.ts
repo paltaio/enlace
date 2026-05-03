@@ -21,6 +21,11 @@ export interface GossipStreamHeader {
   readonly topicId: Uint8Array
 }
 
+export interface GossipStreamRead {
+  readonly data: Uint8Array
+  readonly complete: boolean
+}
+
 export type GossipTopicMessage = GossipSwarmJoinMessage | GossipBroadcastMessage
 
 export interface GossipSwarmJoinMessage {
@@ -102,6 +107,58 @@ export function decodeGossipStreamFrame(bytes: Uint8Array, offset = 0): GossipSt
   return {
     payload: copyBytes(bytes.subarray(payloadOffset, endOffset)),
     bytesRead: endOffset - offset,
+  }
+}
+
+export class GossipFrameReader {
+  readonly #stream: { read(): Promise<GossipStreamRead> }
+  readonly #maxFrameSize: number
+  #buffer: Uint8Array<ArrayBufferLike> = new Uint8Array()
+  #complete = false
+
+  constructor(
+    stream: { read(): Promise<GossipStreamRead> },
+    options: { readonly maxFrameSize?: number } = {},
+  ) {
+    this.#stream = stream
+    this.#maxFrameSize = options.maxFrameSize ?? 65536
+  }
+
+  async readFrame(): Promise<Uint8Array | null> {
+    while (true) {
+      const payload = this.tryReadBufferedFrame()
+      if (payload !== null) {
+        return payload
+      }
+      if (this.#complete) {
+        if (this.#buffer.length !== 0) {
+          throw new RangeError('incomplete gossip stream frame')
+        }
+        return null
+      }
+      const chunk = await this.#stream.read()
+      if (chunk.data.length !== 0) {
+        this.#buffer = concatBytes([this.#buffer, chunk.data])
+      }
+      this.#complete = chunk.complete
+    }
+  }
+
+  private tryReadBufferedFrame(): Uint8Array | null {
+    if (this.#buffer.length < 4) {
+      return null
+    }
+    const length = readU32BE(this.#buffer, 0)
+    if (length > this.#maxFrameSize) {
+      throw new RangeError('gossip stream frame exceeds max size')
+    }
+    const endOffset = 4 + length
+    if (this.#buffer.length < endOffset) {
+      return null
+    }
+    const payload = copyBytes(this.#buffer.subarray(4, endOffset))
+    this.#buffer = copyBytes(this.#buffer.subarray(endOffset))
+    return payload
   }
 }
 

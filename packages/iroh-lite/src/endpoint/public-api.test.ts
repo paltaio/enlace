@@ -63,6 +63,8 @@ describe('public endpoint API', () => {
         alpn,
       })
       const serverConnection = await accepted
+      expect(clientConnection.peerEndpointId).toEqual(server.endpointId)
+      expect(serverConnection.peerEndpointId).toEqual(client.endpointId)
 
       const clientStream = clientConnection.openBidiStream()
       clientStream.write(payload, { fin: true })

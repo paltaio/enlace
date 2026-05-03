@@ -32,6 +32,7 @@ describe('public gossip API', () => {
       expect(await withTimeout(event, 'public gossip message', 5_000)).toEqual({
         type: 'message',
         topicId,
+        deliveredFrom: sender.endpointId,
         id: expect.any(Uint8Array),
         payload,
         scope: { type: 'swarm', round: 0 },
@@ -66,6 +67,7 @@ describe('public gossip API', () => {
       expect(await withTimeout(leftEvent, 'left gossip message', 5_000)).toEqual({
         type: 'message',
         topicId,
+        deliveredFrom: right.endpointId,
         id: expect.any(Uint8Array),
         payload: replyPayload,
         scope: { type: 'swarm', round: 0 },
@@ -73,6 +75,7 @@ describe('public gossip API', () => {
       expect(await withTimeout(rightEvent, 'right gossip message', 5_000)).toEqual({
         type: 'message',
         topicId,
+        deliveredFrom: left.endpointId,
         id: expect.any(Uint8Array),
         payload,
         scope: { type: 'swarm', round: 0 },
@@ -106,6 +109,43 @@ describe('public gossip API', () => {
       await relay.stop()
     }
   })
+
+  test('forwards swarm broadcasts across joined peers', async () => {
+    const relay = await startLocalIrohRelay()
+    const left = await createEndpoint({ relayUrl: relay.url })
+    const middle = await createEndpoint({ relayUrl: relay.url })
+    const right = await createEndpoint({ relayUrl: relay.url })
+    const leftTopic = createGossip(left).subscribe({ topicId })
+    const middleTopic = createGossip(middle).subscribe({ topicId })
+    const rightTopic = createGossip(right).subscribe({ topicId })
+
+    try {
+      const rightEvent = nextMessage(rightTopic.events())
+      const middleJoins = nextEvents(middleTopic.events(), 'join', 2)
+
+      await leftTopic.joinPeer({ peer: middle.address })
+      await rightTopic.joinPeer({ peer: middle.address })
+      await withTimeout(middleJoins, 'middle gossip joins', 5_000)
+      leftTopic.broadcast({ payload })
+
+      expect(await withTimeout(rightEvent, 'forwarded gossip message', 5_000)).toEqual({
+        type: 'message',
+        topicId,
+        deliveredFrom: middle.endpointId,
+        id: expect.any(Uint8Array),
+        payload,
+        scope: { type: 'swarm', round: 1 },
+      })
+    } finally {
+      leftTopic.close()
+      middleTopic.close()
+      rightTopic.close()
+      left.close()
+      middle.close()
+      right.close()
+      await relay.stop()
+    }
+  })
 })
 
 async function expectRejects(promise: Promise<unknown>, message: string): Promise<void> {
@@ -125,4 +165,21 @@ async function nextMessage(events: AsyncIterable<{ readonly type: string }>): Pr
     }
   }
   throw new Error('gossip events closed before message')
+}
+
+async function nextEvents(
+  events: AsyncIterable<{ readonly type: string }>,
+  type: string,
+  count: number,
+): Promise<unknown[]> {
+  const out: unknown[] = []
+  for await (const event of events) {
+    if (event.type === type) {
+      out.push(event)
+      if (out.length === count) {
+        return out
+      }
+    }
+  }
+  throw new Error('gossip events closed before expected events')
 }

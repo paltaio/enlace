@@ -520,6 +520,14 @@ export class Connection {
     this.#driver = driver
   }
 
+  get peerEndpointId(): Uint8Array {
+    const endpointId = this.#driver.connection?.handshakeArtifacts().peerEndpointId ?? null
+    if (endpointId === null) {
+      throw new Error('connection peer endpoint id is unavailable')
+    }
+    return endpointId
+  }
+
   openBidiStream(): BidiStream {
     const streamId = this.nextOpenBidiStreamId()
     const stream = new BidiStream(this, streamId)

@@ -113,6 +113,10 @@ export class IrohConnection {
     this.#connection = connection
   }
 
+  get peerEndpointId(): Uint8Array {
+    return copyBytes(this.#connection.peerEndpointId)
+  }
+
   openBidiStream(): IrohBidiStream {
     return new IrohBidiStream(this.#connection.openBidiStream())
   }
