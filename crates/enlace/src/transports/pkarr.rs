@@ -81,7 +81,8 @@ impl fmt::Debug for PkarrTransport {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl MailboxTransport for PkarrTransport {
     async fn send(&self, _id: &[u8], _sealed: &[u8]) -> Result<(), TransportError> {
         Err(TransportError::Unsupported)
@@ -92,34 +93,50 @@ impl MailboxTransport for PkarrTransport {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl SlotTransport for PkarrTransport {
     async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
         let id = self.pkarr_slot_id(id)?;
-        let current = self.resolve_packet_for(&id.public_key).await;
-        if current
-            .as_ref()
-            .and_then(|packet| slot_record(packet, &id.record).transpose())
-            .transpose()?
-            .is_some_and(|(current_version, _)| current_version >= version)
-        {
-            return Err(TransportError::Stale);
-        }
+        // pkarr's client cache and individual relays can diverge: a stale
+        // CAS timestamp on one relay surfaces as Concurrency even though our
+        // version isn't really stale. Re-resolve and retry a few times before
+        // giving up; a true stale version still fails after the loop.
+        const MAX_ATTEMPTS: usize = 3;
+        let mut last_err: Option<TransportError> = None;
+        for _ in 0..MAX_ATTEMPTS {
+            let current = self.resolve_packet_for(&id.public_key).await;
+            if current
+                .as_ref()
+                .and_then(|packet| slot_record(packet, &id.record).transpose())
+                .transpose()?
+                .is_some_and(|(current_version, _)| current_version >= version)
+            {
+                return Err(TransportError::Stale);
+            }
 
-        let packet = build_packet(
-            &id.keypair,
-            &id.public_key,
-            current.as_ref(),
-            &id.record,
-            version,
-            sealed,
-            self.record_ttl,
-        )?;
-        let cas = current.as_ref().map(SignedPacket::timestamp);
-        self.client
-            .publish(&packet, cas)
-            .await
-            .map_err(map_publish_error)
+            let packet = build_packet(
+                &id.keypair,
+                &id.public_key,
+                current.as_ref(),
+                &id.record,
+                version,
+                sealed,
+                self.record_ttl,
+            )?;
+            let cas = current.as_ref().map(SignedPacket::timestamp);
+            match self.client.publish(&packet, cas).await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    let mapped = map_publish_error(err);
+                    if !matches!(mapped, TransportError::Stale) {
+                        return Err(mapped);
+                    }
+                    last_err = Some(mapped);
+                }
+            }
+        }
+        Err(last_err.unwrap_or(TransportError::Stale))
     }
 
     async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
@@ -136,7 +153,7 @@ impl SlotTransport for PkarrTransport {
         let transport = self.clone();
         let (tx, rx) = mpsc::channel(WATCH_BUFFER);
 
-        tokio::spawn(async move {
+        crate::runtime::spawn(async move {
             let mut since = since;
             loop {
                 match transport.slot_get_since(id.clone(), since).await {
@@ -153,7 +170,7 @@ impl SlotTransport for PkarrTransport {
                         }
                     }
                 }
-                tokio::time::sleep(transport.poll_interval).await;
+                crate::runtime::sleep(transport.poll_interval).await;
             }
         });
 

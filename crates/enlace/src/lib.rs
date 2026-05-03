@@ -37,6 +37,7 @@ pub mod kdf;
 pub mod mailbox;
 pub mod namespace;
 pub mod peer;
+pub(crate) mod runtime;
 pub mod slot;
 pub mod state;
 pub mod transports;

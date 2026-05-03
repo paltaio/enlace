@@ -292,14 +292,24 @@ fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
 impl StateStore for InMemoryStateStore {
     fn next_local_slot_version(&self, slot: &str) -> Result<u64, StateError> {
         let mut inner = write_lock(&self.inner);
+        // Floor next at the highest version we've observed, so a peer that
+        // joins mid-conversation in a shared-seed namespace doesn't try to
+        // write at v=1 over an existing v=N.
+        let observed = inner
+            .last_seen_slot_versions
+            .get(slot)
+            .copied()
+            .unwrap_or(0);
         let entry = inner
             .local_slot_versions
             .entry(slot.to_owned())
             .or_insert(0);
-        *entry = entry
+        let floor = (*entry).max(observed);
+        let next = floor
             .checked_add(1)
             .expect("local slot version counter overflowed u64");
-        Ok(*entry)
+        *entry = next;
+        Ok(next)
     }
 
     fn last_seen_slot_version(&self, slot: &str) -> Result<Option<u64>, StateError> {
@@ -470,6 +480,7 @@ impl StateStore for FileStateStore {
     fn next_local_slot_version(&self, slot: &str) -> Result<u64, StateError> {
         let key = Self::slot_key(LOCAL_SLOT_PREFIX, slot);
         loop {
+            let observed = self.last_seen_slot_version(slot)?.unwrap_or(0);
             let current = self.db.get(&key).map_err(backend_error)?;
             let current_version = current
                 .as_deref()
@@ -477,6 +488,7 @@ impl StateStore for FileStateStore {
                 .transpose()?
                 .unwrap_or(0);
             let next = current_version
+                .max(observed)
                 .checked_add(1)
                 .expect("local slot version counter overflowed u64");
             let encoded = next.to_be_bytes().to_vec();
@@ -973,6 +985,14 @@ mod tests {
     }
 
     #[test]
+    fn next_local_slot_version_floors_at_seen() {
+        let s = InMemoryStateStore::new();
+        s.record_seen_slot_version("alpha", 9).unwrap();
+        assert_eq!(s.next_local_slot_version("alpha").unwrap(), 10);
+        assert_eq!(s.next_local_slot_version("alpha").unwrap(), 11);
+    }
+
+    #[test]
     fn record_seen_slot_version_is_per_slot() {
         let s = InMemoryStateStore::new();
         s.record_seen_slot_version("alpha", 5).unwrap();
@@ -1039,7 +1059,9 @@ mod tests {
         {
             let state = State::file(&path).unwrap();
             let store = state.store();
-            assert_eq!(store.next_local_slot_version("slot").unwrap(), 2);
+            // last_seen=9 floors the next local slot to 10 even though the
+            // persisted local counter is 1.
+            assert_eq!(store.next_local_slot_version("slot").unwrap(), 10);
             assert_eq!(store.last_seen_slot_version("slot").unwrap(), Some(9));
             assert_eq!(store.iroh_keypair().unwrap(), Some([7u8; 32]));
         }

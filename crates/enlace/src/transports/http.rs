@@ -23,10 +23,15 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub fn new(config: HttpConfig) -> Result<Self, TransportError> {
-        let client = Client::builder()
-            .danger_accept_invalid_certs(config.skip_verify)
-            .build()
-            .map_err(map_reqwest_error)?;
+        let builder = Client::builder();
+        // The browser controls TLS verification; reqwest's wasm backend does
+        // not expose `danger_accept_invalid_certs`. Native deployments may opt
+        // into self-signed relays via the `skip_verify` flag.
+        #[cfg(not(target_arch = "wasm32"))]
+        let builder = builder.danger_accept_invalid_certs(config.skip_verify);
+        #[cfg(target_arch = "wasm32")]
+        let _ = config.skip_verify;
+        let client = builder.build().map_err(map_reqwest_error)?;
         Ok(Self {
             client,
             base_url: config.url,
@@ -92,7 +97,8 @@ impl HttpTransport {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl MailboxTransport for HttpTransport {
     async fn send(&self, id: &[u8], sealed: &[u8]) -> Result<(), TransportError> {
         let id = http_channel_id(id)?;
@@ -131,7 +137,8 @@ impl MailboxTransport for HttpTransport {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl SlotTransport for HttpTransport {
     async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
         let id = http_channel_id(id)?;
@@ -164,7 +171,7 @@ impl SlotTransport for HttpTransport {
         let transport = self.clone();
         let (tx, rx) = mpsc::channel(WATCH_BUFFER);
 
-        tokio::spawn(async move {
+        crate::runtime::spawn(async move {
             let mut since = since;
             loop {
                 match transport
@@ -182,7 +189,7 @@ impl SlotTransport for HttpTransport {
                         if tx.send(Err(err)).await.is_err() {
                             break;
                         }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        crate::runtime::sleep(Duration::from_secs(1)).await;
                     }
                 }
             }
