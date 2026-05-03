@@ -97,13 +97,14 @@ export class IrohGossipSubscription {
     })
     this.#connections.add(connection)
     this.sendFrame(connection, encodeGossipSwarmJoinMessage())
+    void this.readIncoming(connection)
   }
 
   broadcast(options: IrohGossipBroadcastOptions): void {
     this.requireOpen()
     const frame = encodeGossipBroadcastMessage(broadcastInput(options))
     for (const connection of this.#connections) {
-      this.sendFrame(connection, frame)
+      this.trySendFrame(connection, frame)
     }
   }
 
@@ -118,9 +119,11 @@ export class IrohGossipSubscription {
 
   private async acceptLoop(): Promise<void> {
     try {
-      const connection = await this.#endpoint.accept({ alpn: gossipAlpn })
-      this.#connections.add(connection)
-      await this.readIncoming(connection)
+      while (!this.#closed) {
+        const connection = await this.#endpoint.accept({ alpn: gossipAlpn })
+        this.#connections.add(connection)
+        void this.readIncoming(connection)
+      }
     } catch (error) {
       if (!this.#closed) {
         this.#events.fail(error)
@@ -134,10 +137,8 @@ export class IrohGossipSubscription {
         const stream = await connection.acceptUniStream()
         const bytes = await stream.readToEnd()
         this.pushStreamEvents(bytes)
-      } catch (error) {
-        if (!this.#closed) {
-          this.#events.fail(error)
-        }
+      } catch {
+        this.#connections.delete(connection)
         return
       }
     }
@@ -184,6 +185,14 @@ export class IrohGossipSubscription {
     stream.write(concatBytes([encodeGossipStreamHeader({ topicId: this.#topicId }), frame]), {
       fin: true,
     })
+  }
+
+  private trySendFrame(connection: IrohConnection, frame: Uint8Array): void {
+    try {
+      this.sendFrame(connection, frame)
+    } catch {
+      this.#connections.delete(connection)
+    }
   }
 
   private requireOpen(): void {
