@@ -1,0 +1,9 @@
+{
+  "extends": "../../packages/iroh-lite/tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "../..",
+    "noEmit": true,
+    "typeRoots": ["../../packages/iroh-lite/node_modules/@types", "../../packages/iroh-lite/node_modules"]
+  },
+  "include": ["src/**/*.ts", "../../packages/iroh-lite/src/**/*.ts"]
+}
