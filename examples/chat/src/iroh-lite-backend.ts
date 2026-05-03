@@ -18,14 +18,16 @@ const hexPattern = /^[0-9a-f]*$/u
 export interface IrohLiteChatBackendOptions {
   readonly seed: Uint8Array
   readonly channel: string
-  readonly relayUrl: RelayUrlInput
+  readonly relayUrl?: RelayUrlInput
+  readonly relayUrls?: readonly RelayUrlInput[]
+  readonly secretKey?: Uint8Array
   readonly WebSocket?: RelayWebSocketConstructor
 }
 
 export async function createIrohLiteChatBackend(
   options: IrohLiteChatBackendOptions,
 ): Promise<IrohLiteChatBackend> {
-  const endpoint = await createEndpoint(endpointOptions(options))
+  const endpoint = await createFirstEndpoint(options)
   const topic = createGossip(endpoint).subscribe({
     topicId: await chatTopicId(options.seed, options.channel),
   })
@@ -47,9 +49,9 @@ export class IrohLiteChatBackend implements ChatBackend {
     this.localInvite = encodeInvite(endpoint.address)
   }
 
-  async addPeer(invite: Uint8Array): Promise<void> {
+  addPeer(invite: Uint8Array): Promise<void> {
     this.requireOpen()
-    await this.#topic.joinPeer({ peer: decodeInvite(invite) })
+    return this.#topic.joinPeer({ peer: decodeInvite(invite) })
   }
 
   send(payload: Uint8Array): void {
@@ -123,12 +125,53 @@ function messageEvent(event: Extract<IrohGossipEvent, { readonly type: 'message'
 
 function endpointOptions(options: IrohLiteChatBackendOptions): {
   readonly relayUrl: RelayUrlInput
+  readonly secretKey?: Uint8Array
   readonly WebSocket?: RelayWebSocketConstructor
-} {
-  if (options.WebSocket === undefined) {
-    return { relayUrl: options.relayUrl }
+}[] {
+  return relayUrlCandidates(options).map((relayUrl) => {
+    const out: {
+      relayUrl: RelayUrlInput
+      secretKey?: Uint8Array
+      WebSocket?: RelayWebSocketConstructor
+    } = { relayUrl }
+    if (options.secretKey !== undefined) {
+      out.secretKey = options.secretKey
+    }
+    if (options.WebSocket !== undefined) {
+      out.WebSocket = options.WebSocket
+    }
+    return out
+  })
+}
+
+async function createFirstEndpoint(options: IrohLiteChatBackendOptions): Promise<IrohEndpoint> {
+  const failures: string[] = []
+  for (const candidate of endpointOptions(options)) {
+    try {
+      return await createEndpoint(candidate)
+    } catch (error) {
+      failures.push(errorMessage(error))
+    }
   }
-  return { relayUrl: options.relayUrl, WebSocket: options.WebSocket }
+  throw new Error(`no relay URL connected: ${failures.join('; ')}`)
+}
+
+function relayUrlCandidates(options: IrohLiteChatBackendOptions): readonly RelayUrlInput[] {
+  const relayUrls = options.relayUrls ?? []
+  if (relayUrls.length > 0) {
+    return relayUrls
+  }
+  if (options.relayUrl !== undefined) {
+    return [options.relayUrl]
+  }
+  throw new Error('at least one relay URL is required')
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message
+  }
+  return String(error)
 }
 
 function encodeInvite(address: {

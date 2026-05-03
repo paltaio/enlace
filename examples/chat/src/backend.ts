@@ -31,7 +31,9 @@ interface ChatBackendBaseOptions {
 
 export interface IrohLiteChatBackendOptions extends ChatBackendBaseOptions {
   readonly kind: 'iroh-lite'
-  readonly relayUrl: RelayUrlInput
+  readonly relayUrl?: RelayUrlInput
+  readonly relayUrls?: readonly RelayUrlInput[]
+  readonly secretKey?: Uint8Array
   readonly WebSocket?: RelayWebSocketConstructor
 }
 

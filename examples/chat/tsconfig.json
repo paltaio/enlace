@@ -1,9 +1,12 @@
 {
   "extends": "../../packages/iroh-lite/tsconfig.json",
   "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact",
     "rootDir": "../..",
     "noEmit": true,
     "typeRoots": ["../../packages/iroh-lite/node_modules/@types", "../../packages/iroh-lite/node_modules"]
   },
-  "include": ["src/**/*.ts", "../../packages/iroh-lite/src/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts", "build.ts", "../../packages/iroh-lite/src/**/*.ts"]
 }

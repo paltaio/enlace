@@ -108,6 +108,7 @@ export class IrohGossipSubscription {
   readonly #events = new AsyncQueue<IrohGossipEvent>()
   readonly #neighbors = new Map<string, Uint8Array>()
   readonly #joinedResolvers: (() => void)[] = []
+  readonly #peerJoined = new Map<string, PendingPeerJoin>()
   #closed = false
 
   constructor(actor: GossipActor, topicId: Uint8Array) {
@@ -140,16 +141,23 @@ export class IrohGossipSubscription {
     return this.#events
   }
 
-  async joinPeer(options: IrohGossipJoinPeerOptions): Promise<void> {
-    this.requireOpen()
-    await this.#actor.joinPeer(this.#topicId, options.peer)
-    await this.joined()
+  joinPeer(options: IrohGossipJoinPeerOptions): Promise<void> {
+    try {
+      this.requireOpen()
+    } catch (error) {
+      return Promise.reject(error)
+    }
+    const joined = this.peerJoined(options.peer.endpointId)
+    void this.#actor.joinPeer(this.#topicId, options.peer).catch((error: unknown) => {
+      this.fail(error)
+    })
+    return joined
   }
 
   async joinPeers(peers: readonly IrohEndpointAddress[]): Promise<void> {
     this.requireOpen()
     await this.#actor.joinPeers(this.#topicId, peers)
-    await this.joined()
+    await Promise.all(peers.map((peer) => this.peerJoined(peer.endpointId)))
   }
 
   broadcast(options: IrohGossipBroadcastOptions): void {
@@ -170,6 +178,7 @@ export class IrohGossipSubscription {
     this.#actor.unsubscribe(this.#topicId, this)
     this.#events.close()
     this.#joinedResolvers.splice(0).forEach((resolve) => resolve())
+    this.resolvePeerJoined()
   }
 
   push(event: IrohGossipEvent): void {
@@ -177,8 +186,10 @@ export class IrohGossipSubscription {
       return
     }
     if (event.type === 'neighbor-up') {
-      this.#neighbors.set(bytesKey(event.peer), copyBytes(event.peer))
+      const peerKey = bytesKey(event.peer)
+      this.#neighbors.set(peerKey, copyBytes(event.peer))
       this.#joinedResolvers.splice(0).forEach((resolve) => resolve())
+      this.resolvePeerJoined(peerKey)
     } else if (event.type === 'neighbor-down') {
       this.#neighbors.delete(bytesKey(event.peer))
     }
@@ -188,6 +199,7 @@ export class IrohGossipSubscription {
   fail(error: unknown): void {
     this.#events.fail(error)
     this.#joinedResolvers.splice(0).forEach((resolve) => resolve())
+    this.resolvePeerJoined()
   }
 
   private requireOpen(): void {
@@ -195,7 +207,47 @@ export class IrohGossipSubscription {
       throw new Error('gossip subscription is closed')
     }
   }
+
+  private peerJoined(peer: Uint8Array): Promise<void> {
+    const key = bytesKey(peer)
+    if (this.#neighbors.has(key)) {
+      return Promise.resolve()
+    }
+    const pending = this.#peerJoined.get(key)
+    if (pending !== undefined) {
+      return pending.promise
+    }
+    let resolvePromise: () => void = noop
+    const promise = new Promise<void>((resolve) => {
+      resolvePromise = resolve
+    })
+    this.#peerJoined.set(key, { promise, resolve: resolvePromise })
+    return promise
+  }
+
+  private resolvePeerJoined(peerKey?: string): void {
+    if (peerKey === undefined) {
+      for (const pending of this.#peerJoined.values()) {
+        pending.resolve()
+      }
+      this.#peerJoined.clear()
+      return
+    }
+    const pending = this.#peerJoined.get(peerKey)
+    if (pending === undefined) {
+      return
+    }
+    this.#peerJoined.delete(peerKey)
+    pending.resolve()
+  }
 }
+
+interface PendingPeerJoin {
+  readonly promise: Promise<void>
+  resolve(): void
+}
+
+function noop(): void {}
 
 class GossipActor {
   readonly #endpoint: IrohEndpoint

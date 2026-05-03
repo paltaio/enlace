@@ -146,6 +146,41 @@ describe('public gossip API', () => {
       await relay.stop()
     }
   })
+
+  test('joinPeer waits for the requested peer when another neighbor is already joined', async () => {
+    const relay = await startLocalIrohRelay()
+    const left = await createEndpoint({ relayUrl: relay.url })
+    const middle = await createEndpoint({ relayUrl: relay.url })
+    const right = await createEndpoint({ relayUrl: relay.url })
+    const offline = await createEndpoint({ relayUrl: relay.url })
+    const offlineAddress = offline.address
+    offline.close()
+    const leftTopic = createGossip(left).subscribe({ topicId })
+    const middleTopic = createGossip(middle).subscribe({ topicId })
+    const rightTopic = createGossip(right).subscribe({ topicId })
+
+    try {
+      await leftTopic.joinPeer({ peer: middle.address })
+      expect(leftTopic.neighbors()).toEqual([middle.endpointId])
+
+      await expectRejects(
+        withTimeout(leftTopic.joinPeer({ peer: offlineAddress }), 'offline gossip peer', 500),
+        'offline gossip peer timed out',
+      )
+      expect(leftTopic.neighbors()).toEqual([middle.endpointId])
+
+      await withTimeout(leftTopic.joinPeer({ peer: right.address }), 'right gossip peer', 5_000)
+      expect(leftTopic.neighbors()).toEqual([middle.endpointId, right.endpointId])
+    } finally {
+      leftTopic.close()
+      middleTopic.close()
+      rightTopic.close()
+      left.close()
+      middle.close()
+      right.close()
+      await relay.stop()
+    }
+  })
 })
 
 async function expectRejects(promise: Promise<unknown>, message: string): Promise<void> {
