@@ -434,4 +434,41 @@ mod tests {
         let err = transport.recv(&[2; 16], Duration::ZERO).await.unwrap_err();
         assert!(matches!(err, TransportError::Unsupported));
     }
+
+    #[test]
+    fn publish_concurrency_errors_map_to_stale() {
+        use pkarr::errors::{ConcurrencyError, PublishError};
+
+        for variant in [
+            ConcurrencyError::ConflictRisk,
+            ConcurrencyError::NotMostRecent,
+            ConcurrencyError::CasFailed,
+        ] {
+            assert!(matches!(
+                map_publish_error(PublishError::Concurrency(variant)),
+                TransportError::Stale,
+            ));
+        }
+    }
+
+    #[test]
+    fn publish_query_timeout_maps_to_timeout_not_stale() {
+        use pkarr::errors::{PublishError, QueryError};
+
+        assert!(matches!(
+            map_publish_error(PublishError::Query(QueryError::Timeout)),
+            TransportError::Timeout,
+        ));
+    }
+
+    #[test]
+    fn publish_other_errors_do_not_map_to_stale() {
+        use pkarr::errors::PublishError;
+
+        let mapped = map_publish_error(PublishError::UnexpectedResponses);
+        assert!(
+            !matches!(mapped, TransportError::Stale),
+            "unexpected-response errors must abort the retry loop, not retry: got {mapped:?}",
+        );
+    }
 }
