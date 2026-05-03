@@ -38,6 +38,11 @@ describe('gossip protocol state', () => {
         topicId: topicA,
         message: { layer: 'swarm', type: 'join', peerData },
       },
+      {
+        type: 'schedule-timer',
+        delayMs: 60_000,
+        timer: { topicId: topicA, value: { type: 'do-shuffle' } },
+      },
     ])
   })
 
@@ -489,6 +494,49 @@ describe('gossip protocol state', () => {
     expect(expired).toBe(false)
   })
 
+  test('shuffle timer sends native shuffle request and reschedules', () => {
+    const state = new GossipProtocolState({
+      me: peerA,
+      peerData,
+      random: sequenceRandom(0, 0, 0, 0, 0, 0),
+    })
+    joinTopic(state, topicA)
+    receiveJoin(state, topicA, peerB)
+    receiveJoin(state, topicA, peerC)
+    receiveForwardJoin(state, topicA, peerB, peerD)
+    receiveForwardJoin(state, topicA, peerB, peerE)
+
+    const out = state.handle({
+      type: 'timer-expired',
+      timer: { topicId: topicA, value: { type: 'do-shuffle' } },
+    })
+
+    expect(sendMessages(out)).toEqual([
+      {
+        type: 'send-message',
+        peer: peerB,
+        topicId: topicA,
+        message: {
+          layer: 'swarm',
+          type: 'shuffle',
+          origin: peerA,
+          nodes: [
+            { id: peerC, peerData: null },
+            { id: peerD, peerData },
+            { id: peerE, peerData },
+            { id: peerA, peerData },
+          ],
+          ttl: 6,
+        },
+      },
+    ])
+    expect(onlyTimer(out)).toEqual({
+      type: 'schedule-timer',
+      delayMs: 60_000,
+      timer: { topicId: topicA, value: { type: 'do-shuffle' } },
+    })
+  })
+
   test('peer disconnect clears pending lazy ihave dispatch', () => {
     const state = joinedStateWithNeighbors()
     const payload = new TextEncoder().encode('stale-lazy')
@@ -581,6 +629,12 @@ describe('gossip protocol state', () => {
         type: 'send-message',
         peer: peerB,
         topicId: topicA,
+        message: { layer: 'swarm', type: 'shuffle-reply', nodes: [] },
+      },
+      {
+        type: 'send-message',
+        peer: peerB,
+        topicId: topicA,
         message: { layer: 'swarm', type: 'disconnect', alive: true, respond: false },
       },
       { type: 'disconnect-peer', peer: peerB },
@@ -625,6 +679,16 @@ describe('gossip protocol state', () => {
         type: 'emit-event',
         topicId: topicA,
         event: { type: 'neighbor-down', peer: peerC },
+      },
+      {
+        type: 'send-message',
+        peer: peerC,
+        topicId: topicA,
+        message: {
+          layer: 'swarm',
+          type: 'shuffle-reply',
+          nodes: [{ id: peerB, peerData: null }],
+        },
       },
       {
         type: 'send-message',
@@ -681,6 +745,16 @@ describe('gossip protocol state', () => {
         },
       }),
     ).toEqual([
+      {
+        type: 'send-message',
+        peer: peerC,
+        topicId: topicA,
+        message: {
+          layer: 'swarm',
+          type: 'shuffle-reply',
+          nodes: [{ id: peerB, peerData: null }],
+        },
+      },
       {
         type: 'send-message',
         peer: peerC,
@@ -917,6 +991,12 @@ describe('gossip protocol state', () => {
         command: { type: 'quit' },
       }),
     ).toEqual([
+      {
+        type: 'send-message',
+        peer: peerB,
+        topicId: topicB,
+        message: { layer: 'swarm', type: 'shuffle-reply', nodes: [] },
+      },
       {
         type: 'send-message',
         peer: peerB,
