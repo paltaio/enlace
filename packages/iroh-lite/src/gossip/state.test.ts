@@ -2,8 +2,14 @@ import { describe, expect, test } from 'bun:test'
 import { blake3 } from '@noble/hashes/blake3.js'
 
 import { hexToBytes } from '../testing/hex'
-import { GossipProtocolState, type GossipProtocolOutEvent } from './state'
+import {
+  GossipProtocolState,
+  GossipTimerScheduler,
+  type GossipProtocolOutEvent,
+  type GossipRandomSource,
+} from './state'
 import type { GossipBroadcastMessage } from './wire'
+import { encodeGossipIHaveMessage } from './wire'
 
 const topicA = hexToBytes('101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f')
 const topicB = hexToBytes('202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f')
@@ -369,7 +375,7 @@ describe('gossip protocol state', () => {
       message: { layer: 'gossip', type: 'prune' },
     })
     let timer: Extract<GossipProtocolOutEvent, { readonly type: 'schedule-timer' }> | null = null
-    for (let index = 0; index < 15; index += 1) {
+    for (let index = 0; index < 16; index += 1) {
       const out = state.handle({
         type: 'command',
         topicId: topicA,
@@ -408,8 +414,79 @@ describe('gossip protocol state', () => {
         }),
       }),
     ])
-    expect(ihaveMessageCount(ihaves[0])).toBe(14)
+    expect(ihaveMessageCount(ihaves[0])).toBe(15)
     expect(ihaveMessageCount(ihaves[1])).toBe(1)
+    expect(ihavePayloadSize(ihaves[0])).toBeLessThanOrEqual(512)
+    expect(ihavePayloadSize(ihaves[1])).toBeLessThanOrEqual(512)
+  })
+
+  test('timer scheduler feeds expired timers back into protocol state', () => {
+    const state = joinedStateWithNeighbors()
+    const clock = new FakeClock()
+    const payload = new TextEncoder().encode('timer-dispatch')
+    const expiredOut: GossipProtocolOutEvent[] = []
+
+    const scheduler = new GossipTimerScheduler({
+      now: () => clock.nowMs,
+      setTimeout: (callback, delayMs) => clock.setTimeout(callback, delayMs),
+      clearTimeout: (handle) => clock.clearTimeout(handle),
+      onTimer: (timer, nowMs) => {
+        expiredOut.push(...state.handle({ type: 'timer-expired', timer }, nowMs))
+      },
+    })
+
+    state.handle({
+      type: 'recv-message',
+      peer: peerB,
+      topicId: topicA,
+      message: { layer: 'gossip', type: 'prune' },
+    })
+    scheduler.scheduleFrom(
+      state.handle({
+        type: 'command',
+        topicId: topicA,
+        command: { type: 'broadcast', payload },
+      }),
+    )
+
+    expect(clock.pending()).toBe(1)
+    clock.nowMs = 5
+    clock.runNext()
+
+    expect(sendMessages(expiredOut)).toEqual([
+      {
+        type: 'send-message',
+        peer: peerB,
+        topicId: topicA,
+        message: {
+          layer: 'gossip',
+          type: 'ihave',
+          messages: [{ id: blake3(payload), round: 0 }],
+        },
+      },
+    ])
+  })
+
+  test('timer scheduler cancels pending timers on close', () => {
+    const clock = new FakeClock()
+    let expired = false
+    const scheduler = new GossipTimerScheduler({
+      setTimeout: (callback, delayMs) => clock.setTimeout(callback, delayMs),
+      clearTimeout: (handle) => clock.clearTimeout(handle),
+      onTimer: () => {
+        expired = true
+      },
+    })
+
+    scheduler.schedule({
+      type: 'schedule-timer',
+      delayMs: 5,
+      timer: { topicId: topicA, value: { type: 'dispatch-lazy-push' } },
+    })
+    scheduler.close()
+
+    expect(clock.pending()).toBe(0)
+    expect(expired).toBe(false)
   })
 
   test('peer disconnect clears pending lazy ihave dispatch', () => {
@@ -479,7 +556,11 @@ describe('gossip protocol state', () => {
   })
 
   test('active view capacity evicts old high-priority neighbor to passive view', () => {
-    const state = new GossipProtocolState({ me: peerA, activeViewCapacity: 1 })
+    const state = new GossipProtocolState({
+      me: peerA,
+      activeViewCapacity: 1,
+      random: sequenceRandom(0),
+    })
     joinTopic(state, topicA)
     receiveJoin(state, topicA, peerB)
 
@@ -517,6 +598,66 @@ describe('gossip protocol state', () => {
           type: 'neighbor',
           priority: 'high',
           peerData: new Uint8Array(),
+        },
+      },
+    ])
+  })
+
+  test('active view eviction uses injected random source', () => {
+    const state = new GossipProtocolState({
+      me: peerA,
+      activeViewCapacity: 2,
+      random: sequenceRandom(1),
+    })
+    joinTopic(state, topicA)
+    receiveJoin(state, topicA, peerB)
+    receiveJoin(state, topicA, peerC)
+
+    const out = state.handle({
+      type: 'recv-message',
+      peer: peerD,
+      topicId: topicA,
+      message: { layer: 'swarm', type: 'join', peerData: new Uint8Array() },
+    })
+
+    expect(out).toEqual([
+      {
+        type: 'emit-event',
+        topicId: topicA,
+        event: { type: 'neighbor-down', peer: peerC },
+      },
+      {
+        type: 'send-message',
+        peer: peerC,
+        topicId: topicA,
+        message: { layer: 'swarm', type: 'disconnect', alive: true, respond: false },
+      },
+      { type: 'disconnect-peer', peer: peerC },
+      {
+        type: 'emit-event',
+        topicId: topicA,
+        event: { type: 'neighbor-up', peer: peerD },
+      },
+      {
+        type: 'send-message',
+        peer: peerD,
+        topicId: topicA,
+        message: {
+          layer: 'swarm',
+          type: 'neighbor',
+          priority: 'high',
+          peerData: new Uint8Array(),
+        },
+      },
+      {
+        type: 'send-message',
+        peer: peerB,
+        topicId: topicA,
+        message: {
+          layer: 'swarm',
+          type: 'forward-join',
+          peer: { id: peerD, peerData: new Uint8Array() },
+          ttl: 6,
         },
       },
     ])
@@ -582,7 +723,11 @@ describe('gossip protocol state', () => {
   })
 
   test('disconnect refills active view from passive peers', () => {
-    const state = new GossipProtocolState({ me: peerA, activeViewCapacity: 2 })
+    const state = new GossipProtocolState({
+      me: peerA,
+      activeViewCapacity: 2,
+      random: sequenceRandom(0),
+    })
     joinTopic(state, topicA)
     receiveJoin(state, topicA, peerB)
     receiveNeighbor(state, topicA, peerB)
@@ -634,7 +779,11 @@ describe('gossip protocol state', () => {
   })
 
   test('alive disconnect keeps passive peer after connection close', () => {
-    const state = new GossipProtocolState({ me: peerA, activeViewCapacity: 1 })
+    const state = new GossipProtocolState({
+      me: peerA,
+      activeViewCapacity: 1,
+      random: sequenceRandom(0),
+    })
     joinTopic(state, topicA)
     receiveJoin(state, topicA, peerB)
     state.handle({
@@ -671,7 +820,11 @@ describe('gossip protocol state', () => {
   })
 
   test('pending neighbor timeout disconnects failed probe and skips pending passive peers', () => {
-    const state = new GossipProtocolState({ me: peerA, activeViewCapacity: 3 })
+    const state = new GossipProtocolState({
+      me: peerA,
+      activeViewCapacity: 3,
+      random: sequenceRandom(0),
+    })
     joinTopic(state, topicA)
     receiveJoin(state, topicA, peerB)
     receiveNeighbor(state, topicA, peerB)
@@ -861,4 +1014,56 @@ function ihaveMessageCount(event: GossipProtocolOutEvent | undefined): number {
     throw new Error('expected ihave message')
   }
   return event.message.messages.length
+}
+
+function ihavePayloadSize(event: GossipProtocolOutEvent | undefined): number {
+  if (event?.type !== 'send-message' || event.message.type !== 'ihave') {
+    throw new Error('expected ihave message')
+  }
+  return encodeGossipIHaveMessage({ messages: event.message.messages }).length - 4
+}
+
+function sequenceRandom(...values: readonly number[]): GossipRandomSource {
+  let index = 0
+  return {
+    nextUint32(): number {
+      const value = values[index] ?? 0
+      index += 1
+      return value
+    },
+  }
+}
+
+class FakeClock {
+  nowMs = 0
+  readonly #timers = new Map<number, { readonly callback: () => void; readonly delayMs: number }>()
+  #nextHandle = 0
+
+  setTimeout(callback: () => void, delayMs: number): number {
+    const handle = this.#nextHandle
+    this.#nextHandle += 1
+    this.#timers.set(handle, { callback, delayMs })
+    return handle
+  }
+
+  clearTimeout(handle: unknown): void {
+    if (typeof handle === 'number') {
+      this.#timers.delete(handle)
+    }
+  }
+
+  pending(): number {
+    return this.#timers.size
+  }
+
+  runNext(): void {
+    const next = this.#timers.entries().next().value
+    if (next === undefined) {
+      throw new Error('expected pending timer')
+    }
+    const [handle, timer] = next
+    this.#timers.delete(handle)
+    this.nowMs += timer.delayMs
+    timer.callback()
+  }
 }

@@ -1,21 +1,43 @@
 import { copyBytes } from './bytes'
-import type { IrohEndpoint, IrohEndpointAddress, IrohConnection } from './endpoint'
+import type { IrohConnection, IrohEndpoint, IrohEndpointAddress } from './endpoint'
+import { decodeGossipPeerDataAddrInfo, encodeGossipPeerDataAddrInfo } from './gossip/peer-data'
+import {
+  GossipProtocolState,
+  GossipTimerScheduler,
+  type GossipBroadcastScope,
+  type GossipProtocolCommand,
+  type GossipProtocolEmitEvent,
+  type GossipProtocolOutEvent,
+  type GossipProtocolSendMessage,
+} from './gossip/state'
 import {
   decodeGossipStreamHeader,
   decodeGossipTopicMessage,
   encodeGossipBroadcastMessage,
+  encodeGossipGraftMessage,
+  encodeGossipIHaveMessage,
+  encodeGossipPruneMessage,
+  encodeGossipSwarmDisconnectMessage,
+  encodeGossipSwarmForwardJoinMessage,
   encodeGossipSwarmJoinMessage,
+  encodeGossipSwarmNeighborMessage,
+  encodeGossipSwarmShuffleMessage,
+  encodeGossipSwarmShuffleReplyMessage,
   gossipAlpn,
   GossipFrameReader,
   GossipTopicStreamWriter,
   validateGossipTopicId,
-  type GossipBroadcastMessage,
   type GossipDeliveryScope,
   type GossipTopicMessage,
 } from './gossip/wire'
 
+export interface IrohGossipOptions {
+  readonly maxMessageSize?: number
+}
+
 export interface IrohGossipSubscribeOptions {
   readonly topicId: Uint8Array
+  readonly bootstrap?: readonly IrohEndpointAddress[]
 }
 
 export interface IrohGossipJoinPeerOptions {
@@ -27,12 +49,28 @@ export interface IrohGossipBroadcastOptions {
   readonly scope?: GossipDeliveryScope
 }
 
-export type IrohGossipEvent = IrohGossipJoinEvent | IrohGossipMessageEvent
+export type IrohGossipEvent =
+  | IrohGossipJoinEvent
+  | IrohGossipNeighborUpEvent
+  | IrohGossipNeighborDownEvent
+  | IrohGossipMessageEvent
 
 export interface IrohGossipJoinEvent {
   readonly type: 'join'
   readonly topicId: Uint8Array
   readonly peerData: Uint8Array | null
+}
+
+export interface IrohGossipNeighborUpEvent {
+  readonly type: 'neighbor-up'
+  readonly topicId: Uint8Array
+  readonly peer: Uint8Array
+}
+
+export interface IrohGossipNeighborDownEvent {
+  readonly type: 'neighbor-down'
+  readonly topicId: Uint8Array
+  readonly peer: Uint8Array
 }
 
 export interface IrohGossipMessageEvent {
@@ -44,34 +82,36 @@ export interface IrohGossipMessageEvent {
   readonly scope: GossipDeliveryScope
 }
 
-export function createGossip(endpoint: IrohEndpoint): IrohGossip {
-  return new IrohGossip(endpoint)
+export function createGossip(endpoint: IrohEndpoint, options: IrohGossipOptions = {}): IrohGossip {
+  return new IrohGossip(endpoint, options)
 }
 
 export class IrohGossip {
-  readonly #endpoint: IrohEndpoint
+  readonly #actor: GossipActor
 
-  constructor(endpoint: IrohEndpoint) {
-    this.#endpoint = endpoint
+  constructor(endpoint: IrohEndpoint, options: IrohGossipOptions = {}) {
+    this.#actor = new GossipActor(endpoint, options)
   }
 
   subscribe(options: IrohGossipSubscribeOptions): IrohGossipSubscription {
-    return new IrohGossipSubscription(this.#endpoint, options.topicId)
+    return this.#actor.subscribe(options)
+  }
+
+  close(): void {
+    this.#actor.close()
   }
 }
 
 export class IrohGossipSubscription {
-  readonly #endpoint: IrohEndpoint
+  readonly #actor: GossipActor
   readonly #topicId: Uint8Array
   readonly #events = new AsyncQueue<IrohGossipEvent>()
-  readonly #connections = new Set<IrohConnection>()
-  readonly #writers = new Map<IrohConnection, GossipTopicStreamWriter>()
-  readonly #seenMessageIds = new Set<string>()
-  #started = false
+  readonly #neighbors = new Map<string, Uint8Array>()
+  readonly #joinedResolvers: (() => void)[] = []
   #closed = false
 
-  constructor(endpoint: IrohEndpoint, topicId: Uint8Array) {
-    this.#endpoint = endpoint
+  constructor(actor: GossipActor, topicId: Uint8Array) {
+    this.#actor = actor
     this.#topicId = validateGossipTopicId(topicId)
   }
 
@@ -79,35 +119,47 @@ export class IrohGossipSubscription {
     return copyBytes(this.#topicId)
   }
 
-  start(): void {
-    if (this.#started) {
-      return
+  joined(): Promise<void> {
+    if (this.isJoined()) {
+      return Promise.resolve()
     }
-    this.#started = true
-    void this.acceptLoop()
+    return new Promise((resolve) => {
+      this.#joinedResolvers.push(resolve)
+    })
+  }
+
+  isJoined(): boolean {
+    return this.#neighbors.size !== 0
+  }
+
+  neighbors(): readonly Uint8Array[] {
+    return Array.from(this.#neighbors.values(), copyBytes)
   }
 
   events(): AsyncIterable<IrohGossipEvent> {
-    this.start()
     return this.#events
   }
 
   async joinPeer(options: IrohGossipJoinPeerOptions): Promise<void> {
     this.requireOpen()
-    const connection = await this.#endpoint.connect({
-      address: options.peer,
-      alpn: gossipAlpn,
-    })
-    this.addConnection(connection)
-    this.sendFrame(connection, encodeGossipSwarmJoinMessage())
+    await this.#actor.joinPeer(this.#topicId, options.peer)
+    await this.joined()
+  }
+
+  async joinPeers(peers: readonly IrohEndpointAddress[]): Promise<void> {
+    this.requireOpen()
+    await this.#actor.joinPeers(this.#topicId, peers)
+    await this.joined()
   }
 
   broadcast(options: IrohGossipBroadcastOptions): void {
     this.requireOpen()
-    const frame = encodeGossipBroadcastMessage(broadcastInput(options))
-    for (const connection of this.#connections) {
-      this.trySendFrame(connection, frame)
-    }
+    this.#actor.broadcast(this.#topicId, options.payload, protocolScope(options.scope))
+  }
+
+  broadcastNeighbors(options: { readonly payload: Uint8Array }): void {
+    this.requireOpen()
+    this.#actor.broadcast(this.#topicId, options.payload, 'neighbors')
   }
 
   close(): void {
@@ -115,40 +167,279 @@ export class IrohGossipSubscription {
       return
     }
     this.#closed = true
-    for (const writer of this.#writers.values()) {
-      finishWriter(writer)
-    }
-    this.#writers.clear()
-    this.#connections.clear()
+    this.#actor.unsubscribe(this.#topicId, this)
     this.#events.close()
+    this.#joinedResolvers.splice(0).forEach((resolve) => resolve())
+  }
+
+  push(event: IrohGossipEvent): void {
+    if (this.#closed) {
+      return
+    }
+    if (event.type === 'neighbor-up') {
+      this.#neighbors.set(bytesKey(event.peer), copyBytes(event.peer))
+      this.#joinedResolvers.splice(0).forEach((resolve) => resolve())
+    } else if (event.type === 'neighbor-down') {
+      this.#neighbors.delete(bytesKey(event.peer))
+    }
+    this.#events.push(event)
+  }
+
+  fail(error: unknown): void {
+    this.#events.fail(error)
+    this.#joinedResolvers.splice(0).forEach((resolve) => resolve())
+  }
+
+  private requireOpen(): void {
+    if (this.#closed) {
+      throw new Error('gossip subscription is closed')
+    }
+  }
+}
+
+class GossipActor {
+  readonly #endpoint: IrohEndpoint
+  readonly #state: GossipProtocolState
+  readonly #scheduler: GossipTimerScheduler
+  readonly #subscriptions = new Map<string, Set<IrohGossipSubscription>>()
+  readonly #addressBook = new Map<string, IrohEndpointAddress>()
+  readonly #peers = new Map<string, PeerRuntime>()
+  #closed = false
+
+  constructor(endpoint: IrohEndpoint, options: IrohGossipOptions) {
+    this.#endpoint = endpoint
+    const stateOptions = {
+      me: endpoint.endpointId,
+      peerData: encodeGossipPeerDataAddrInfo({ relayUrl: endpoint.relayUrl }),
+    }
+    this.#state = new GossipProtocolState(
+      options.maxMessageSize === undefined
+        ? stateOptions
+        : { ...stateOptions, maxMessageSize: options.maxMessageSize },
+    )
+    this.#scheduler = new GossipTimerScheduler({
+      onTimer: (timer, nowMs) => {
+        this.processOut(this.#state.handle({ type: 'timer-expired', timer }, nowMs))
+      },
+    })
+    void this.acceptLoop()
+  }
+
+  subscribe(options: IrohGossipSubscribeOptions): IrohGossipSubscription {
+    const topicId = validateGossipTopicId(options.topicId)
+    const subscription = new IrohGossipSubscription(this, topicId)
+    const key = bytesKey(topicId)
+    let subscriptions = this.#subscriptions.get(key)
+    if (subscriptions === undefined) {
+      subscriptions = new Set()
+      this.#subscriptions.set(key, subscriptions)
+    }
+    subscriptions.add(subscription)
+    void this.joinPeers(topicId, options.bootstrap ?? [])
+    return subscription
+  }
+
+  unsubscribe(topicId: Uint8Array, subscription: IrohGossipSubscription): void {
+    const key = bytesKey(topicId)
+    const subscriptions = this.#subscriptions.get(key)
+    if (subscriptions === undefined) {
+      return
+    }
+    subscriptions.delete(subscription)
+    if (subscriptions.size !== 0) {
+      return
+    }
+    this.#subscriptions.delete(key)
+    this.processOut(
+      this.#state.handle({
+        type: 'command',
+        topicId,
+        command: { type: 'quit' },
+      }),
+    )
+  }
+
+  async joinPeer(topicId: Uint8Array, peer: IrohEndpointAddress): Promise<void> {
+    await this.joinPeers(topicId, [peer])
+  }
+
+  async joinPeers(topicId: Uint8Array, peers: readonly IrohEndpointAddress[]): Promise<void> {
+    for (const peer of peers) {
+      this.rememberAddress(peer)
+    }
+    const command: GossipProtocolCommand =
+      peers.length === 0
+        ? { type: 'join', peers: [] }
+        : { type: 'join', peers: peers.map((peer) => peer.endpointId) }
+    this.processOut(
+      this.#state.handle({
+        type: 'command',
+        topicId,
+        command,
+      }),
+    )
+    await Promise.all(peers.map((peer) => this.peerReady(peer.endpointId)))
+  }
+
+  broadcast(topicId: Uint8Array, payload: Uint8Array, scope?: GossipBroadcastScope): void {
+    const command: GossipProtocolCommand =
+      scope === undefined ? { type: 'broadcast', payload } : { type: 'broadcast', payload, scope }
+    this.processOut(
+      this.#state.handle({
+        type: 'command',
+        topicId,
+        command,
+      }),
+    )
+  }
+
+  close(): void {
+    if (this.#closed) {
+      return
+    }
+    this.#closed = true
+    this.#scheduler.close()
+    for (const runtime of this.#peers.values()) {
+      closeRuntime(runtime)
+    }
+    this.#peers.clear()
+    for (const subscriptions of this.#subscriptions.values()) {
+      for (const subscription of subscriptions) {
+        subscription.close()
+      }
+    }
+    this.#subscriptions.clear()
   }
 
   private async acceptLoop(): Promise<void> {
     try {
       while (!this.#closed) {
-        const connection = await this.#endpoint.accept({ alpn: gossipAlpn })
-        this.addConnection(connection)
+        this.activateConnection(await this.#endpoint.accept({ alpn: gossipAlpn }), 'inbound')
       }
     } catch (error) {
       if (!this.#closed) {
-        this.#events.fail(error)
+        this.failAll(error)
       }
     }
   }
 
-  private async readIncoming(connection: IrohConnection): Promise<void> {
-    while (!this.#closed) {
+  private processOut(events: readonly GossipProtocolOutEvent[]): void {
+    this.#scheduler.scheduleFrom(events)
+    for (const event of events) {
+      if (event.type === 'send-message') {
+        this.sendMessage(event)
+      } else if (event.type === 'emit-event') {
+        this.emitEvent(event)
+      } else if (event.type === 'disconnect-peer') {
+        this.disconnectPeer(event.peer)
+      } else if (event.type === 'peer-data') {
+        this.updatePeerData(event.peer, event.peerData)
+      }
+    }
+  }
+
+  private emitEvent(event: GossipProtocolEmitEvent): void {
+    const topicId = copyBytes(event.topicId)
+    if (event.event.type === 'neighbor-up') {
+      this.pushTopicEvent(topicId, {
+        type: 'neighbor-up',
+        topicId,
+        peer: copyBytes(event.event.peer),
+      })
+      this.pushTopicEvent(topicId, { type: 'join', topicId, peerData: null })
+    } else if (event.event.type === 'neighbor-down') {
+      this.pushTopicEvent(topicId, {
+        type: 'neighbor-down',
+        topicId,
+        peer: copyBytes(event.event.peer),
+      })
+    } else {
+      this.pushTopicEvent(topicId, {
+        type: 'message',
+        topicId,
+        deliveredFrom: copyBytes(event.event.deliveredFrom),
+        id: copyBytes(event.event.id),
+        payload: copyBytes(event.event.payload),
+        scope: event.event.scope,
+      })
+    }
+  }
+
+  private pushTopicEvent(topicId: Uint8Array, event: IrohGossipEvent): void {
+    const subscriptions = this.#subscriptions.get(bytesKey(topicId))
+    if (subscriptions === undefined) {
+      return
+    }
+    for (const subscription of subscriptions) {
+      subscription.push(event)
+    }
+  }
+
+  private sendMessage(event: GossipProtocolSendMessage): void {
+    const runtime = this.requirePeer(event.peer)
+    runtime.queue.push(event)
+    if (runtime.connection !== undefined) {
+      this.flushRuntime(runtime)
+      return
+    }
+    this.dial(runtime)
+  }
+
+  private dial(runtime: PeerRuntime): void {
+    if (runtime.dialing !== null) {
+      return
+    }
+    const address = this.#addressBook.get(bytesKey(runtime.peer))
+    if (address === undefined) {
+      return
+    }
+    runtime.dialing = this.#endpoint
+      .connect({ address, alpn: gossipAlpn })
+      .then((connection) => {
+        runtime.dialing = null
+        this.activateConnection(connection, 'outbound')
+        this.flushRuntime(runtime)
+      })
+      .catch(() => {
+        runtime.dialing = null
+        this.processOut(this.#state.handle({ type: 'peer-disconnected', peer: runtime.peer }))
+      })
+  }
+
+  private activateConnection(connection: IrohConnection, direction: PeerConnectionDirection): void {
+    const runtime = this.requirePeer(connection.peerEndpointId)
+    if (runtime.connection !== undefined && runtime.connection !== connection) {
+      const preferred = this.preferredDirection(runtime.peer)
+      if (runtime.direction === preferred) {
+        closeConnection(connection)
+        return
+      }
+      if (direction !== preferred) {
+        closeConnection(connection)
+        return
+      }
+      closeRuntime(runtime)
+    }
+    runtime.connection = connection
+    runtime.direction = direction
+    void this.readIncoming(runtime, connection)
+    this.flushRuntime(runtime)
+  }
+
+  private async readIncoming(runtime: PeerRuntime, connection: IrohConnection): Promise<void> {
+    while (!this.#closed && runtime.connection === connection) {
       try {
         const stream = await connection.acceptUniStream()
-        void this.readIncomingStream(connection, stream)
+        void this.readIncomingStream(runtime, connection, stream)
       } catch {
-        this.removeConnection(connection)
+        this.peerDisconnected(runtime, connection)
         return
       }
     }
   }
 
   private async readIncomingStream(
+    runtime: PeerRuntime,
     connection: IrohConnection,
     stream: {
       read(): Promise<{ readonly data: Uint8Array; readonly complete: boolean }>
@@ -161,118 +452,145 @@ export class IrohGossipSubscription {
         return
       }
       const header = decodeGossipStreamHeader(headerPayload)
-      if (!equalBytes(header.topicId, this.#topicId)) {
-        return
-      }
-      while (!this.#closed) {
+      while (!this.#closed && runtime.connection === connection) {
         const payload = await reader.readFrame()
         if (payload === null) {
           return
         }
-        this.pushTopicEvent(connection, header.topicId, decodeGossipTopicMessage(payload))
+        this.processOut(
+          this.#state.handle({
+            type: 'recv-message',
+            peer: runtime.peer,
+            topicId: header.topicId,
+            message: decodeGossipTopicMessage(payload),
+          }),
+        )
       }
     } catch {
-      this.removeConnection(connection)
+      this.peerDisconnected(runtime, connection)
     }
   }
 
-  private addConnection(connection: IrohConnection): void {
-    if (this.#connections.has(connection)) {
+  private flushRuntime(runtime: PeerRuntime): void {
+    const connection = runtime.connection
+    if (connection === undefined) {
       return
     }
-    this.#connections.add(connection)
-    void this.readIncoming(connection)
-  }
-
-  private removeConnection(connection: IrohConnection): void {
-    this.#connections.delete(connection)
-    const writer = this.#writers.get(connection)
-    this.#writers.delete(connection)
-    if (writer !== undefined) {
-      finishWriter(writer)
+    while (runtime.queue.length !== 0) {
+      const event = runtime.queue.shift()
+      if (event === undefined) {
+        return
+      }
+      try {
+        this.writer(runtime, connection, event.topicId).writeFrame(
+          encodeTopicMessage(event.message),
+        )
+      } catch {
+        this.peerDisconnected(runtime, connection)
+        return
+      }
     }
   }
 
-  private pushTopicEvent(
+  private writer(
+    runtime: PeerRuntime,
     connection: IrohConnection,
     topicId: Uint8Array,
-    message: GossipTopicMessage,
-  ): void {
-    if (!equalBytes(topicId, this.#topicId)) {
-      return
-    }
-    if (message.type === 'join') {
-      this.#events.push({
-        type: 'join',
-        topicId: copyBytes(topicId),
-        peerData: message.peerData === null ? null : copyBytes(message.peerData),
-      })
-      return
-    }
-    if (message.type !== 'gossip') {
-      return
-    }
-    const messageKey = bytesKey(message.id)
-    if (this.#seenMessageIds.has(messageKey)) {
-      return
-    }
-    this.#seenMessageIds.add(messageKey)
-    this.#events.push({
-      type: 'message',
-      topicId: copyBytes(topicId),
-      deliveredFrom: connection.peerEndpointId,
-      id: copyBytes(message.id),
-      payload: copyBytes(message.content),
-      scope: message.scope,
-    })
-    this.forwardBroadcast(connection, message)
-  }
-
-  private sendFrame(connection: IrohConnection, frame: Uint8Array): void {
-    this.requireWriter(connection).writeFrame(frame)
-  }
-
-  private trySendFrame(connection: IrohConnection, frame: Uint8Array): void {
-    try {
-      this.sendFrame(connection, frame)
-    } catch {
-      this.removeConnection(connection)
-    }
-  }
-
-  private forwardBroadcast(source: IrohConnection, message: GossipBroadcastMessage): void {
-    if (message.scope.type !== 'swarm') {
-      return
-    }
-    const scope: GossipDeliveryScope = {
-      type: 'swarm',
-      round: message.scope.round + 1,
-    }
-    const frame = encodeGossipBroadcastMessage({ content: message.content, scope })
-    for (const connection of this.#connections) {
-      if (connection === source) {
-        continue
-      }
-      this.trySendFrame(connection, frame)
-    }
-  }
-
-  private requireWriter(connection: IrohConnection): GossipTopicStreamWriter {
-    const writer = this.#writers.get(connection)
+  ): GossipTopicStreamWriter {
+    const key = bytesKey(topicId)
+    const writer = runtime.writers.get(key)
     if (writer !== undefined) {
       return writer
     }
-    const nextWriter = new GossipTopicStreamWriter(connection.openUniStream(), this.#topicId)
-    this.#writers.set(connection, nextWriter)
+    const nextWriter = new GossipTopicStreamWriter(connection.openUniStream(), topicId)
+    runtime.writers.set(key, nextWriter)
     return nextWriter
   }
 
-  private requireOpen(): void {
-    if (this.#closed) {
-      throw new Error('gossip subscription is closed')
+  private peerDisconnected(runtime: PeerRuntime, connection: IrohConnection): void {
+    if (runtime.connection !== connection) {
+      return
+    }
+    closeRuntime(runtime)
+    delete runtime.connection
+    delete runtime.direction
+    this.processOut(this.#state.handle({ type: 'peer-disconnected', peer: runtime.peer }))
+  }
+
+  private disconnectPeer(peer: Uint8Array): void {
+    const key = bytesKey(peer)
+    const runtime = this.#peers.get(key)
+    if (runtime === undefined) {
+      return
+    }
+    closeRuntime(runtime)
+    this.#peers.delete(key)
+  }
+
+  private updatePeerData(peer: Uint8Array, peerData: Uint8Array): void {
+    const decoded = decodeGossipPeerDataAddrInfo(peerData)
+    if (decoded.relayUrl === null) {
+      return
+    }
+    this.rememberAddress({ endpointId: peer, relayUrl: decoded.relayUrl })
+  }
+
+  private rememberAddress(address: IrohEndpointAddress): void {
+    this.#addressBook.set(bytesKey(address.endpointId), {
+      endpointId: copyBytes(address.endpointId),
+      relayUrl: new URL(address.relayUrl),
+    })
+  }
+
+  private requirePeer(peer: Uint8Array): PeerRuntime {
+    const key = bytesKey(peer)
+    const runtime = this.#peers.get(key)
+    if (runtime !== undefined) {
+      return runtime
+    }
+    const nextRuntime: PeerRuntime = {
+      peer: copyBytes(peer),
+      queue: [],
+      writers: new Map(),
+      dialing: null,
+    }
+    this.#peers.set(key, nextRuntime)
+    return nextRuntime
+  }
+
+  private preferredDirection(peer: Uint8Array): PeerConnectionDirection {
+    return bytesKey(this.#endpoint.endpointId) < bytesKey(peer) ? 'outbound' : 'inbound'
+  }
+
+  private async peerReady(peer: Uint8Array): Promise<void> {
+    const runtime = this.requirePeer(peer)
+    if (runtime.connection !== undefined) {
+      return
+    }
+    if (runtime.dialing !== null) {
+      await runtime.dialing
+    }
+  }
+
+  private failAll(error: unknown): void {
+    for (const subscriptions of this.#subscriptions.values()) {
+      for (const subscription of subscriptions) {
+        subscription.fail(error)
+      }
     }
   }
 }
+
+interface PeerRuntime {
+  readonly peer: Uint8Array
+  readonly queue: GossipProtocolSendMessage[]
+  readonly writers: Map<string, GossipTopicStreamWriter>
+  connection?: IrohConnection
+  direction?: PeerConnectionDirection
+  dialing: Promise<void> | null
+}
+
+type PeerConnectionDirection = 'inbound' | 'outbound'
 
 class AsyncQueue<T> implements AsyncIterable<T>, AsyncIterator<T> {
   readonly #values: T[] = []
@@ -347,25 +665,61 @@ interface PendingRead<T> {
   reject(error: unknown): void
 }
 
-function broadcastInput(options: IrohGossipBroadcastOptions): {
-  readonly content: Uint8Array
-  readonly scope?: GossipDeliveryScope
-} {
-  if (options.scope === undefined) {
-    return { content: options.payload }
+function protocolScope(scope: GossipDeliveryScope | undefined): GossipBroadcastScope | undefined {
+  if (scope === undefined) {
+    return undefined
   }
-  return { content: options.payload, scope: options.scope }
+  return scope.type === 'neighbors' ? 'neighbors' : 'swarm'
 }
 
-function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
-  if (left.length !== right.length) {
-    return false
+function encodeTopicMessage(message: GossipTopicMessage): Uint8Array {
+  if (message.layer === 'swarm') {
+    if (message.type === 'join') {
+      return encodeGossipSwarmJoinMessage(message.peerData)
+    }
+    if (message.type === 'forward-join') {
+      return encodeGossipSwarmForwardJoinMessage(message)
+    }
+    if (message.type === 'shuffle') {
+      return encodeGossipSwarmShuffleMessage(message)
+    }
+    if (message.type === 'shuffle-reply') {
+      return encodeGossipSwarmShuffleReplyMessage(message)
+    }
+    if (message.type === 'neighbor') {
+      return encodeGossipSwarmNeighborMessage(message)
+    }
+    return encodeGossipSwarmDisconnectMessage(message)
   }
-  let diff = 0
-  for (let index = 0; index < left.length; index += 1) {
-    diff |= (left[index] ?? 0) ^ (right[index] ?? 0)
+  if (message.type === 'gossip') {
+    return encodeGossipBroadcastMessage({ content: message.content, scope: message.scope })
   }
-  return diff === 0
+  if (message.type === 'prune') {
+    return encodeGossipPruneMessage()
+  }
+  if (message.type === 'graft') {
+    return encodeGossipGraftMessage(message)
+  }
+  return encodeGossipIHaveMessage(message)
+}
+
+function closeRuntime(runtime: PeerRuntime): void {
+  for (const writer of runtime.writers.values()) {
+    finishWriter(writer)
+  }
+  runtime.writers.clear()
+  const connection = runtime.connection
+  if (connection !== undefined) {
+    closeConnection(connection)
+  }
+}
+
+function closeConnection(connection: IrohConnection): void {
+  try {
+    connection.close()
+  } catch {
+    // Transport may already be closed by the opposite side.
+  }
 }
 
 function bytesKey(bytes: Uint8Array): string {

@@ -35,7 +35,7 @@ describe('public gossip API', () => {
         deliveredFrom: sender.endpointId,
         id: expect.any(Uint8Array),
         payload,
-        scope: { type: 'swarm', round: 0 },
+        scope: { type: 'swarm', round: 1 },
       })
     } finally {
       senderTopic.close()
@@ -70,7 +70,7 @@ describe('public gossip API', () => {
         deliveredFrom: right.endpointId,
         id: expect.any(Uint8Array),
         payload: replyPayload,
-        scope: { type: 'swarm', round: 0 },
+        scope: { type: 'swarm', round: 1 },
       })
       expect(await withTimeout(rightEvent, 'right gossip message', 5_000)).toEqual({
         type: 'message',
@@ -78,7 +78,7 @@ describe('public gossip API', () => {
         deliveredFrom: left.endpointId,
         id: expect.any(Uint8Array),
         payload,
-        scope: { type: 'swarm', round: 0 },
+        scope: { type: 'swarm', round: 1 },
       })
     } finally {
       leftTopic.close()
@@ -134,7 +134,7 @@ describe('public gossip API', () => {
         deliveredFrom: middle.endpointId,
         id: expect.any(Uint8Array),
         payload,
-        scope: { type: 'swarm', round: 1 },
+        scope: { type: 'swarm', round: 2 },
       })
     } finally {
       leftTopic.close()

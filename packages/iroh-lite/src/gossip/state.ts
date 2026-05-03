@@ -8,6 +8,7 @@ import {
   type GossipIHaveEntry,
   type GossipPeerInfo,
   type GossipTopicMessage,
+  encodeGossipIHaveMessage,
 } from './wire'
 
 const lazyDispatchDelayMs = 5
@@ -22,7 +23,6 @@ const passiveRandomWalkLength = 3
 const pendingNeighborTimeoutMs = 500
 const defaultMaxMessageSize = 4096
 const minMaxMessageSize = 512
-const ihaveEntryMaxEncodedSize = 35
 
 export interface GossipProtocolStateOptions {
   readonly me: Uint8Array
@@ -30,6 +30,11 @@ export interface GossipProtocolStateOptions {
   readonly maxMessageSize?: number
   readonly activeViewCapacity?: number
   readonly passiveViewCapacity?: number
+  readonly random?: GossipRandomSource
+}
+
+export interface GossipRandomSource {
+  nextUint32(): number
 }
 
 export type GossipProtocolInEvent =
@@ -131,6 +136,67 @@ export interface GossipProtocolPeerData {
   readonly peerData: Uint8Array
 }
 
+export interface GossipTimerSchedulerOptions {
+  readonly onTimer: (timer: GossipProtocolTimer, nowMs: number) => void
+  readonly now?: () => number
+  readonly setTimeout?: GossipSetTimeout
+  readonly clearTimeout?: GossipClearTimeout
+}
+
+export type GossipTimerHandle = number | ReturnType<typeof globalThis.setTimeout>
+export type GossipSetTimeout = (callback: () => void, delayMs: number) => GossipTimerHandle
+export type GossipClearTimeout = (handle: GossipTimerHandle) => void
+
+export class GossipTimerScheduler {
+  readonly #onTimer: (timer: GossipProtocolTimer, nowMs: number) => void
+  readonly #now: () => number
+  readonly #setTimeout: GossipSetTimeout
+  readonly #clearTimeout: GossipClearTimeout
+  readonly #timers = new Set<GossipTimerHandle>()
+  #closed = false
+
+  constructor(options: GossipTimerSchedulerOptions) {
+    this.#onTimer = options.onTimer
+    this.#now = options.now ?? monotonicNowMs
+    this.#setTimeout = options.setTimeout ?? defaultSetTimeout
+    this.#clearTimeout = options.clearTimeout ?? defaultClearTimeout
+  }
+
+  schedule(event: GossipProtocolScheduleTimer): void {
+    if (this.#closed) {
+      return
+    }
+    const timer = copyProtocolTimer(event.timer)
+    let handle: GossipTimerHandle
+    handle = this.#setTimeout(() => {
+      this.#timers.delete(handle)
+      if (!this.#closed) {
+        this.#onTimer(timer, this.#now())
+      }
+    }, event.delayMs)
+    this.#timers.add(handle)
+  }
+
+  scheduleFrom(events: readonly GossipProtocolOutEvent[]): void {
+    for (const event of events) {
+      if (event.type === 'schedule-timer') {
+        this.schedule(event)
+      }
+    }
+  }
+
+  close(): void {
+    if (this.#closed) {
+      return
+    }
+    this.#closed = true
+    for (const timer of this.#timers) {
+      this.#clearTimeout(timer)
+    }
+    this.#timers.clear()
+  }
+}
+
 type TopicOutEvent =
   | Omit<GossipProtocolSendMessage, 'topicId'>
   | Omit<GossipProtocolEmitEvent, 'topicId'>
@@ -143,6 +209,7 @@ export class GossipProtocolState {
   readonly #maxMessageSize: number
   readonly #activeViewCapacity: number
   readonly #passiveViewCapacity: number
+  readonly #random: GossipRandomSource
   #peerData: Uint8Array | null
   readonly #topics = new Map<string, GossipTopicProtocolState>()
   readonly #peerTopics = new Map<string, PeerTopicMembership>()
@@ -158,6 +225,7 @@ export class GossipProtocolState {
       options.passiveViewCapacity ?? passiveViewCapacity,
       'passive',
     )
+    this.#random = options.random ?? cryptoRandomSource
     this.#peerData = copyOptionalBytes(options.peerData ?? new Uint8Array())
   }
 
@@ -253,6 +321,7 @@ export class GossipProtocolState {
       me: this.#me,
       passiveViewCapacity: this.#passiveViewCapacity,
       peerData: this.#peerData,
+      random: this.#random,
       topicId,
     })
     this.#topics.set(key, nextTopic)
@@ -371,6 +440,7 @@ class GossipTopicProtocolState {
   readonly #activeViewCapacity: number
   readonly #maxMessageSize: number
   readonly #passiveViewCapacity: number
+  readonly #random: GossipRandomSource
   readonly #topicId: Uint8Array
   #peerData: Uint8Array | null
   readonly #neighbors = new Map<string, Uint8Array>()
@@ -393,6 +463,7 @@ class GossipTopicProtocolState {
     readonly me: Uint8Array
     readonly passiveViewCapacity: number
     readonly peerData: Uint8Array | null
+    readonly random: GossipRandomSource
     readonly topicId: Uint8Array
   }) {
     this.#activeViewCapacity = validateViewCapacity(options.activeViewCapacity, 'active')
@@ -400,6 +471,7 @@ class GossipTopicProtocolState {
     this.#me = validatePeerId(options.me)
     this.#passiveViewCapacity = validateViewCapacity(options.passiveViewCapacity, 'passive')
     this.#peerData = copyOptionalBytes(options.peerData)
+    this.#random = options.random
     this.#topicId = validateGossipTopicId(options.topicId)
   }
 
@@ -619,7 +691,7 @@ class GossipTopicProtocolState {
       ]
     }
     if (this.#neighbors.size >= this.#activeViewCapacity) {
-      const evicted = firstMapValue(this.#neighbors)
+      const evicted = randomMapValue(this.#neighbors, this.#random)
       if (evicted !== undefined) {
         out.push(...this.removeActive(evicted, { keepPassive: true, sendDisconnect: true }))
       }
@@ -735,9 +807,9 @@ class GossipTopicProtocolState {
       return out
     }
     if (this.#passivePeers.size >= this.#passiveViewCapacity) {
-      const evictedKey = this.#passivePeers.keys().next().value
-      if (typeof evictedKey === 'string') {
-        this.#passivePeers.delete(evictedKey)
+      const evicted = randomMapEntry(this.#passivePeers, this.#random)
+      if (evicted !== undefined) {
+        this.#passivePeers.delete(evicted.key)
       }
     }
     this.#passivePeers.set(key, copyBytes(peer))
@@ -847,44 +919,27 @@ class GossipTopicProtocolState {
 
   private pickActiveExcept(peers: readonly Uint8Array[]): Uint8Array | undefined {
     const excluded = new Set(peers.map(peerKey))
-    for (const [key, peer] of this.#neighbors) {
-      if (!excluded.has(key)) {
-        return copyBytes(peer)
-      }
-    }
-    return undefined
+    const candidates = Array.from(this.#neighbors, ([key, peer]) => ({ key, peer })).filter(
+      (candidate) => !excluded.has(candidate.key),
+    )
+    const selected = randomArrayValue(candidates, this.#random)
+    return selected === undefined ? undefined : copyBytes(selected.peer)
   }
 
   private firstPassiveWithoutPending(): Uint8Array | undefined {
-    for (const [key, peer] of this.#passivePeers) {
-      if (!this.#pendingNeighborRequests.has(key)) {
-        return copyBytes(peer)
-      }
-    }
-    return undefined
+    const candidates = Array.from(this.#passivePeers, ([key, peer]) => ({ key, peer })).filter(
+      (candidate) => !this.#pendingNeighborRequests.has(candidate.key),
+    )
+    const selected = randomArrayValue(candidates, this.#random)
+    return selected === undefined ? undefined : copyBytes(selected.peer)
   }
 
   private peerSample(count: number): readonly GossipPeerInfo[] {
-    const out: GossipPeerInfo[] = []
-    for (const peer of this.#passivePeers.values()) {
-      out.push({
-        id: copyBytes(peer),
-        peerData: copyOptionalBytes(this.#peerDataByPeer.get(peerKey(peer)) ?? null),
-      })
-      if (out.length >= count) {
-        return out
-      }
-    }
-    for (const peer of this.#neighbors.values()) {
-      out.push({
-        id: copyBytes(peer),
-        peerData: copyOptionalBytes(this.#peerDataByPeer.get(peerKey(peer)) ?? null),
-      })
-      if (out.length >= count) {
-        return out
-      }
-    }
-    return out
+    const peers = [...this.#passivePeers.values(), ...this.#neighbors.values()]
+    return randomSample(peers, count, this.#random).map((peer) => ({
+      id: copyBytes(peer),
+      peerData: copyOptionalBytes(this.#peerDataByPeer.get(peerKey(peer)) ?? null),
+    }))
   }
 
   private addPeerData(peer: GossipPeerInfo): readonly TopicOutEvent[] {
@@ -1089,13 +1144,19 @@ class GossipTopicProtocolState {
   private chunkIHaveMessages(
     messages: readonly GossipIHaveEntry[],
   ): readonly (readonly GossipIHaveEntry[])[] {
-    const chunkLength = Math.max(
-      1,
-      Math.floor((this.#maxMessageSize - 3) / ihaveEntryMaxEncodedSize),
-    )
     const chunks: GossipIHaveEntry[][] = []
-    for (let offset = 0; offset < messages.length; offset += chunkLength) {
-      chunks.push(messages.slice(offset, offset + chunkLength).map(copyIHaveEntry))
+    let chunk: GossipIHaveEntry[] = []
+    for (const message of messages) {
+      const nextChunk = [...chunk, copyIHaveEntry(message)]
+      if (chunk.length !== 0 && ihavePayloadSize(nextChunk) > this.#maxMessageSize) {
+        chunks.push(chunk)
+        chunk = [copyIHaveEntry(message)]
+      } else {
+        chunk = nextChunk
+      }
+    }
+    if (chunk.length !== 0) {
+      chunks.push(chunk)
     }
     return chunks
   }
@@ -1211,6 +1272,26 @@ function copyTopicMessage(message: GossipTopicMessage): GossipTopicMessage {
   return { ...message }
 }
 
+function copyProtocolTimer(timer: GossipProtocolTimer): GossipProtocolTimer {
+  return {
+    topicId: copyBytes(timer.topicId),
+    value: copyTimerValue(timer.value),
+  }
+}
+
+function copyTimerValue(timer: unknown): unknown {
+  if (isTopicTimer(timer)) {
+    if (timer.type === 'pending-neighbor') {
+      return { type: 'pending-neighbor', peer: copyBytes(timer.peer) }
+    }
+    if (timer.type === 'send-graft') {
+      return { type: 'send-graft', id: copyBytes(timer.id) }
+    }
+    return { type: 'dispatch-lazy-push' }
+  }
+  return timer
+}
+
 function copyGossipBroadcastMessage(message: GossipBroadcastMessage): GossipBroadcastMessage {
   return {
     ...message,
@@ -1232,6 +1313,10 @@ function copyIHaveEntry(message: GossipIHaveEntry): GossipIHaveEntry {
     id: copyBytes(message.id),
     round: message.round,
   }
+}
+
+function ihavePayloadSize(messages: readonly GossipIHaveEntry[]): number {
+  return encodeGossipIHaveMessage({ messages }).length - 4
 }
 
 function copyTopicEvent(event: GossipProtocolTopicEvent): GossipProtocolTopicEvent {
@@ -1270,11 +1355,55 @@ function topicKey(topicId: Uint8Array): string {
   return bytesKey(validateGossipTopicId(topicId))
 }
 
-function firstMapValue<T>(map: ReadonlyMap<string, T>): T | undefined {
-  for (const value of map.values()) {
-    return value
+function randomMapValue<T>(map: ReadonlyMap<string, T>, random: GossipRandomSource): T | undefined {
+  return randomMapEntry(map, random)?.value
+}
+
+function randomMapEntry<T>(
+  map: ReadonlyMap<string, T>,
+  random: GossipRandomSource,
+): { readonly key: string; readonly value: T } | undefined {
+  return randomArrayValue(
+    Array.from(map, ([key, value]) => ({ key, value })),
+    random,
+  )
+}
+
+function randomArrayValue<T>(values: readonly T[], random: GossipRandomSource): T | undefined {
+  if (values.length === 0) {
+    return undefined
   }
-  return undefined
+  return values[randomInt(values.length, random)]
+}
+
+function randomSample<T>(
+  values: readonly T[],
+  count: number,
+  random: GossipRandomSource,
+): readonly T[] {
+  const remaining = values.slice()
+  const out: T[] = []
+  while (out.length < count && remaining.length > 0) {
+    const index = randomInt(remaining.length, random)
+    const [value] = remaining.splice(index, 1)
+    if (value !== undefined) {
+      out.push(value)
+    }
+  }
+  return out
+}
+
+function randomInt(maxExclusive: number, random: GossipRandomSource): number {
+  if (!Number.isInteger(maxExclusive) || maxExclusive < 1) {
+    throw new RangeError('random max must be positive')
+  }
+  const range = 0x1_0000_0000
+  const limit = Math.floor(range / maxExclusive) * maxExclusive
+  let value = random.nextUint32() >>> 0
+  while (value >= limit) {
+    value = random.nextUint32() >>> 0
+  }
+  return value % maxExclusive
 }
 
 function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
@@ -1290,4 +1419,17 @@ function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
 
 function monotonicNowMs(): number {
   return performance.now()
+}
+
+const defaultSetTimeout: GossipSetTimeout = (callback, delayMs) =>
+  globalThis.setTimeout(callback, delayMs)
+
+const defaultClearTimeout: GossipClearTimeout = (handle) => globalThis.clearTimeout(handle)
+
+const cryptoRandomSource: GossipRandomSource = {
+  nextUint32(): number {
+    const buffer = new Uint32Array(1)
+    globalThis.crypto.getRandomValues(buffer)
+    return buffer[0] ?? 0
+  },
 }
