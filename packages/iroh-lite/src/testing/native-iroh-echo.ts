@@ -36,6 +36,13 @@ export interface NativeIrohGossipClientSendOptions {
   readonly payload: Uint8Array
 }
 
+export interface NativeIrohGossipClientRecvOptions {
+  readonly relayUrl: string
+  readonly serverEndpointId: Uint8Array
+  readonly topicId: Uint8Array
+  readonly expectedPayload?: Uint8Array
+}
+
 export interface NativeIrohGossipClientSendResult {
   readonly endpointId: Uint8Array
   readonly endpointIdHex: string
@@ -43,7 +50,23 @@ export interface NativeIrohGossipClientSendResult {
   readonly payload: Uint8Array
 }
 
+export interface NativeIrohGossipClientRecvResult {
+  readonly endpointId: Uint8Array
+  readonly endpointIdHex: string
+  readonly topicId: Uint8Array
+  readonly deliveredFrom: Uint8Array
+  readonly payload: Uint8Array
+}
+
 export interface NativeIrohGossipClientSender extends NativeIrohGossipClientSendResult {
+  stop(): Promise<void>
+}
+
+export interface NativeIrohGossipClientReceiver {
+  readonly endpointId: Uint8Array
+  readonly endpointIdHex: string
+  readonly topicId: Uint8Array
+  received(): Promise<NativeIrohGossipClientRecvResult>
   stop(): Promise<void>
 }
 
@@ -51,6 +74,7 @@ export interface NativeIrohGossipServer {
   readonly endpointId: Uint8Array
   readonly endpointIdHex: string
   readonly topicId: Uint8Array
+  broadcast(payload: Uint8Array): Promise<void>
   nextEvent(): Promise<NativeIrohGossipEvent>
   stop(): Promise<void>
 }
@@ -265,6 +289,48 @@ export async function startNativeIrohGossipClientSender(
   }
 }
 
+export async function startNativeIrohGossipClientReceiver(
+  options: NativeIrohGossipClientRecvOptions,
+): Promise<NativeIrohGossipClientReceiver> {
+  const proc = Bun.spawn(nativeIrohEchoCommand('gossip-client-recv'), {
+    env: {
+      ...Bun.env,
+      CARGO_TARGET_DIR: Bun.env.IROH_NATIVE_ECHO_TARGET_DIR ?? nativeIrohEchoTargetDir(),
+      IROH_RELAY_URL: options.relayUrl,
+      IROH_SERVER_ENDPOINT_ID_HEX: bytesToHex(options.serverEndpointId),
+      IROH_GOSSIP_TOPIC_ID_HEX: bytesToHex(options.topicId),
+      ...(options.expectedPayload === undefined
+        ? {}
+        : { IROH_GOSSIP_EXPECT_PAYLOAD_HEX: bytesToHex(options.expectedPayload) }),
+      RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
+    },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
+  const lines = new ProcessLineReader(proc.stdout.getReader())
+  const stderr = streamToText(proc.stderr)
+
+  async function stop(): Promise<void> {
+    await stopProcess(proc, 'native iroh gossip client receiver stop')
+  }
+
+  try {
+    const ready = await withTimeout(
+      readGossipClientRecvReady(lines, proc, stderr),
+      'native iroh gossip client receiver ready',
+      120_000,
+    )
+    return {
+      ...ready,
+      received: () => readGossipClientRecvResult(lines, proc, stderr),
+      stop,
+    }
+  } catch (error) {
+    await stop()
+    throw error
+  }
+}
+
 export async function startNativeIrohGossipServer(
   relayUrl: string,
   topicId: Uint8Array,
@@ -285,8 +351,10 @@ export async function startNativeIrohGossipServer(
         CARGO_TARGET_DIR: Bun.env.IROH_NATIVE_ECHO_TARGET_DIR ?? nativeIrohEchoTargetDir(),
         IROH_RELAY_URL: relayUrl,
         IROH_GOSSIP_TOPIC_ID_HEX: bytesToHex(topicId),
+        IROH_GOSSIP_STDIN_COMMANDS: '1',
         RUST_LOG: Bun.env.RUST_LOG ?? 'iroh=info,iroh_relay=info',
       },
+      stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
     },
@@ -306,6 +374,7 @@ export async function startNativeIrohGossipServer(
     )
     return {
       ...ready,
+      broadcast: (payload) => writeGossipServerBroadcast(proc, lines, stderr, payload),
       nextEvent: () => readGossipEvent(lines, proc, stderr),
       stop,
     }
@@ -386,6 +455,57 @@ async function readGossipClientSendResult(
     const result = parseGossipClientSendResultLine(line)
     if (result !== null) {
       return result
+    }
+  }
+}
+
+async function readGossipClientRecvReady(
+  lines: ProcessLineReader,
+  proc: ReturnType<typeof Bun.spawn>,
+  stderr: Promise<string>,
+): Promise<{
+  readonly endpointId: Uint8Array
+  readonly endpointIdHex: string
+  readonly topicId: Uint8Array
+}> {
+  while (true) {
+    const line = await lines.readLine(proc, stderr, 'native iroh gossip client receiver')
+    const ready = parseGossipClientRecvReadyLine(line)
+    if (ready !== null) {
+      return ready
+    }
+  }
+}
+
+async function readGossipClientRecvResult(
+  lines: ProcessLineReader,
+  proc: ReturnType<typeof Bun.spawn>,
+  stderr: Promise<string>,
+): Promise<NativeIrohGossipClientRecvResult> {
+  while (true) {
+    const line = await lines.readLine(proc, stderr, 'native iroh gossip client receiver')
+    const result = parseGossipClientRecvResultLine(line)
+    if (result !== null) {
+      return result
+    }
+  }
+}
+
+async function writeGossipServerBroadcast(
+  proc: ReturnType<typeof Bun.spawn>,
+  lines: ProcessLineReader,
+  stderr: Promise<string>,
+  payload: Uint8Array,
+): Promise<void> {
+  await writeProcessStdin(proc, `broadcast ${bytesToHex(payload)}\n`)
+  while (true) {
+    const line = await lines.readLine(proc, stderr, 'native iroh gossip server broadcast')
+    const broadcastPayload = parseGossipServerBroadcastLine(line)
+    if (broadcastPayload !== null) {
+      if (!bytesEqual(broadcastPayload, payload)) {
+        throw new Error('native iroh gossip server broadcasted unexpected payload')
+      }
+      return
     }
   }
 }
@@ -519,6 +639,15 @@ async function closeProcessStdin(proc: ReturnType<typeof Bun.spawn>): Promise<vo
   if (typeof stdin !== 'object' || stdin === null) {
     return
   }
+  if ('getWriter' in stdin && typeof stdin.getWriter === 'function') {
+    const writer = stdin.getWriter()
+    try {
+      await writer.close()
+    } finally {
+      writer.releaseLock()
+    }
+    return
+  }
   try {
     stdin.end()
   } catch {
@@ -526,6 +655,39 @@ async function closeProcessStdin(proc: ReturnType<typeof Bun.spawn>): Promise<vo
       proc.kill()
     }
   }
+}
+
+async function writeProcessStdin(proc: ReturnType<typeof Bun.spawn>, text: string): Promise<void> {
+  const stdin = proc.stdin
+  if (typeof stdin !== 'object' || stdin === null) {
+    throw new Error('native process stdin is not writable')
+  }
+  if ('getWriter' in stdin && typeof stdin.getWriter === 'function') {
+    const writer = stdin.getWriter()
+    try {
+      await writer.write(new TextEncoder().encode(text))
+    } finally {
+      writer.releaseLock()
+    }
+    return
+  }
+  if ('write' in stdin && typeof stdin.write === 'function') {
+    await Promise.resolve(stdin.write(text))
+    return
+  }
+  throw new Error('native process stdin is not writable')
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.length !== right.length) {
+    return false
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      return false
+    }
+  }
+  return true
 }
 
 function parseClientResult(output: string): NativeIrohEchoClientResult {
@@ -611,6 +773,68 @@ function parseGossipClientSendResultLine(line: string): NativeIrohGossipClientSe
     topicId: hexToBytes(topicIdHex),
     payload: hexToBytes(payloadHex),
   }
+}
+
+function parseGossipClientRecvReadyLine(line: string): {
+  readonly endpointId: Uint8Array
+  readonly endpointIdHex: string
+  readonly topicId: Uint8Array
+} | null {
+  const match =
+    /^IROH_NATIVE_GOSSIP_CLIENT_RECV_READY endpoint_id_hex=([0-9a-f]{64}) topic_id_hex=([0-9a-f]{64})$/.exec(
+      line,
+    )
+  if (match === null) {
+    return null
+  }
+  const [, endpointIdHex, topicIdHex] = match
+  if (endpointIdHex === undefined || topicIdHex === undefined) {
+    throw new Error(`native iroh gossip client recv printed invalid ready line: ${line}`)
+  }
+  return {
+    endpointId: hexToBytes(endpointIdHex),
+    endpointIdHex,
+    topicId: hexToBytes(topicIdHex),
+  }
+}
+
+function parseGossipClientRecvResultLine(line: string): NativeIrohGossipClientRecvResult | null {
+  const match =
+    /^IROH_NATIVE_GOSSIP_CLIENT_RECV_OK endpoint_id_hex=([0-9a-f]{64}) topic_id_hex=([0-9a-f]{64}) from_endpoint_id_hex=([0-9a-f]{64}) payload_hex=([0-9a-f]*)$/.exec(
+      line,
+    )
+  if (match === null) {
+    return null
+  }
+  const [, endpointIdHex, topicIdHex, deliveredFromHex, payloadHex] = match
+  if (
+    endpointIdHex === undefined ||
+    topicIdHex === undefined ||
+    deliveredFromHex === undefined ||
+    payloadHex === undefined ||
+    payloadHex.length % 2 !== 0
+  ) {
+    throw new Error(`native iroh gossip client recv printed invalid result: ${line}`)
+  }
+  return {
+    endpointId: hexToBytes(endpointIdHex),
+    endpointIdHex,
+    topicId: hexToBytes(topicIdHex),
+    deliveredFrom: hexToBytes(deliveredFromHex),
+    payload: hexToBytes(payloadHex),
+  }
+}
+
+function parseGossipServerBroadcastLine(line: string): Uint8Array | null {
+  const match = /^IROH_NATIVE_GOSSIP_SERVER_BROADCAST_OK payload_hex=([0-9a-f]*)$/.exec(line)
+  if (match === null) {
+    return null
+  }
+  const [, payloadHex] = match
+  if (payloadHex === undefined || payloadHex.length % 2 !== 0) {
+    throw new Error(`native iroh gossip server printed invalid broadcast result: ${line}`)
+  }
+  return hexToBytes(payloadHex)
 }
 
 function nativeIrohEchoManifestPath(): string {

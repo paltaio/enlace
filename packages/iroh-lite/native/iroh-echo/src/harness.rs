@@ -8,7 +8,7 @@ use iroh::{
 };
 use iroh_gossip::{ALPN as GOSSIP_ALPN, api::Event as GossipEvent, net::Gossip, proto::TopicId};
 use n0_future::StreamExt;
-use tokio::io::{self, AsyncReadExt};
+use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::time::{Duration, timeout};
 
 mod gossip_vectors;
@@ -90,7 +90,7 @@ async fn run_gossip_server() -> Result<()> {
         .accept(GOSSIP_ALPN, gossip.clone())
         .spawn();
     let topic = gossip.subscribe(topic_id, Vec::new()).await?;
-    let (_sender, receiver) = topic.split();
+    let (sender, receiver) = topic.split();
     tokio::spawn(print_gossip_events(receiver));
 
     println!(
@@ -98,6 +98,12 @@ async fn run_gossip_server() -> Result<()> {
         hex(router.endpoint().id().as_bytes()),
         hex(topic_id.as_bytes())
     );
+
+    if std::env::var("IROH_GOSSIP_STDIN_COMMANDS").as_deref() == Ok("1") {
+        read_gossip_server_commands(sender).await?;
+        router.shutdown().await?;
+        return Ok(());
+    }
 
     std::future::pending::<()>().await;
     Ok(())
@@ -138,6 +144,11 @@ async fn run_gossip_client_recv() -> Result<()> {
     let (router, gossip) =
         spawn_gossip_router(endpoint, Some(bootstrap_addr(bootstrap, relay_url)))?;
     let mut topic = gossip.subscribe_and_join(topic_id, vec![bootstrap]).await?;
+    println!(
+        "IROH_NATIVE_GOSSIP_CLIENT_RECV_READY endpoint_id_hex={} topic_id_hex={}",
+        hex(router.endpoint().id().as_bytes()),
+        hex(topic_id.as_bytes())
+    );
     let message = wait_for_gossip_payload(&mut topic, expected_gossip_payload()?).await?;
 
     println!(
@@ -257,6 +268,23 @@ fn print_gossip_event(prefix: &str, event: GossipEvent) {
 async fn verify_optional_gossip_payload(topic: &mut iroh_gossip::api::GossipTopic) -> Result<()> {
     if let Some(expected) = expected_gossip_payload()? {
         let _message = wait_for_gossip_payload(topic, Some(expected)).await?;
+    }
+    Ok(())
+}
+
+async fn read_gossip_server_commands(sender: iroh_gossip::api::GossipSender) -> Result<()> {
+    let mut lines = BufReader::new(io::stdin()).lines();
+    while let Some(line) = lines.next_line().await? {
+        let payload = match line.trim().split_once(' ') {
+            Some(("broadcast", payload_hex)) => parse_hex(payload_hex)?,
+            None if line.trim() == "broadcast" => gossip_payload()?,
+            _ => continue,
+        };
+        sender.broadcast(Bytes::from(payload.clone())).await?;
+        println!(
+            "IROH_NATIVE_GOSSIP_SERVER_BROADCAST_OK payload_hex={}",
+            hex(&payload)
+        );
     }
     Ok(())
 }

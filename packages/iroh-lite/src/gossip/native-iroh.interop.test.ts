@@ -4,8 +4,8 @@ import { createEndpoint, createGossip } from '@paltaio/iroh-lite'
 
 import { startLocalIrohRelay, withTimeout } from '../testing/local-iroh-relay'
 import {
-  runNativeIrohGossipClientSend,
   startNativeIrohGossipClientSender,
+  startNativeIrohGossipClientReceiver,
   startNativeIrohGossipServer,
   type NativeIrohGossipEvent,
 } from '../testing/native-iroh-echo'
@@ -102,10 +102,11 @@ describe('native iroh gossip interop', () => {
       const subscription = gossip.subscribe({ topicId })
       const events = subscription.events()
       const nextPayload = new TextEncoder().encode('hello again from native iroh gossip')
+      let firstSender: Awaited<ReturnType<typeof startNativeIrohGossipClientSender>> | null = null
       let nativeSender: Awaited<ReturnType<typeof startNativeIrohGossipClientSender>> | null = null
 
       try {
-        const firstSender = await runNativeIrohGossipClientSend({
+        firstSender = await startNativeIrohGossipClientSender({
           relayUrl: relay.url,
           serverEndpointId: endpoint.endpointId,
           topicId,
@@ -120,10 +121,13 @@ describe('native iroh gossip interop', () => {
           payload,
           scope: { type: 'swarm', round: 1 },
         })
+        await firstSender.stop()
+        const firstSenderEndpointId = firstSender.endpointId
+        firstSender = null
 
         expect(
           await withTimeout(nextNeighborDown(events), 'native neighbor-down', 120_000),
-        ).toEqual(firstSender.endpointId)
+        ).toEqual(firstSenderEndpointId)
 
         nativeSender = await startNativeIrohGossipClientSender({
           relayUrl: relay.url,
@@ -144,7 +148,62 @@ describe('native iroh gossip interop', () => {
         subscription.close()
         gossip.close()
         endpoint.close()
+        await firstSender?.stop()
         await nativeSender?.stop()
+        await relay.stop()
+      }
+    },
+    180_000,
+  )
+
+  interopTest(
+    'forwards native gossip through a relay-only TypeScript peer',
+    async () => {
+      const relay = await startLocalIrohRelay()
+      const nativeA = await startNativeIrohGossipServer(relay.url, topicId)
+      const endpointB = await createEndpoint({ relayUrl: relay.url })
+      const gossipB = createGossip(endpointB)
+      const subscriptionB = gossipB.subscribe({
+        topicId,
+        bootstrap: [{ endpointId: nativeA.endpointId, relayUrl: new URL(relay.url) }],
+      })
+      const eventsB = subscriptionB.events()
+      let nativeC: Awaited<ReturnType<typeof startNativeIrohGossipClientReceiver>> | null = null
+
+      try {
+        await withTimeout(subscriptionB.joined(), 'TypeScript peer joined native A', 120_000)
+        nativeC = await startNativeIrohGossipClientReceiver({
+          relayUrl: relay.url,
+          serverEndpointId: endpointB.endpointId,
+          topicId,
+          expectedPayload: payload,
+        })
+        await withTimeout(
+          nextNeighborUp(eventsB, nativeC.endpointId),
+          'native C joined TypeScript peer',
+          120_000,
+        )
+
+        await nativeA.broadcast(payload)
+        const received = await withTimeout(
+          nativeC.received(),
+          'native C forwarded gossip message',
+          120_000,
+        )
+
+        expect(received).toEqual({
+          endpointId: nativeC.endpointId,
+          endpointIdHex: nativeC.endpointIdHex,
+          topicId,
+          deliveredFrom: endpointB.endpointId,
+          payload,
+        })
+      } finally {
+        subscriptionB.close()
+        gossipB.close()
+        endpointB.close()
+        await nativeC?.stop()
+        await nativeA.stop()
         await relay.stop()
       }
     },
@@ -172,6 +231,18 @@ async function nextNeighborDown(
   throw new Error('gossip events closed before neighbor-down')
 }
 
+async function nextNeighborUp(
+  events: AsyncIterable<{ readonly type: string; readonly peer?: Uint8Array }>,
+  peer: Uint8Array,
+): Promise<Uint8Array> {
+  for await (const event of events) {
+    if (event.type === 'neighbor-up' && event.peer !== undefined && bytesEqual(event.peer, peer)) {
+      return event.peer
+    }
+  }
+  throw new Error('gossip events closed before neighbor-up')
+}
+
 async function nextNativeMessage(native: {
   nextEvent(): Promise<NativeIrohGossipEvent>
 }): Promise<NativeIrohGossipEvent> {
@@ -181,4 +252,16 @@ async function nextNativeMessage(native: {
       return event
     }
   }
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.length !== right.length) {
+    return false
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      return false
+    }
+  }
+  return true
 }
