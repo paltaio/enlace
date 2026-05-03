@@ -132,6 +132,10 @@ export class IrohConnection {
   async acceptUniStream(): Promise<IrohUniStream> {
     return new IrohUniStream(await this.#connection.acceptUniStream())
   }
+
+  close(errorCode?: number, reason?: string): void {
+    this.#connection.close(errorCode, reason)
+  }
 }
 
 export class IrohBidiStream {

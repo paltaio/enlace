@@ -396,8 +396,14 @@ class RelayDatagramRouter {
     this.ensureReadLoop()
   }
 
-  unregister(connection: Connection): void {
+  unregister(connection: Connection, error = new Error('connection is closed')): void {
     this.removeAccept(connection)
+    const queue = this.#connectionQueues.get(connection)
+    if (queue !== undefined) {
+      for (const waiter of queue.waiters.splice(0)) {
+        waiter.reject(error)
+      }
+    }
     this.#connectionQueues.delete(connection)
     for (const [key, routedConnection] of this.#connectionIdRoutes) {
       if (routedConnection === connection) {
@@ -514,6 +520,7 @@ export class Connection {
   readonly #acceptedUniStreams: UniStream[] = []
   #nextBidiStreamId: number | null = null
   #nextUniStreamId: number | null = null
+  #closed = false
 
   constructor(relayRouter: RelayDatagramRouter, driver: EndpointConnectionDriver) {
     this.#relayRouter = relayRouter
@@ -529,6 +536,7 @@ export class Connection {
   }
 
   openBidiStream(): BidiStream {
+    this.requireOpen()
     const streamId = this.nextOpenBidiStreamId()
     const stream = new BidiStream(this, streamId)
     this.#streams.set(streamId, stream)
@@ -537,6 +545,7 @@ export class Connection {
   }
 
   openUniStream(): UniStream {
+    this.requireOpen()
     const streamId = this.nextOpenUniStreamId()
     const stream = new UniStream(this, streamId)
     this.#streams.set(streamId, stream)
@@ -546,6 +555,7 @@ export class Connection {
 
   async acceptBidiStream(): Promise<BidiStream> {
     while (true) {
+      this.requireOpen()
       const stream = this.#acceptedBidiStreams.shift()
       if (stream !== undefined) {
         return stream
@@ -556,6 +566,7 @@ export class Connection {
 
   async acceptUniStream(): Promise<UniStream> {
     while (true) {
+      this.requireOpen()
       const stream = this.#acceptedUniStreams.shift()
       if (stream !== undefined) {
         return stream
@@ -566,12 +577,14 @@ export class Connection {
 
   async driveUntilConnected(): Promise<void> {
     while (this.#driver.connection === null) {
+      this.requireOpen()
       await this.receiveRelayDatagrams()
     }
     this.setInitialStreamId()
   }
 
   sendStream(streamId: number, data: Uint8Array, fin = false): QuicRelayStreamSendResult {
+    this.requireOpen()
     const sent = this.#driver.sendStream(streamId, data, fin)
     this.#relayRouter.sendDatagrams(sent.datagrams)
     return sent
@@ -580,6 +593,7 @@ export class Connection {
   async readStreamOutput(streamId: number): Promise<QuicStreamReceiveOutput> {
     const stream = this.requireStream(streamId)
     while (true) {
+      this.requireOpen()
       const output = stream.dequeueOutput()
       if (output !== null) {
         return output
@@ -589,10 +603,28 @@ export class Connection {
   }
 
   async receiveRelayDatagrams(): Promise<void> {
+    this.requireOpen()
     const datagrams = await this.#relayRouter.receiveDatagrams(this)
+    this.requireOpen()
     const result = await this.#driver.receive(datagrams)
     this.sendOutgoing(result)
     this.queueStreamOutputs(result.streamOutputs)
+    if (result.closed) {
+      this.markClosed(new Error('connection is closed'))
+    }
+  }
+
+  close(errorCode = 0, reason = ''): void {
+    if (this.#closed) {
+      return
+    }
+    try {
+      const reasonPhrase = new TextEncoder().encode(reason)
+      const sent = this.#driver.close(errorCode, reasonPhrase)
+      this.#relayRouter.sendDatagrams(sent.datagrams)
+    } finally {
+      this.markClosed(new Error('connection is closed'))
+    }
   }
 
   private sendOutgoing(result: QuicRelayReceiveResult): void {
@@ -665,6 +697,20 @@ export class Connection {
       throw new RangeError('unknown stream')
     }
     return stream
+  }
+
+  private requireOpen(): void {
+    if (this.#closed) {
+      throw new Error('connection is closed')
+    }
+  }
+
+  private markClosed(error: Error): void {
+    if (this.#closed) {
+      return
+    }
+    this.#closed = true
+    this.#relayRouter.unregister(this, error)
   }
 }
 

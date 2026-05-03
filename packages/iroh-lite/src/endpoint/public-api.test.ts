@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import { createEndpoint } from '@paltaio/iroh-lite'
 import { IrohEndpoint } from '@paltaio/iroh-lite/endpoint'
 
-import { startLocalIrohRelay } from '../testing/local-iroh-relay'
+import { startLocalIrohRelay, withTimeout } from '../testing/local-iroh-relay'
 
 const alpn = new TextEncoder().encode('/paltaio/test')
 const payload = new TextEncoder().encode('hello endpoint')
@@ -73,6 +73,33 @@ describe('public endpoint API', () => {
       expect(await serverStream.readToEnd()).toEqual(payload)
       serverStream.write(payload, { fin: true })
       expect(await clientStream.readToEnd()).toEqual(payload)
+    } finally {
+      client.close()
+      server.close()
+      await relay.stop()
+    }
+  })
+
+  test('closes connections and rejects later stream operations', async () => {
+    const relay = await startLocalIrohRelay()
+    const client = await createEndpoint({ relayUrl: relay.url })
+    const server = await createEndpoint({ relayUrl: relay.url })
+
+    try {
+      const accepted = server.accept({ alpn })
+      const clientConnection = await client.connect({
+        address: server.address,
+        alpn,
+      })
+      const serverConnection = await accepted
+      const remoteAccept = serverConnection.acceptUniStream()
+
+      clientConnection.close(0, 'done')
+
+      expect(() => clientConnection.openUniStream()).toThrow('connection is closed')
+      await expect(withTimeout(remoteAccept, 'remote connection close', 5_000)).rejects.toThrow(
+        'connection is closed',
+      )
     } finally {
       client.close()
       server.close()

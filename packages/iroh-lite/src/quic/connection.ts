@@ -7,6 +7,7 @@ import {
   type QuicOneRttStreamPacketSendResult,
 } from './one-rtt'
 import type { QuicAckReceiveSnapshot } from './ack'
+import { encodeQuicApplicationConnectionCloseFrame } from './frame'
 import type { QuicStreamReceiveSnapshot } from './streams'
 import { deriveTls13ApplicationTrafficFromHandshakeState } from './tls-application-traffic'
 import type {
@@ -49,6 +50,7 @@ export interface QuicConnectionDirectionalKeys {
 
 export interface QuicConnectionReceiveResult extends QuicOneRttPacketStreamReceiveResult {
   readonly ackPacket: QuicOneRttPacketSendResult | null
+  readonly connectionClosed: boolean
 }
 
 export interface QuicConnectionHandshakeArtifacts {
@@ -139,11 +141,16 @@ export class QuicConnectionState {
     return {
       ...result,
       ackPacket: result.ackFrame === null ? null : this.sendFrames(result.ackFrame),
+      connectionClosed: result.frames.some((frame) => frame.type === 'connection-close'),
     }
   }
 
   sendFrames(frameBytes: Uint8Array): QuicOneRttPacketSendResult {
     return this.#oneRtt.send(this.sendKeys(), this.#peerConnectionId, frameBytes)
+  }
+
+  sendApplicationClose(errorCode: number, reasonPhrase: Uint8Array): QuicOneRttPacketSendResult {
+    return this.sendFrames(encodeQuicApplicationConnectionCloseFrame(errorCode, reasonPhrase))
   }
 
   sendStream(streamId: number, data: Uint8Array, fin = false): QuicOneRttStreamPacketSendResult {

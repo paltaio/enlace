@@ -31,12 +31,17 @@ export interface QuicRelayReceiveResult {
   readonly outgoing: readonly Datagrams[]
   readonly streamOutputs: readonly QuicStreamReceiveOutput[]
   readonly connected: boolean
+  readonly closed: boolean
 }
 
 export interface QuicRelayStreamSendResult {
   readonly datagrams: Datagrams
   readonly packetNumber: bigint
   readonly stream: QuicStreamSendResult
+}
+
+export interface QuicRelayConnectionCloseResult {
+  readonly datagrams: Datagrams
 }
 
 export class QuicRelayClientDriver {
@@ -71,9 +76,10 @@ export class QuicRelayClientDriver {
 
     const outgoing: Datagrams[] = []
     const streamOutputs: QuicStreamReceiveOutput[] = []
+    let closed = false
     for (const packet of splitRelayDatagramPackets(datagrams)) {
       if (this.#connection !== null) {
-        receiveConnectedPacket(
+        closed = receiveConnectedPacket(
           this.#connection,
           this.#peerEndpointId,
           this.#ecn,
@@ -81,6 +87,9 @@ export class QuicRelayClientDriver {
           outgoing,
           streamOutputs,
         )
+        if (closed) {
+          break
+        }
         continue
       }
       if (isShortHeaderPacket(packet)) {
@@ -100,7 +109,7 @@ export class QuicRelayClientDriver {
       if (clientFlight !== null) {
         this.#connection = clientFlight.connection
         outgoing.push(this.outgoing(clientFlight.packet))
-        drainPendingConnectedPackets(
+        closed = drainPendingConnectedPackets(
           this.#connection,
           this.#peerEndpointId,
           this.#ecn,
@@ -115,6 +124,7 @@ export class QuicRelayClientDriver {
       outgoing,
       streamOutputs,
       connected: this.#connection !== null,
+      closed,
     }
   }
 
@@ -125,6 +135,14 @@ export class QuicRelayClientDriver {
       datagrams: this.outgoing(sent.packet),
       packetNumber: sent.packetNumber,
       stream: sent.stream,
+    }
+  }
+
+  close(errorCode = 0, reasonPhrase = new Uint8Array()): QuicRelayConnectionCloseResult {
+    const connection = requireConnection(this.#connection)
+    const sent = connection.sendApplicationClose(errorCode, reasonPhrase)
+    return {
+      datagrams: this.outgoing(sent.packet),
     }
   }
 
@@ -174,9 +192,10 @@ export class QuicRelayServerDriver {
 
     const outgoing: Datagrams[] = []
     const streamOutputs: QuicStreamReceiveOutput[] = []
+    let closed = false
     for (const packet of splitRelayDatagramPackets(datagrams)) {
       if (this.#connection !== null) {
-        receiveConnectedPacket(
+        closed = receiveConnectedPacket(
           this.#connection,
           peerEndpointId,
           this.#ecn,
@@ -184,6 +203,9 @@ export class QuicRelayServerDriver {
           outgoing,
           streamOutputs,
         )
+        if (closed) {
+          break
+        }
         continue
       }
       if (isShortHeaderPacket(packet)) {
@@ -200,7 +222,7 @@ export class QuicRelayServerDriver {
       if (packetType === QuicLongHeaderPacketType.Handshake) {
         const complete = await this.#handshake.receiveClientHandshake(packet)
         this.#connection = complete.connection
-        drainPendingConnectedPackets(
+        closed = drainPendingConnectedPackets(
           this.#connection,
           peerEndpointId,
           this.#ecn,
@@ -217,6 +239,7 @@ export class QuicRelayServerDriver {
       outgoing,
       streamOutputs,
       connected: this.#connection !== null,
+      closed,
     }
   }
 
@@ -228,6 +251,15 @@ export class QuicRelayServerDriver {
       datagrams: packetToRelayDatagrams(peerEndpointId, this.#ecn, sent.packet),
       packetNumber: sent.packetNumber,
       stream: sent.stream,
+    }
+  }
+
+  close(errorCode = 0, reasonPhrase = new Uint8Array()): QuicRelayConnectionCloseResult {
+    const connection = requireConnection(this.#connection)
+    const peerEndpointId = requireEndpointId(this.#peerEndpointId)
+    const sent = connection.sendApplicationClose(errorCode, reasonPhrase)
+    return {
+      datagrams: packetToRelayDatagrams(peerEndpointId, this.#ecn, sent.packet),
     }
   }
 
@@ -295,13 +327,25 @@ function receiveConnectedDatagram(
 ): QuicRelayReceiveResult {
   const outgoing: Datagrams[] = []
   const streamOutputs: QuicStreamReceiveOutput[] = []
+  let closed = false
   for (const packet of splitRelayDatagramPackets(datagrams)) {
-    receiveConnectedPacket(connection, peerEndpointId, ecn, packet, outgoing, streamOutputs)
+    closed = receiveConnectedPacket(
+      connection,
+      peerEndpointId,
+      ecn,
+      packet,
+      outgoing,
+      streamOutputs,
+    )
+    if (closed) {
+      break
+    }
   }
   return {
     outgoing,
     streamOutputs,
     connected: true,
+    closed,
   }
 }
 
@@ -312,12 +356,13 @@ function receiveConnectedPacket(
   packet: Uint8Array,
   outgoing: Datagrams[],
   streamOutputs: QuicStreamReceiveOutput[],
-): void {
+): boolean {
   const received = connection.receive(packet)
   streamOutputs.push(...received.streamOutputs)
   if (received.ackPacket !== null) {
     outgoing.push(packetToRelayDatagrams(peerEndpointId, ecn, received.ackPacket.packet))
   }
+  return received.connectionClosed
 }
 
 function drainPendingConnectedPackets(
@@ -327,10 +372,13 @@ function drainPendingConnectedPackets(
   packets: Uint8Array[],
   outgoing: Datagrams[],
   streamOutputs: QuicStreamReceiveOutput[],
-): void {
+): boolean {
   for (const packet of packets.splice(0)) {
-    receiveConnectedPacket(connection, peerEndpointId, ecn, packet, outgoing, streamOutputs)
+    if (receiveConnectedPacket(connection, peerEndpointId, ecn, packet, outgoing, streamOutputs)) {
+      return true
+    }
   }
+  return false
 }
 
 function serverFlightToDatagrams(
