@@ -520,6 +520,7 @@ export class Connection {
   readonly #acceptedUniStreams: UniStream[] = []
   #nextBidiStreamId: number | null = null
   #nextUniStreamId: number | null = null
+  #receivePump: Promise<void> | null = null
   #closed = false
 
   constructor(relayRouter: RelayDatagramRouter, driver: EndpointConnectionDriver) {
@@ -603,6 +604,22 @@ export class Connection {
   }
 
   async receiveRelayDatagrams(): Promise<void> {
+    if (this.#receivePump !== null) {
+      await this.#receivePump
+      return
+    }
+    const pump = this.receiveRelayDatagramsOnce()
+    this.#receivePump = pump
+    try {
+      await pump
+    } finally {
+      if (this.#receivePump === pump) {
+        this.#receivePump = null
+      }
+    }
+  }
+
+  private async receiveRelayDatagramsOnce(): Promise<void> {
     this.requireOpen()
     const datagrams = await this.#relayRouter.receiveDatagrams(this)
     this.requireOpen()

@@ -7,10 +7,19 @@ import {
   decodeGossipStreamHeader,
   decodeGossipTopicMessage,
   encodeGossipBroadcastMessage,
+  encodeGossipGraftMessage,
+  encodeGossipIHaveMessage,
+  encodeGossipPruneMessage,
+  encodeGossipSwarmDisconnectMessage,
+  encodeGossipSwarmForwardJoinMessage,
   encodeGossipStreamFrame,
   encodeGossipStreamHeader,
   encodeGossipSwarmJoinMessage,
+  encodeGossipSwarmNeighborMessage,
+  encodeGossipSwarmShuffleMessage,
+  encodeGossipSwarmShuffleReplyMessage,
   GossipFrameReader,
+  GossipTopicStreamWriter,
   gossipAlpn,
 } from './wire'
 
@@ -19,9 +28,25 @@ const vector = {
   topicIdHex: '101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f',
   streamHeaderFrameHex: '00000020101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f',
   joinMessageFrameHex: '0000000400000100',
+  neighborMessageFrameHex: '000000050004000100',
+  forwardJoinMessageFrameHex:
+    '000000250001ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1010006',
+  shuffleMessageFrameHex:
+    '0000004600028a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c018a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c010006',
+  shuffleReplyMessageFrameHex:
+    '000000250003018a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0100',
+  disconnectMessageFrameHex: '0000000400050000',
   broadcastMessageFrameHex:
     '000000310100aab5d0114139f72a5670610ad1d21388f38fb6c8eac1aedab6d9f9e42006cf4f0c68656c6c6f20676f737369700000',
+  pruneMessageFrameHex: '000000020101',
+  ihaveMessageFrameHex:
+    '00000024010301283d8b10fc0413e78cb9eb40037257fc8a8cbac07b6ed30d6e77d134ee79176f00',
+  graftMessageFrameHex:
+    '00000024010201283d8b10fc0413e78cb9eb40037257fc8a8cbac07b6ed30d6e77d134ee79176f00',
   broadcastPayloadHex: '68656c6c6f20676f73736970',
+  repairPayloadHex: '72657061697220676f73736970',
+  peerAHex: '8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c',
+  peerCHex: 'ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1',
 }
 
 describe('gossip wire frames', () => {
@@ -58,6 +83,108 @@ describe('gossip wire frames', () => {
     expect(bytesToHex(encodeGossipSwarmJoinMessage())).toBe(vector.joinMessageFrameHex)
   })
 
+  test('decodes native neighbor message frame', () => {
+    const frame = decodeGossipStreamFrame(hexToBytes(vector.neighborMessageFrameHex))
+
+    expect(decodeGossipTopicMessage(frame.payload)).toEqual({
+      layer: 'swarm',
+      type: 'neighbor',
+      priority: 'high',
+      peerData: new Uint8Array(),
+    })
+  })
+
+  test('encodes native neighbor message frame', () => {
+    expect(
+      bytesToHex(
+        encodeGossipSwarmNeighborMessage({ priority: 'high', peerData: new Uint8Array() }),
+      ),
+    ).toBe(vector.neighborMessageFrameHex)
+  })
+
+  test('decodes native forward join message frame', () => {
+    const frame = decodeGossipStreamFrame(hexToBytes(vector.forwardJoinMessageFrameHex))
+
+    expect(decodeGossipTopicMessage(frame.payload)).toEqual({
+      layer: 'swarm',
+      type: 'forward-join',
+      peer: { id: hexToBytes(vector.peerCHex), peerData: new Uint8Array() },
+      ttl: 6,
+    })
+  })
+
+  test('encodes native forward join message frame', () => {
+    expect(
+      bytesToHex(
+        encodeGossipSwarmForwardJoinMessage({
+          peer: { id: hexToBytes(vector.peerCHex), peerData: new Uint8Array() },
+          ttl: 6,
+        }),
+      ),
+    ).toBe(vector.forwardJoinMessageFrameHex)
+  })
+
+  test('decodes native shuffle message frame', () => {
+    const frame = decodeGossipStreamFrame(hexToBytes(vector.shuffleMessageFrameHex))
+
+    expect(decodeGossipTopicMessage(frame.payload)).toEqual({
+      layer: 'swarm',
+      type: 'shuffle',
+      origin: hexToBytes(vector.peerAHex),
+      nodes: [{ id: hexToBytes(vector.peerAHex), peerData: new Uint8Array() }],
+      ttl: 6,
+    })
+  })
+
+  test('encodes native shuffle message frame', () => {
+    expect(
+      bytesToHex(
+        encodeGossipSwarmShuffleMessage({
+          origin: hexToBytes(vector.peerAHex),
+          nodes: [{ id: hexToBytes(vector.peerAHex), peerData: new Uint8Array() }],
+          ttl: 6,
+        }),
+      ),
+    ).toBe(vector.shuffleMessageFrameHex)
+  })
+
+  test('decodes native shuffle reply message frame', () => {
+    const frame = decodeGossipStreamFrame(hexToBytes(vector.shuffleReplyMessageFrameHex))
+
+    expect(decodeGossipTopicMessage(frame.payload)).toEqual({
+      layer: 'swarm',
+      type: 'shuffle-reply',
+      nodes: [{ id: hexToBytes(vector.peerAHex), peerData: new Uint8Array() }],
+    })
+  })
+
+  test('encodes native shuffle reply message frame', () => {
+    expect(
+      bytesToHex(
+        encodeGossipSwarmShuffleReplyMessage({
+          nodes: [{ id: hexToBytes(vector.peerAHex), peerData: new Uint8Array() }],
+        }),
+      ),
+    ).toBe(vector.shuffleReplyMessageFrameHex)
+  })
+
+  test('decodes native disconnect message frame', () => {
+    const frame = decodeGossipStreamFrame(hexToBytes(vector.disconnectMessageFrameHex))
+
+    expect(decodeGossipTopicMessage(frame.payload)).toEqual({
+      layer: 'swarm',
+      type: 'disconnect',
+      alive: false,
+      respond: false,
+    })
+  })
+
+  test('encodes native disconnect message frame', () => {
+    expect(bytesToHex(encodeGossipSwarmDisconnectMessage({ alive: false }))).toBe(
+      vector.disconnectMessageFrameHex,
+    )
+  })
+
   test('decodes native broadcast message frame', () => {
     const frame = decodeGossipStreamFrame(hexToBytes(vector.broadcastMessageFrameHex))
     const message = decodeGossipTopicMessage(frame.payload)
@@ -65,7 +192,7 @@ describe('gossip wire frames', () => {
 
     expect(message.layer).toBe('gossip')
     expect(message.type).toBe('gossip')
-    if (message.layer !== 'gossip') {
+    if (message.type !== 'gossip') {
       throw new Error('expected gossip message')
     }
     expect(message.content).toEqual(payload)
@@ -77,6 +204,56 @@ describe('gossip wire frames', () => {
     expect(
       bytesToHex(encodeGossipBroadcastMessage({ content: hexToBytes(vector.broadcastPayloadHex) })),
     ).toBe(vector.broadcastMessageFrameHex)
+  })
+
+  test('decodes native prune message frame', () => {
+    const frame = decodeGossipStreamFrame(hexToBytes(vector.pruneMessageFrameHex))
+
+    expect(decodeGossipTopicMessage(frame.payload)).toEqual({
+      layer: 'gossip',
+      type: 'prune',
+    })
+  })
+
+  test('encodes native prune message frame', () => {
+    expect(bytesToHex(encodeGossipPruneMessage())).toBe(vector.pruneMessageFrameHex)
+  })
+
+  test('decodes native ihave message frame', () => {
+    const frame = decodeGossipStreamFrame(hexToBytes(vector.ihaveMessageFrameHex))
+    const id = blake3(hexToBytes(vector.repairPayloadHex))
+
+    expect(decodeGossipTopicMessage(frame.payload)).toEqual({
+      layer: 'gossip',
+      type: 'ihave',
+      messages: [{ id, round: 0 }],
+    })
+  })
+
+  test('encodes native ihave message frame', () => {
+    const id = blake3(hexToBytes(vector.repairPayloadHex))
+
+    expect(bytesToHex(encodeGossipIHaveMessage({ messages: [{ id, round: 0 }] }))).toBe(
+      vector.ihaveMessageFrameHex,
+    )
+  })
+
+  test('decodes native graft message frame', () => {
+    const frame = decodeGossipStreamFrame(hexToBytes(vector.graftMessageFrameHex))
+    const id = blake3(hexToBytes(vector.repairPayloadHex))
+
+    expect(decodeGossipTopicMessage(frame.payload)).toEqual({
+      layer: 'gossip',
+      type: 'graft',
+      id,
+      round: 0,
+    })
+  })
+
+  test('encodes native graft message frame', () => {
+    const id = blake3(hexToBytes(vector.repairPayloadHex))
+
+    expect(bytesToHex(encodeGossipGraftMessage({ id, round: 0 }))).toBe(vector.graftMessageFrameHex)
   })
 
   test('reads frames from arbitrary stream chunks', async () => {
@@ -113,6 +290,37 @@ describe('gossip wire frames', () => {
     const reader = new GossipFrameReader(chunkedStream([hexToBytes('00000002ff')]))
 
     await expect(reader.readFrame()).rejects.toThrow('incomplete gossip stream frame')
+  })
+
+  test('writes topic header once before message frames', () => {
+    const writes: Array<{ readonly data: Uint8Array; readonly fin: boolean }> = []
+    const writer = new GossipTopicStreamWriter(
+      {
+        write(data, options = {}) {
+          writes.push({ data, fin: options.fin ?? false })
+        },
+      },
+      hexToBytes(vector.topicIdHex),
+    )
+
+    writer.writeFrame(encodeGossipSwarmJoinMessage())
+    writer.writeFrame(
+      encodeGossipBroadcastMessage({ content: hexToBytes(vector.broadcastPayloadHex) }),
+    )
+    writer.finish()
+
+    expect(writes).toEqual([
+      {
+        data: encodeGossipStreamHeader({ topicId: hexToBytes(vector.topicIdHex) }),
+        fin: false,
+      },
+      { data: encodeGossipSwarmJoinMessage(), fin: false },
+      {
+        data: encodeGossipBroadcastMessage({ content: hexToBytes(vector.broadcastPayloadHex) }),
+        fin: false,
+      },
+      { data: new Uint8Array(), fin: true },
+    ])
   })
 })
 

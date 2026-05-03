@@ -1,17 +1,17 @@
-import { concatBytes, copyBytes } from './bytes'
+import { copyBytes } from './bytes'
 import type { IrohEndpoint, IrohEndpointAddress, IrohConnection } from './endpoint'
 import {
   decodeGossipStreamHeader,
   decodeGossipTopicMessage,
   encodeGossipBroadcastMessage,
-  encodeGossipStreamHeader,
   encodeGossipSwarmJoinMessage,
   gossipAlpn,
   GossipFrameReader,
+  GossipTopicStreamWriter,
   validateGossipTopicId,
   type GossipBroadcastMessage,
   type GossipDeliveryScope,
-  type GossipSwarmJoinMessage,
+  type GossipTopicMessage,
 } from './gossip/wire'
 
 export interface IrohGossipSubscribeOptions {
@@ -65,6 +65,7 @@ export class IrohGossipSubscription {
   readonly #topicId: Uint8Array
   readonly #events = new AsyncQueue<IrohGossipEvent>()
   readonly #connections = new Set<IrohConnection>()
+  readonly #writers = new Map<IrohConnection, GossipTopicStreamWriter>()
   readonly #seenMessageIds = new Set<string>()
   #started = false
   #closed = false
@@ -114,6 +115,10 @@ export class IrohGossipSubscription {
       return
     }
     this.#closed = true
+    for (const writer of this.#writers.values()) {
+      finishWriter(writer)
+    }
+    this.#writers.clear()
     this.#connections.clear()
     this.#events.close()
   }
@@ -181,12 +186,17 @@ export class IrohGossipSubscription {
 
   private removeConnection(connection: IrohConnection): void {
     this.#connections.delete(connection)
+    const writer = this.#writers.get(connection)
+    this.#writers.delete(connection)
+    if (writer !== undefined) {
+      finishWriter(writer)
+    }
   }
 
   private pushTopicEvent(
     connection: IrohConnection,
     topicId: Uint8Array,
-    message: GossipBroadcastMessage | GossipSwarmJoinMessage,
+    message: GossipTopicMessage,
   ): void {
     if (!equalBytes(topicId, this.#topicId)) {
       return
@@ -197,6 +207,9 @@ export class IrohGossipSubscription {
         topicId: copyBytes(topicId),
         peerData: message.peerData === null ? null : copyBytes(message.peerData),
       })
+      return
+    }
+    if (message.type !== 'gossip') {
       return
     }
     const messageKey = bytesKey(message.id)
@@ -216,10 +229,7 @@ export class IrohGossipSubscription {
   }
 
   private sendFrame(connection: IrohConnection, frame: Uint8Array): void {
-    const stream = connection.openUniStream()
-    stream.write(concatBytes([encodeGossipStreamHeader({ topicId: this.#topicId }), frame]), {
-      fin: true,
-    })
+    this.requireWriter(connection).writeFrame(frame)
   }
 
   private trySendFrame(connection: IrohConnection, frame: Uint8Array): void {
@@ -245,6 +255,16 @@ export class IrohGossipSubscription {
       }
       this.trySendFrame(connection, frame)
     }
+  }
+
+  private requireWriter(connection: IrohConnection): GossipTopicStreamWriter {
+    const writer = this.#writers.get(connection)
+    if (writer !== undefined) {
+      return writer
+    }
+    const nextWriter = new GossipTopicStreamWriter(connection.openUniStream(), this.#topicId)
+    this.#writers.set(connection, nextWriter)
+    return nextWriter
   }
 
   private requireOpen(): void {
@@ -354,4 +374,12 @@ function bytesKey(bytes: Uint8Array): string {
     out += byte.toString(16).padStart(2, '0')
   }
   return out
+}
+
+function finishWriter(writer: GossipTopicStreamWriter): void {
+  try {
+    writer.finish()
+  } catch {
+    // Connection teardown can race FIN.
+  }
 }

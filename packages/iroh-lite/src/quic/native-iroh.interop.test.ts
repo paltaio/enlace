@@ -116,7 +116,7 @@ describe('native iroh QUIC interop', () => {
       expect(header.topicId).toEqual(result.topicId)
       expect(message.layer).toBe('gossip')
       expect(message.type).toBe('gossip')
-      if (message.layer !== 'gossip') {
+      if (message.type !== 'gossip') {
         throw new Error('expected gossip message')
       }
       expect(message.content).toEqual(result.payload)

@@ -26,12 +26,68 @@ export interface GossipStreamRead {
   readonly complete: boolean
 }
 
-export type GossipTopicMessage = GossipSwarmJoinMessage | GossipBroadcastMessage
+export interface GossipStreamWrite {
+  write(data: Uint8Array, options?: { readonly fin?: boolean }): void
+}
+
+export type GossipTopicMessage =
+  | GossipSwarmJoinMessage
+  | GossipSwarmForwardJoinMessage
+  | GossipSwarmShuffleMessage
+  | GossipSwarmShuffleReplyMessage
+  | GossipSwarmNeighborMessage
+  | GossipSwarmDisconnectMessage
+  | GossipBroadcastMessage
+  | GossipPruneMessage
+  | GossipGraftMessage
+  | GossipIHaveMessage
 
 export interface GossipSwarmJoinMessage {
   readonly layer: 'swarm'
   readonly type: 'join'
   readonly peerData: Uint8Array | null
+}
+
+export interface GossipPeerInfo {
+  readonly id: Uint8Array
+  readonly peerData: Uint8Array | null
+}
+
+export interface GossipSwarmForwardJoinMessage {
+  readonly layer: 'swarm'
+  readonly type: 'forward-join'
+  readonly peer: GossipPeerInfo
+  readonly ttl: number
+}
+
+export interface GossipSwarmShuffleMessage {
+  readonly layer: 'swarm'
+  readonly type: 'shuffle'
+  readonly origin: Uint8Array
+  readonly nodes: readonly GossipPeerInfo[]
+  readonly ttl: number
+}
+
+export interface GossipSwarmShuffleReplyMessage {
+  readonly layer: 'swarm'
+  readonly type: 'shuffle-reply'
+  readonly nodes: readonly GossipPeerInfo[]
+}
+
+export interface GossipSwarmNeighborMessage {
+  readonly layer: 'swarm'
+  readonly type: 'neighbor'
+  readonly priority: GossipSwarmNeighborPriority
+  readonly peerData: Uint8Array | null
+}
+
+export type GossipSwarmNeighborPriority = 'high' | 'low'
+
+export interface GossipSwarmDisconnectMessage {
+  readonly layer: 'swarm'
+  readonly type: 'disconnect'
+  readonly alive: boolean
+  readonly respond: boolean
 }
 
 export interface GossipBroadcastMessage {
@@ -40,6 +96,29 @@ export interface GossipBroadcastMessage {
   readonly id: Uint8Array
   readonly content: Uint8Array
   readonly scope: GossipDeliveryScope
+}
+
+export interface GossipPruneMessage {
+  readonly layer: 'gossip'
+  readonly type: 'prune'
+}
+
+export interface GossipGraftMessage {
+  readonly layer: 'gossip'
+  readonly type: 'graft'
+  readonly id: Uint8Array | null
+  readonly round: number
+}
+
+export interface GossipIHaveMessage {
+  readonly layer: 'gossip'
+  readonly type: 'ihave'
+  readonly messages: readonly GossipIHaveEntry[]
+}
+
+export interface GossipIHaveEntry {
+  readonly id: Uint8Array
+  readonly round: number
 }
 
 export type GossipDeliveryScope = GossipSwarmDeliveryScope | GossipNeighborDeliveryScope
@@ -68,12 +147,78 @@ export function encodeGossipStreamHeader(header: GossipStreamHeader): Uint8Array
 
 export function encodeGossipSwarmJoinMessage(peerData = new Uint8Array()): Uint8Array {
   return encodeGossipStreamFrame(
+    concatBytes([encodePostcardLen(0), encodePostcardLen(0), encodeOptionalPeerData(peerData)]),
+  )
+}
+
+export function encodeGossipSwarmForwardJoinMessage(message: {
+  readonly peer: GossipPeerInfo
+  readonly ttl: number
+}): Uint8Array {
+  return encodeGossipStreamFrame(
     concatBytes([
       encodePostcardLen(0),
-      encodePostcardLen(0),
       encodePostcardLen(1),
-      encodePostcardLen(peerData.length),
-      peerData,
+      encodePeerInfo(message.peer),
+      encodePostcardLen(message.ttl),
+    ]),
+  )
+}
+
+export function encodeGossipSwarmShuffleMessage(message: {
+  readonly origin: Uint8Array
+  readonly nodes: readonly GossipPeerInfo[]
+  readonly ttl: number
+}): Uint8Array {
+  return encodeGossipStreamFrame(
+    concatBytes([
+      encodePostcardLen(0),
+      encodePostcardLen(2),
+      validatePeerId(message.origin),
+      encodePostcardLen(message.nodes.length),
+      ...message.nodes.map(encodePeerInfo),
+      encodePostcardLen(message.ttl),
+    ]),
+  )
+}
+
+export function encodeGossipSwarmShuffleReplyMessage(message: {
+  readonly nodes: readonly GossipPeerInfo[]
+}): Uint8Array {
+  return encodeGossipStreamFrame(
+    concatBytes([
+      encodePostcardLen(0),
+      encodePostcardLen(3),
+      encodePostcardLen(message.nodes.length),
+      ...message.nodes.map(encodePeerInfo),
+    ]),
+  )
+}
+
+export function encodeGossipSwarmNeighborMessage(message: {
+  readonly priority: GossipSwarmNeighborPriority
+  readonly peerData: Uint8Array | null
+}): Uint8Array {
+  return encodeGossipStreamFrame(
+    concatBytes([
+      encodePostcardLen(0),
+      encodePostcardLen(4),
+      encodeNeighborPriority(message.priority),
+      encodeOptionalPeerData(message.peerData),
+    ]),
+  )
+}
+
+export function encodeGossipSwarmDisconnectMessage(message: {
+  readonly alive: boolean
+  readonly respond?: boolean
+}): Uint8Array {
+  return encodeGossipStreamFrame(
+    concatBytes([
+      encodePostcardLen(0),
+      encodePostcardLen(5),
+      encodeBool(message.alive),
+      encodeBool(message.respond ?? false),
     ]),
   )
 }
@@ -88,6 +233,37 @@ export function encodeGossipBroadcastMessage(message: GossipBroadcastMessageInpu
       encodePostcardLen(content.length),
       content,
       encodeDeliveryScope(message.scope ?? { type: 'swarm', round: 0 }),
+    ]),
+  )
+}
+
+export function encodeGossipPruneMessage(): Uint8Array {
+  return encodeGossipStreamFrame(concatBytes([encodePostcardLen(1), encodePostcardLen(1)]))
+}
+
+export function encodeGossipGraftMessage(message: {
+  readonly id: Uint8Array | null
+  readonly round: number
+}): Uint8Array {
+  return encodeGossipStreamFrame(
+    concatBytes([
+      encodePostcardLen(1),
+      encodePostcardLen(2),
+      encodeOptionalMessageId(message.id),
+      encodePostcardLen(message.round),
+    ]),
+  )
+}
+
+export function encodeGossipIHaveMessage(message: {
+  readonly messages: readonly GossipIHaveEntry[]
+}): Uint8Array {
+  return encodeGossipStreamFrame(
+    concatBytes([
+      encodePostcardLen(1),
+      encodePostcardLen(3),
+      encodePostcardLen(message.messages.length),
+      ...message.messages.map(encodeIHaveEntry),
     ]),
   )
 }
@@ -162,6 +338,35 @@ export class GossipFrameReader {
   }
 }
 
+export class GossipTopicStreamWriter {
+  readonly #stream: GossipStreamWrite
+  #closed = false
+
+  constructor(stream: GossipStreamWrite, topicId: Uint8Array) {
+    this.#stream = stream
+    this.#stream.write(encodeGossipStreamHeader({ topicId }))
+  }
+
+  writeFrame(frame: Uint8Array): void {
+    this.requireOpen()
+    this.#stream.write(frame)
+  }
+
+  finish(): void {
+    if (this.#closed) {
+      return
+    }
+    this.#closed = true
+    this.#stream.write(new Uint8Array(), { fin: true })
+  }
+
+  private requireOpen(): void {
+    if (this.#closed) {
+      throw new Error('gossip topic stream writer is closed')
+    }
+  }
+}
+
 export function decodeGossipStreamHeader(payload: Uint8Array): GossipStreamHeader {
   if (payload.length !== 32) {
     throw new RangeError('gossip stream header must be 32 bytes')
@@ -181,29 +386,99 @@ export function decodeGossipTopicMessage(payload: Uint8Array): GossipTopicMessag
   throw new RangeError(`unsupported gossip topic message layer ${layer}`)
 }
 
-function decodeSwarmMessage(reader: PostcardReader): GossipSwarmJoinMessage {
+function decodeSwarmMessage(
+  reader: PostcardReader,
+):
+  | GossipSwarmJoinMessage
+  | GossipSwarmForwardJoinMessage
+  | GossipSwarmShuffleMessage
+  | GossipSwarmShuffleReplyMessage
+  | GossipSwarmNeighborMessage
+  | GossipSwarmDisconnectMessage {
   const variant = reader.variant()
-  if (variant !== 0) {
-    throw new RangeError(`unsupported gossip swarm message variant ${variant}`)
+  if (variant === 0) {
+    return decodeSwarmJoinMessage(reader)
   }
-  const option = reader.variant()
-  if (option === 0) {
-    reader.requireDone()
-    return { layer: 'swarm', type: 'join', peerData: null }
+  if (variant === 1) {
+    return decodeSwarmForwardJoinMessage(reader)
   }
-  if (option === 1) {
-    const peerData = reader.bytes()
-    reader.requireDone()
-    return { layer: 'swarm', type: 'join', peerData }
+  if (variant === 2) {
+    return decodeSwarmShuffleMessage(reader)
   }
-  throw new RangeError(`unsupported gossip join peer data option ${option}`)
+  if (variant === 3) {
+    return decodeSwarmShuffleReplyMessage(reader)
+  }
+  if (variant === 4) {
+    return decodeSwarmNeighborMessage(reader)
+  }
+  if (variant === 5) {
+    return decodeSwarmDisconnectMessage(reader)
+  }
+  throw new RangeError(`unsupported gossip swarm message variant ${variant}`)
 }
 
-function decodeGossipMessage(reader: PostcardReader): GossipBroadcastMessage {
+function decodeSwarmJoinMessage(reader: PostcardReader): GossipSwarmJoinMessage {
+  const peerData = decodeOptionalPeerData(reader)
+  reader.requireDone()
+  return { layer: 'swarm', type: 'join', peerData }
+}
+
+function decodeSwarmForwardJoinMessage(reader: PostcardReader): GossipSwarmForwardJoinMessage {
+  const peer = decodePeerInfo(reader)
+  const ttl = reader.uint()
+  reader.requireDone()
+  return { layer: 'swarm', type: 'forward-join', peer, ttl }
+}
+
+function decodeSwarmShuffleMessage(reader: PostcardReader): GossipSwarmShuffleMessage {
+  const origin = reader.fixedBytes(32)
+  const nodes = decodePeerInfoVec(reader)
+  const ttl = reader.uint()
+  reader.requireDone()
+  return { layer: 'swarm', type: 'shuffle', origin, nodes, ttl }
+}
+
+function decodeSwarmShuffleReplyMessage(reader: PostcardReader): GossipSwarmShuffleReplyMessage {
+  const nodes = decodePeerInfoVec(reader)
+  reader.requireDone()
+  return { layer: 'swarm', type: 'shuffle-reply', nodes }
+}
+
+function decodeSwarmNeighborMessage(reader: PostcardReader): GossipSwarmNeighborMessage {
+  const priority = decodeNeighborPriority(reader)
+  const peerData = decodeOptionalPeerData(reader)
+  reader.requireDone()
+  return { layer: 'swarm', type: 'neighbor', priority, peerData }
+}
+
+function decodeSwarmDisconnectMessage(reader: PostcardReader): GossipSwarmDisconnectMessage {
+  const alive = reader.bool()
+  const respond = reader.bool()
+  reader.requireDone()
+  return { layer: 'swarm', type: 'disconnect', alive, respond }
+}
+
+function decodeGossipMessage(
+  reader: PostcardReader,
+): GossipBroadcastMessage | GossipPruneMessage | GossipGraftMessage | GossipIHaveMessage {
   const variant = reader.variant()
-  if (variant !== 0) {
-    throw new RangeError(`unsupported gossip broadcast message variant ${variant}`)
+  if (variant === 0) {
+    return decodeGossipBroadcastMessage(reader)
   }
+  if (variant === 1) {
+    reader.requireDone()
+    return { layer: 'gossip', type: 'prune' }
+  }
+  if (variant === 2) {
+    return decodeGossipGraftMessage(reader)
+  }
+  if (variant === 3) {
+    return decodeGossipIHaveMessage(reader)
+  }
+  throw new RangeError(`unsupported gossip broadcast message variant ${variant}`)
+}
+
+function decodeGossipBroadcastMessage(reader: PostcardReader): GossipBroadcastMessage {
   const id = reader.fixedBytes(32)
   const content = reader.bytes()
   const scope = decodeDeliveryScope(reader)
@@ -215,6 +490,26 @@ function decodeGossipMessage(reader: PostcardReader): GossipBroadcastMessage {
     content,
     scope,
   }
+}
+
+function decodeGossipGraftMessage(reader: PostcardReader): GossipGraftMessage {
+  const id = decodeOptionalMessageId(reader)
+  const round = reader.uint()
+  reader.requireDone()
+  return { layer: 'gossip', type: 'graft', id, round }
+}
+
+function decodeGossipIHaveMessage(reader: PostcardReader): GossipIHaveMessage {
+  const length = reader.uint()
+  const messages: GossipIHaveEntry[] = []
+  for (let index = 0; index < length; index += 1) {
+    messages.push({
+      id: reader.fixedBytes(32),
+      round: reader.uint(),
+    })
+  }
+  reader.requireDone()
+  return { layer: 'gossip', type: 'ihave', messages }
 }
 
 function decodeDeliveryScope(reader: PostcardReader): GossipDeliveryScope {
@@ -235,6 +530,98 @@ function encodeDeliveryScope(scope: GossipDeliveryScope): Uint8Array {
   return encodePostcardLen(1)
 }
 
+function encodeOptionalMessageId(id: Uint8Array | null): Uint8Array {
+  if (id === null) {
+    return encodePostcardLen(0)
+  }
+  return concatBytes([encodePostcardLen(1), validateMessageId(id)])
+}
+
+function encodeOptionalPeerData(peerData: Uint8Array | null): Uint8Array {
+  if (peerData === null) {
+    return encodePostcardLen(0)
+  }
+  return concatBytes([encodePostcardLen(1), encodePostcardLen(peerData.length), peerData])
+}
+
+function decodeOptionalPeerData(reader: PostcardReader): Uint8Array | null {
+  const option = reader.variant()
+  if (option === 0) {
+    return null
+  }
+  if (option === 1) {
+    return reader.bytes()
+  }
+  throw new RangeError(`unsupported gossip peer data option ${option}`)
+}
+
+function encodePeerInfo(peer: GossipPeerInfo): Uint8Array {
+  return concatBytes([validatePeerId(peer.id), encodeOptionalPeerData(peer.peerData)])
+}
+
+function decodePeerInfo(reader: PostcardReader): GossipPeerInfo {
+  return {
+    id: reader.fixedBytes(32),
+    peerData: decodeOptionalPeerData(reader),
+  }
+}
+
+function decodePeerInfoVec(reader: PostcardReader): readonly GossipPeerInfo[] {
+  const length = reader.uint()
+  const peers: GossipPeerInfo[] = []
+  for (let index = 0; index < length; index += 1) {
+    peers.push(decodePeerInfo(reader))
+  }
+  return peers
+}
+
+function encodeNeighborPriority(priority: GossipSwarmNeighborPriority): Uint8Array {
+  if (priority === 'high') {
+    return encodePostcardLen(0)
+  }
+  return encodePostcardLen(1)
+}
+
+function decodeNeighborPriority(reader: PostcardReader): GossipSwarmNeighborPriority {
+  const variant = reader.variant()
+  if (variant === 0) {
+    return 'high'
+  }
+  if (variant === 1) {
+    return 'low'
+  }
+  throw new RangeError(`unsupported gossip neighbor priority ${variant}`)
+}
+
+function encodeBool(value: boolean): Uint8Array {
+  return new Uint8Array([value ? 1 : 0])
+}
+
+function decodeOptionalMessageId(reader: PostcardReader): Uint8Array | null {
+  const option = reader.variant()
+  if (option === 0) {
+    return null
+  }
+  if (option === 1) {
+    return reader.fixedBytes(32)
+  }
+  throw new RangeError(`unsupported gossip message id option ${option}`)
+}
+
+function encodeIHaveEntry(message: GossipIHaveEntry): Uint8Array {
+  return concatBytes([validateMessageId(message.id), encodePostcardLen(message.round)])
+}
+
+function validateMessageId(id: Uint8Array): Uint8Array {
+  requireLength(id, 32, 'gossip message id')
+  return copyBytes(id)
+}
+
+function validatePeerId(id: Uint8Array): Uint8Array {
+  requireLength(id, 32, 'gossip peer id')
+  return copyBytes(id)
+}
+
 class PostcardReader {
   readonly #bytes: Uint8Array
   #offset = 0
@@ -253,6 +640,17 @@ class PostcardReader {
     return decoded.value
   }
 
+  bool(): boolean {
+    const value = this.fixedByte()
+    if (value === 0) {
+      return false
+    }
+    if (value === 1) {
+      return true
+    }
+    throw new RangeError(`unsupported postcard bool ${value}`)
+  }
+
   bytes(): Uint8Array {
     const length = this.uint()
     return this.fixedBytes(length)
@@ -266,6 +664,15 @@ class PostcardReader {
     const out = copyBytes(this.#bytes.subarray(this.#offset, endOffset))
     this.#offset = endOffset
     return out
+  }
+
+  private fixedByte(): number {
+    const value = this.#bytes[this.#offset]
+    if (value === undefined) {
+      throw new RangeError('not enough bytes for postcard byte')
+    }
+    this.#offset += 1
+    return value
   }
 
   requireDone(): void {
