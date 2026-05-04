@@ -60,6 +60,12 @@ struct Cli {
     #[arg(long)]
     relay: Option<String>,
     #[arg(long)]
+    pkarr_network: Option<PkarrNetworkArg>,
+    #[arg(long)]
+    pkarr_relay: Vec<String>,
+    #[arg(long)]
+    pkarr_bootstrap: Vec<SocketAddr>,
+    #[arg(long)]
     data_dir: Option<PathBuf>,
     #[arg(long)]
     log: Option<String>,
@@ -83,11 +89,29 @@ impl Cli {
         } else {
             self.transport
         };
+        let pkarr_network = self
+            .pkarr_network
+            .or(file.pkarr_network)
+            .unwrap_or_default();
+        let pkarr_relays = if self.pkarr_relay.is_empty() {
+            file.pkarr_relays.unwrap_or_default()
+        } else {
+            self.pkarr_relay
+        };
+        let pkarr_bootstrap = if self.pkarr_bootstrap.is_empty() {
+            file.pkarr_bootstrap.unwrap_or_default()
+        } else {
+            self.pkarr_bootstrap
+        };
 
         if listen_ws.is_none() && listen_unix.is_none() {
             bail!("at least one listener is required");
         }
         validate_transport_flags(&transports)?;
+        let transports = enabled_transports(&transports);
+        if transports.contains(&"pkarr") {
+            validate_pkarr_network(pkarr_network)?;
+        }
         #[cfg(not(all(feature = "unix-socket", unix)))]
         if listen_unix.is_some() {
             bail!("unix socket listener requires unix-socket feature on unix platforms");
@@ -107,8 +131,11 @@ impl Cli {
             listen_ws,
             listen_unix,
             peers,
-            transports: enabled_transports(&transports),
+            transports,
             relay: self.relay.or(file.relay),
+            pkarr_network,
+            pkarr_relays,
+            pkarr_bootstrap,
             data_dir: self.data_dir.or(file.data_dir),
             log: self.log.or(file.log).unwrap_or_else(|| "info".to_owned()),
         })
@@ -127,6 +154,9 @@ struct FileConfig {
     peers: Option<Vec<String>>,
     transports: Option<Vec<TransportFlag>>,
     relay: Option<String>,
+    pkarr_network: Option<PkarrNetworkArg>,
+    pkarr_relays: Option<Vec<String>>,
+    pkarr_bootstrap: Option<Vec<SocketAddr>>,
     data_dir: Option<PathBuf>,
     log: Option<String>,
 }
@@ -140,6 +170,12 @@ struct AgentConfig {
     peers: Vec<PeerCard>,
     transports: Vec<&'static str>,
     relay: Option<String>,
+    #[cfg_attr(not(feature = "pkarr"), allow(dead_code))]
+    pkarr_network: PkarrNetworkArg,
+    #[cfg_attr(not(feature = "pkarr"), allow(dead_code))]
+    pkarr_relays: Vec<String>,
+    #[cfg_attr(not(feature = "pkarr"), allow(dead_code))]
+    pkarr_bootstrap: Vec<SocketAddr>,
     data_dir: Option<PathBuf>,
     log: String,
 }
@@ -179,6 +215,28 @@ impl TransportFlag {
             Self::Iroh => cfg!(feature = "iroh"),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PkarrNetworkArg {
+    #[default]
+    Relays,
+    Dht,
+    Both,
+}
+
+impl PkarrNetworkArg {
+    const fn requires_dht(self) -> bool {
+        matches!(self, Self::Dht | Self::Both)
+    }
+}
+
+fn validate_pkarr_network(network: PkarrNetworkArg) -> anyhow::Result<()> {
+    if network.requires_dht() && !cfg!(feature = "pkarr-dht") {
+        bail!("pkarr DHT mode requires the 'pkarr-dht' feature");
+    }
+    Ok(())
 }
 
 pub async fn run_from_env() -> anyhow::Result<()> {
@@ -740,7 +798,7 @@ fn configure_transports(config: &AgentConfig, peer_config: &mut PeerConfig) -> a
 
     #[cfg(feature = "pkarr")]
     if config.transports.contains(&"pkarr") {
-        peer_config.pkarr = Some(enlace::PkarrConfig::default());
+        peer_config.pkarr = Some(build_pkarr_config(config));
     }
 
     #[cfg(feature = "iroh")]
@@ -749,6 +807,23 @@ fn configure_transports(config: &AgentConfig, peer_config: &mut PeerConfig) -> a
     }
 
     Ok(())
+}
+
+#[cfg(feature = "pkarr")]
+fn build_pkarr_config(config: &AgentConfig) -> enlace::PkarrConfig {
+    let mut pkarr = enlace::PkarrConfig {
+        network: match config.pkarr_network {
+            PkarrNetworkArg::Relays => enlace::PkarrNetworkMode::Relays,
+            PkarrNetworkArg::Dht => enlace::PkarrNetworkMode::Dht,
+            PkarrNetworkArg::Both => enlace::PkarrNetworkMode::Both,
+        },
+        ..enlace::PkarrConfig::default()
+    };
+    if !config.pkarr_relays.is_empty() {
+        pkarr.resolvers.clone_from(&config.pkarr_relays);
+    }
+    pkarr.bootstrap.clone_from(&config.pkarr_bootstrap);
+    pkarr
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -1147,6 +1222,45 @@ mod tests {
             peers: Vec::new(),
             transports: vec!["http"],
             relay: None,
+            pkarr_network: PkarrNetworkArg::Relays,
+            pkarr_relays: Vec::new(),
+            pkarr_bootstrap: Vec::new(),
+            data_dir: None,
+            log: "info".to_owned(),
+        }
+    }
+
+    fn cli_config() -> Cli {
+        Cli {
+            config: None,
+            seed: Some(SecretArg("01".repeat(32))),
+            token: Some(SecretArg("secret".to_owned())),
+            listen_ws: Some("127.0.0.1:3000".parse().unwrap()),
+            listen_unix: None,
+            peer: Vec::new(),
+            transport: Vec::new(),
+            relay: None,
+            pkarr_network: None,
+            pkarr_relay: Vec::new(),
+            pkarr_bootstrap: Vec::new(),
+            data_dir: None,
+            log: None,
+        }
+    }
+
+    #[cfg(feature = "pkarr")]
+    fn pkarr_agent_config(network: PkarrNetworkArg) -> AgentConfig {
+        AgentConfig {
+            seed: [1; 32],
+            token: None,
+            listen_ws: Some("127.0.0.1:0".parse().unwrap()),
+            listen_unix: None,
+            peers: Vec::new(),
+            transports: vec!["pkarr"],
+            relay: None,
+            pkarr_network: network,
+            pkarr_relays: Vec::new(),
+            pkarr_bootstrap: Vec::new(),
             data_dir: None,
             log: "info".to_owned(),
         }
@@ -1184,6 +1298,9 @@ mod tests {
                 peers,
                 transports: vec!["http"],
                 relay: None,
+                pkarr_network: PkarrNetworkArg::Relays,
+                pkarr_relays: Vec::new(),
+                pkarr_bootstrap: Vec::new(),
                 data_dir: None,
                 log: "info".to_owned(),
             },
@@ -1523,6 +1640,9 @@ mod tests {
             peer: Vec::new(),
             transport: Vec::new(),
             relay: None,
+            pkarr_network: None,
+            pkarr_relay: Vec::new(),
+            pkarr_bootstrap: Vec::new(),
             data_dir: None,
             log: None,
         };
@@ -1545,6 +1665,9 @@ mod tests {
             peer: Vec::new(),
             transport: Vec::new(),
             relay: None,
+            pkarr_network: None,
+            pkarr_relay: Vec::new(),
+            pkarr_bootstrap: Vec::new(),
             data_dir: None,
             log: None,
         };
@@ -1591,6 +1714,9 @@ log = "debug"
             peer: Vec::new(),
             transport: Vec::new(),
             relay: None,
+            pkarr_network: None,
+            pkarr_relay: Vec::new(),
+            pkarr_bootstrap: Vec::new(),
             data_dir: None,
             log: None,
         }
@@ -1644,6 +1770,9 @@ log = "debug"
             peer: Vec::new(),
             transport: Vec::new(),
             relay: Some("https://cli-relay.example.com".to_owned()),
+            pkarr_network: None,
+            pkarr_relay: Vec::new(),
+            pkarr_bootstrap: Vec::new(),
             data_dir: Some(cli_data_dir.clone()),
             log: Some("trace".to_owned()),
         }
@@ -1685,6 +1814,9 @@ log = "debug"
             peer: Vec::new(),
             transport: vec![flag],
             relay: None,
+            pkarr_network: None,
+            pkarr_relay: Vec::new(),
+            pkarr_bootstrap: Vec::new(),
             data_dir: None,
             log: None,
         };
@@ -1696,6 +1828,202 @@ log = "debug"
         let message = err.to_string();
         assert!(message.contains(name));
         assert!(message.contains("not enabled"));
+    }
+
+    #[test]
+    fn pkarr_network_defaults_to_relays_when_unset() {
+        let config = cli_config().load().unwrap();
+
+        assert_eq!(config.pkarr_network, PkarrNetworkArg::Relays);
+        assert!(config.pkarr_relays.is_empty());
+        assert!(config.pkarr_bootstrap.is_empty());
+    }
+
+    #[test]
+    fn pkarr_cli_flags_populate_agent_config() {
+        let bootstrap: SocketAddr = "203.0.113.7:6881".parse().unwrap();
+        let mut cli = cli_config();
+        cli.pkarr_relay = vec!["https://pkarr.example.com".to_owned()];
+        cli.pkarr_bootstrap = vec![bootstrap];
+        let config = cli.load().unwrap();
+
+        assert_eq!(config.pkarr_network, PkarrNetworkArg::Relays);
+        assert_eq!(
+            config.pkarr_relays,
+            vec!["https://pkarr.example.com".to_owned()]
+        );
+        assert_eq!(config.pkarr_bootstrap, vec![bootstrap]);
+    }
+
+    #[test]
+    fn pkarr_config_file_supplies_pkarr_settings() {
+        let config_path = temp_path_for_test("pkarr.toml");
+        let seed_path = temp_path_for_test("pkarr-seed");
+        std::fs::write(&seed_path, "01".repeat(32)).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+seed_file = {}
+token = "secret"
+listen_ws = "127.0.0.1:3000"
+pkarr_relays = ["https://file.example.com"]
+pkarr_bootstrap = ["198.51.100.1:6881"]
+"#,
+                toml_string(seed_path.display())
+            ),
+        )
+        .unwrap();
+
+        let mut cli = cli_config();
+        cli.config = Some(config_path.clone());
+        cli.seed = None;
+        cli.token = None;
+        cli.listen_ws = None;
+        let config = cli.load().unwrap();
+
+        assert_eq!(
+            config.pkarr_relays,
+            vec!["https://file.example.com".to_owned()]
+        );
+        assert_eq!(
+            config.pkarr_bootstrap,
+            vec!["198.51.100.1:6881".parse::<SocketAddr>().unwrap()]
+        );
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(seed_path);
+    }
+
+    #[test]
+    fn pkarr_cli_flags_override_pkarr_config_file() {
+        let config_path = temp_path_for_test("pkarr-override.toml");
+        let seed_path = temp_path_for_test("pkarr-override-seed");
+        std::fs::write(&seed_path, "01".repeat(32)).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+seed_file = {}
+token = "secret"
+listen_ws = "127.0.0.1:3000"
+pkarr_relays = ["https://file.example.com"]
+pkarr_bootstrap = ["198.51.100.1:6881"]
+"#,
+                toml_string(seed_path.display())
+            ),
+        )
+        .unwrap();
+
+        let cli_bootstrap: SocketAddr = "203.0.113.7:6881".parse().unwrap();
+        let mut cli = cli_config();
+        cli.config = Some(config_path.clone());
+        cli.seed = None;
+        cli.token = None;
+        cli.listen_ws = None;
+        cli.pkarr_relay = vec!["https://cli.example.com".to_owned()];
+        cli.pkarr_bootstrap = vec![cli_bootstrap];
+        let config = cli.load().unwrap();
+
+        assert_eq!(
+            config.pkarr_relays,
+            vec!["https://cli.example.com".to_owned()]
+        );
+        assert_eq!(config.pkarr_bootstrap, vec![cli_bootstrap]);
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(seed_path);
+    }
+
+    #[test]
+    #[cfg(all(feature = "pkarr", not(feature = "pkarr-dht")))]
+    fn pkarr_dht_mode_rejected_without_feature() {
+        let mut cli = cli_config();
+        cli.transport = vec![TransportFlag::Pkarr];
+        cli.pkarr_network = Some(PkarrNetworkArg::Dht);
+
+        let Err(err) = cli.load() else {
+            panic!("expected config error");
+        };
+
+        assert!(err.to_string().contains("pkarr-dht"));
+    }
+
+    #[test]
+    #[cfg(all(feature = "http", not(feature = "pkarr-dht")))]
+    fn unused_pkarr_dht_mode_does_not_reject_http_only_config() {
+        let mut cli = cli_config();
+        cli.transport = vec![TransportFlag::Http];
+        cli.pkarr_network = Some(PkarrNetworkArg::Dht);
+
+        let config = cli.load().unwrap();
+
+        assert_eq!(config.transports, vec!["http"]);
+    }
+
+    #[test]
+    #[cfg(feature = "pkarr-dht")]
+    fn pkarr_dht_mode_accepted_with_feature() {
+        let bootstrap: SocketAddr = "203.0.113.7:6881".parse().unwrap();
+        let mut cli = cli_config();
+        cli.transport = vec![TransportFlag::Pkarr];
+        cli.pkarr_network = Some(PkarrNetworkArg::Dht);
+        cli.pkarr_bootstrap = vec![bootstrap];
+        let config = cli.load().unwrap();
+
+        assert_eq!(config.pkarr_network, PkarrNetworkArg::Dht);
+        assert_eq!(config.pkarr_bootstrap, vec![bootstrap]);
+    }
+
+    #[cfg(feature = "pkarr")]
+    #[test]
+    fn build_pkarr_config_keeps_default_resolvers_when_relays_unset() {
+        let agent = pkarr_agent_config(PkarrNetworkArg::Relays);
+
+        let pkarr = build_pkarr_config(&agent);
+
+        assert_eq!(pkarr.network, enlace::PkarrNetworkMode::Relays);
+        assert_eq!(pkarr.resolvers, enlace::PkarrConfig::default().resolvers);
+        assert!(pkarr.bootstrap.is_empty());
+    }
+
+    #[cfg(feature = "pkarr")]
+    #[test]
+    fn build_pkarr_config_uses_cli_relays() {
+        let mut agent = pkarr_agent_config(PkarrNetworkArg::Relays);
+        agent.pkarr_relays = vec!["https://pkarr.example.com".to_owned()];
+
+        let pkarr = build_pkarr_config(&agent);
+
+        assert_eq!(
+            pkarr.resolvers,
+            vec!["https://pkarr.example.com".to_owned()]
+        );
+        assert!(pkarr.bootstrap.is_empty());
+    }
+
+    #[cfg(feature = "pkarr-dht")]
+    #[test]
+    fn build_pkarr_config_uses_dht_bootstrap() {
+        let bootstrap: SocketAddr = "203.0.113.7:6881".parse().unwrap();
+        let mut agent = pkarr_agent_config(PkarrNetworkArg::Dht);
+        agent.pkarr_bootstrap = vec![bootstrap];
+
+        let pkarr = build_pkarr_config(&agent);
+
+        assert_eq!(pkarr.network, enlace::PkarrNetworkMode::Dht);
+        assert_eq!(pkarr.bootstrap, vec![bootstrap]);
+    }
+
+    #[cfg(feature = "pkarr-dht")]
+    #[test]
+    fn build_pkarr_config_maps_dht_and_both_modes() {
+        assert_eq!(
+            build_pkarr_config(&pkarr_agent_config(PkarrNetworkArg::Dht)).network,
+            enlace::PkarrNetworkMode::Dht,
+        );
+        assert_eq!(
+            build_pkarr_config(&pkarr_agent_config(PkarrNetworkArg::Both)).network,
+            enlace::PkarrNetworkMode::Both,
+        );
     }
 
     #[tokio::test]
