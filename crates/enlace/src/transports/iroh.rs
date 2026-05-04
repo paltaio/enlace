@@ -278,6 +278,7 @@ impl IrohTransport {
         if let Ok(addr) = endpoint_addr(&peer) {
             self.inner.memory_lookup.add_endpoint_info(addr);
         }
+        let endpoint = EndpointId::from_bytes(&peer.endpoint_id).ok();
 
         {
             let mut peers = self
@@ -289,9 +290,9 @@ impl IrohTransport {
                 .iter_mut()
                 .find(|existing| existing.endpoint_id == peer.endpoint_id)
             {
-                *existing = peer.clone();
+                *existing = peer;
             } else {
-                peers.push(peer.clone());
+                peers.push(peer);
             }
         }
 
@@ -299,7 +300,7 @@ impl IrohTransport {
         // empty bootstrap, so the gossip mesh has nothing to dial. Push the
         // new endpoint into every live topic sender so swarm formation kicks
         // in for messages that are already buffered.
-        let Ok(endpoint) = EndpointId::from_bytes(&peer.endpoint_id) else {
+        let Some(endpoint) = endpoint else {
             return;
         };
         let topics: Vec<Arc<TopicState>> = self
@@ -372,7 +373,7 @@ impl IrohTransport {
                                 state.record_slot(version, sealed);
                             }
                         }
-                        _ => {}
+                        Event::Lagged => {}
                     }
                 }
             });

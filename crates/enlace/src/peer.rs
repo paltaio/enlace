@@ -59,6 +59,17 @@ const GROUP_ENVELOPE_RECORD_VERSION: u8 = 1;
 const PEER_SLOT_INNER_VERSION: u8 = 1;
 const PEER_SLOT_WATCH_BUFFER: usize = 64;
 
+type PeerSendTask = crate::runtime::BoxedFuture<(TransportKind, Result<(), TransportError>)>;
+type PeerRecvTask = crate::runtime::BoxedFuture<(
+    TransportKind,
+    PeerAddress,
+    Result<Option<Vec<u8>>, TransportError>,
+)>;
+type PeerSlotGetTask = crate::runtime::BoxedFuture<(
+    TransportKind,
+    Result<Option<(u64, Vec<u8>)>, TransportError>,
+)>;
+
 /// Failure modes for public-key peer envelopes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerEnvelopeError {
@@ -1170,13 +1181,7 @@ impl PeerMailbox<'_> {
 
     pub async fn recv_timeout(&self, wait: Duration) -> Result<PeerMailboxMessage, RecvError> {
         loop {
-            let mut tasks: FuturesUnordered<
-                crate::runtime::BoxedFuture<(
-                    TransportKind,
-                    PeerAddress,
-                    Result<Option<Vec<u8>>, TransportError>,
-                )>,
-            > = FuturesUnordered::new();
+            let mut tasks: FuturesUnordered<PeerRecvTask> = FuturesUnordered::new();
             let addresses = self.recv_addresses();
             for endpoint in &self.namespace.transports {
                 for address in &addresses {
@@ -1233,9 +1238,7 @@ impl PeerMailbox<'_> {
         addresses: &[PeerAddress],
         bytes: Vec<u8>,
     ) -> Result<PeerSendReport, PeerSendError> {
-        let mut tasks: FuturesUnordered<
-            crate::runtime::BoxedFuture<(TransportKind, Result<(), TransportError>)>,
-        > = FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<PeerSendTask> = FuturesUnordered::new();
         for endpoint in &self.namespace.transports {
             for address in addresses {
                 let transport = Arc::clone(&endpoint.transport);
@@ -1448,9 +1451,7 @@ impl PeerSlot<'_> {
         version: u64,
         bytes: Vec<u8>,
     ) -> Result<PeerSlotPutReport, PeerSlotError> {
-        let mut tasks: FuturesUnordered<
-            crate::runtime::BoxedFuture<(TransportKind, Result<(), TransportError>)>,
-        > = FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<PeerSendTask> = FuturesUnordered::new();
         for endpoint in &self.namespace.transports {
             for address in addresses {
                 let transport = Arc::clone(&endpoint.transport);
@@ -1487,12 +1488,7 @@ impl PeerSlot<'_> {
         address: PeerAddress,
         scope: PeerSlotScope,
     ) -> Result<Option<PeerSlotValue>, PeerSlotError> {
-        let mut tasks: FuturesUnordered<
-            crate::runtime::BoxedFuture<(
-                TransportKind,
-                Result<Option<(u64, Vec<u8>)>, TransportError>,
-            )>,
-        > = FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<PeerSlotGetTask> = FuturesUnordered::new();
         for endpoint in &self.namespace.transports {
             let transport = Arc::clone(&endpoint.transport);
             let id = peer_transport_id(endpoint.kind, address, ChannelKind::Slot, &self.name);

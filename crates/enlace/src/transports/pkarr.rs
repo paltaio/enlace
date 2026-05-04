@@ -17,6 +17,7 @@ use crate::error::TransportError;
 use crate::transports::{MailboxTransport, SlotTransport, SlotWatchStream};
 
 const DEFAULT_RECORD_TTL: u32 = 300;
+const MAX_PUBLISH_ATTEMPTS: usize = 3;
 const RECORD_PREFIX: &str = "enlace-slot-v1";
 const WATCH_BUFFER: usize = 64;
 
@@ -102,9 +103,8 @@ impl SlotTransport for PkarrTransport {
         // CAS timestamp on one relay surfaces as Concurrency even though our
         // version isn't really stale. Re-resolve and retry a few times before
         // giving up; a true stale version still fails after the loop.
-        const MAX_ATTEMPTS: usize = 3;
         let mut last_err: Option<TransportError> = None;
-        for _ in 0..MAX_ATTEMPTS {
+        for _ in 0..MAX_PUBLISH_ATTEMPTS {
             let current = self.resolve_packet_for(&id.public_key).await;
             if current
                 .as_ref()

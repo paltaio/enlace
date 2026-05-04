@@ -28,6 +28,14 @@ pub(crate) struct TransportEndpoint {
     pub(crate) transport: Arc<dyn Transport>,
 }
 
+type TransportSendTask = crate::runtime::BoxedFuture<(TransportKind, Result<(), TransportError>)>;
+type TransportRecvTask =
+    crate::runtime::BoxedFuture<(TransportKind, Result<Option<Vec<u8>>, TransportError>)>;
+type TransportSlotGetTask = crate::runtime::BoxedFuture<(
+    TransportKind,
+    Result<Option<(u64, Vec<u8>)>, TransportError>,
+)>;
+
 pub(crate) struct Coordinator {
     seed: Zeroizing<[u8; 32]>,
     transports: Vec<TransportEndpoint>,
@@ -87,9 +95,7 @@ impl Coordinator {
         payload: &[u8],
     ) -> Result<SendReport, SendError> {
         let sealed = self.seal(ChannelKind::Mailbox, name, payload, None)?;
-        let mut tasks: FuturesUnordered<
-            crate::runtime::BoxedFuture<(TransportKind, Result<(), TransportError>)>,
-        > = FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<TransportSendTask> = FuturesUnordered::new();
 
         for endpoint in &self.transports {
             let transport = Arc::clone(&endpoint.transport);
@@ -125,12 +131,7 @@ impl Coordinator {
         dedup: &std::sync::Mutex<Dedup>,
     ) -> Result<RecvMessage, RecvError> {
         loop {
-            let mut tasks: FuturesUnordered<
-                crate::runtime::BoxedFuture<(
-                    TransportKind,
-                    Result<Option<Vec<u8>>, TransportError>,
-                )>,
-            > = FuturesUnordered::new();
+            let mut tasks: FuturesUnordered<TransportRecvTask> = FuturesUnordered::new();
             for endpoint in &self.transports {
                 let transport = Arc::clone(&endpoint.transport);
                 let id =
@@ -184,9 +185,7 @@ impl Coordinator {
     }
 
     pub(crate) async fn mailbox_subscribe(&self, name: &str) -> Result<(), RecvError> {
-        let mut tasks: FuturesUnordered<
-            crate::runtime::BoxedFuture<(TransportKind, Result<(), TransportError>)>,
-        > = FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<TransportSendTask> = FuturesUnordered::new();
         for endpoint in &self.transports {
             let transport = Arc::clone(&endpoint.transport);
             let id = transport_channel_id(&self.seed, endpoint.kind, ChannelKind::Mailbox, name)
@@ -222,9 +221,7 @@ impl Coordinator {
     ) -> Result<PutReport, SlotError> {
         let version = self.state.next_local_slot_version(name)?;
         let sealed = self.seal(ChannelKind::Slot, name, payload, Some(version))?;
-        let mut tasks: FuturesUnordered<
-            crate::runtime::BoxedFuture<(TransportKind, Result<(), TransportError>)>,
-        > = FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<TransportSendTask> = FuturesUnordered::new();
 
         for endpoint in &self.transports {
             let transport = Arc::clone(&endpoint.transport);
@@ -258,12 +255,7 @@ impl Coordinator {
     }
 
     pub(crate) async fn slot_get(&self, name: &str) -> Result<Option<SlotValue>, SlotError> {
-        let mut tasks: FuturesUnordered<
-            crate::runtime::BoxedFuture<(
-                TransportKind,
-                Result<Option<(u64, Vec<u8>)>, TransportError>,
-            )>,
-        > = FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<TransportSlotGetTask> = FuturesUnordered::new();
         for endpoint in &self.transports {
             let transport = Arc::clone(&endpoint.transport);
             let id = transport_channel_id(&self.seed, endpoint.kind, ChannelKind::Slot, name)
