@@ -17,7 +17,8 @@ use crate::error::TransportError;
 use crate::transports::{MailboxTransport, SlotTransport, SlotWatchStream};
 
 const DEFAULT_RECORD_TTL: u32 = 300;
-const MAX_PUBLISH_ATTEMPTS: usize = 3;
+const MAX_PUBLISH_ATTEMPTS: usize = 4;
+const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(50);
 const RECORD_PREFIX: &str = "enlace-slot-v1";
 const WATCH_BUFFER: usize = 64;
 
@@ -64,6 +65,21 @@ impl PkarrTransport {
         self.client.resolve_most_recent(public_key).await
     }
 
+    /// Block until the underlying mainline DHT has finished bootstrapping.
+    /// Used to absorb the empty-routing-table window right after a fresh
+    /// client is constructed; a no-op when the DHT is disabled (relay-only
+    /// mode, or wasm builds without the DHT feature).
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn wait_for_bootstrap(&self) {
+        let Some(dht) = self.client.dht() else {
+            return;
+        };
+        let _ = tokio::task::spawn_blocking(move || dht.bootstrapped()).await;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn wait_for_bootstrap(&self) {}
+
     async fn slot_get_since(
         &self,
         id: PkarrSlotId,
@@ -109,12 +125,15 @@ impl MailboxTransport for PkarrTransport {
 impl SlotTransport for PkarrTransport {
     async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
         let id = self.pkarr_slot_id(id)?;
-        // pkarr's client cache and individual relays can diverge: a stale
-        // CAS timestamp on one relay surfaces as Concurrency even though our
-        // version isn't really stale. Re-resolve and retry a few times before
-        // giving up; a true stale version still fails after the loop.
+        // Two transient conditions justify a retry:
+        //   * Concurrency: a stale CAS on one relay or DHT node surfaces even
+        //     though our version isn't really stale; re-resolve and retry.
+        //   * NoClosestNodes / BadRequest: the routing table or relay set
+        //     wasn't ready yet (typical right after construction). Wait for
+        //     bootstrap and retry. A true stale version still fails after
+        //     the loop, as does a persistent unreachable network.
         let mut last_err: Option<TransportError> = None;
-        for _ in 0..MAX_PUBLISH_ATTEMPTS {
+        for attempt in 0..MAX_PUBLISH_ATTEMPTS {
             let current = self.resolve_packet_for(&id.public_key).await;
             if current
                 .as_ref()
@@ -138,11 +157,22 @@ impl SlotTransport for PkarrTransport {
             match self.client.publish(&packet, cas).await {
                 Ok(()) => return Ok(()),
                 Err(err) => {
-                    let mapped = map_publish_error(err);
-                    if !matches!(mapped, TransportError::Stale) {
-                        return Err(mapped);
+                    if !is_transient_publish_error(&err) {
+                        return Err(map_publish_error(err));
                     }
-                    last_err = Some(mapped);
+                    let needs_bootstrap = matches!(
+                        err,
+                        pkarr::errors::PublishError::Query(
+                            pkarr::errors::QueryError::NoClosestNodes,
+                        )
+                    );
+                    last_err = Some(map_publish_error(err));
+                    if attempt + 1 < MAX_PUBLISH_ATTEMPTS {
+                        if needs_bootstrap {
+                            self.wait_for_bootstrap().await;
+                        }
+                        crate::runtime::sleep(PUBLISH_RETRY_DELAY).await;
+                    }
                 }
             }
         }
@@ -394,6 +424,19 @@ fn map_publish_error(err: pkarr::errors::PublishError) -> TransportError {
     }
 }
 
+/// Classify whether a publish error is worth retrying. `Concurrency` reflects
+/// a CAS race that can clear once we re-resolve. `NoClosestNodes` /
+/// `BadRequest` reflect a not-yet-ready DHT or relay set that should clear
+/// once bootstrap completes. Everything else is reported as-is.
+fn is_transient_publish_error(err: &pkarr::errors::PublishError) -> bool {
+    use pkarr::errors::{PublishError, QueryError};
+    matches!(
+        err,
+        PublishError::Concurrency(_)
+            | PublishError::Query(QueryError::NoClosestNodes | QueryError::BadRequest)
+    )
+}
+
 fn map_other_error<E>(err: E) -> TransportError
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -507,6 +550,37 @@ mod tests {
             !matches!(mapped, TransportError::Stale),
             "unexpected-response errors must abort the retry loop, not retry: got {mapped:?}",
         );
+    }
+
+    #[test]
+    fn no_closest_nodes_is_classified_transient() {
+        use pkarr::errors::{ConcurrencyError, PublishError, QueryError};
+
+        // Bootstrap-not-ready and relay-not-ready states must drive a retry,
+        // otherwise a fresh client racing its first put against an empty
+        // routing table fails permanently instead of waiting for bootstrap.
+        assert!(is_transient_publish_error(&PublishError::Query(
+            QueryError::NoClosestNodes,
+        )));
+        assert!(is_transient_publish_error(&PublishError::Query(
+            QueryError::BadRequest,
+        )));
+        assert!(is_transient_publish_error(&PublishError::Concurrency(
+            ConcurrencyError::CasFailed,
+        )));
+
+        // Hard errors must not retry: a timeout already exhausted its budget,
+        // an unexpected response indicates a misconfigured peer, and an
+        // explicit DHT error response is authoritative.
+        assert!(!is_transient_publish_error(&PublishError::Query(
+            QueryError::Timeout,
+        )));
+        assert!(!is_transient_publish_error(&PublishError::Query(
+            QueryError::DhtErrorResponse(203, "boom".to_owned()),
+        )));
+        assert!(!is_transient_publish_error(
+            &PublishError::UnexpectedResponses,
+        ));
     }
 
     #[test]
