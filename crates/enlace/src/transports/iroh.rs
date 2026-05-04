@@ -13,19 +13,19 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, TransportAdd
 use iroh_gossip::api::{Event, GossipSender};
 use iroh_gossip::{Gossip, TopicId};
 use tokio::sync::{Notify, broadcast, mpsc};
-use tokio::task::JoinHandle;
-use tokio::time::{Instant, timeout, timeout_at};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::{IrohConfig, IrohEndpointAddr, IrohRelayMode};
 use crate::error::TransportError;
+use crate::runtime::{Instant, timeout_at};
 use crate::state::{StateError, StateStore};
 use crate::transports::{MailboxTransport, SlotTransport, SlotWatchStream};
 
 const WATCH_BUFFER: usize = 64;
 const SLOT_HEADER_LEN: usize = 8;
-const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum broadcasts buffered while waiting for the first neighbor on a topic.
+const MAX_PENDING_BROADCASTS: usize = 64;
 
 #[derive(Clone)]
 pub struct IrohTransport {
@@ -56,7 +56,49 @@ struct TopicState {
     mailbox_notify: Notify,
     slot: RwLock<Option<(u64, Vec<u8>)>>,
     slot_updates: broadcast::Sender<(u64, Vec<u8>)>,
-    task: JoinHandle<()>,
+    task: crate::runtime::AbortHandle,
+    neighbor_state: Mutex<NeighborState>,
+}
+
+struct NeighborState {
+    neighbors: HashSet<EndpointId>,
+    pending_broadcasts: VecDeque<Vec<u8>>,
+}
+
+impl NeighborState {
+    fn new(neighbors: HashSet<EndpointId>) -> Self {
+        Self {
+            neighbors,
+            pending_broadcasts: VecDeque::new(),
+        }
+    }
+
+    fn mark_up(&mut self, peer: EndpointId) -> Vec<Vec<u8>> {
+        let was_empty = self.neighbors.is_empty();
+        self.neighbors.insert(peer);
+        if was_empty {
+            self.pending_broadcasts.drain(..).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn mark_down(&mut self, peer: EndpointId) {
+        self.neighbors.remove(&peer);
+    }
+
+    fn queue_or_send(&mut self, message: Vec<u8>) -> Result<Option<Vec<u8>>, TransportError> {
+        if !self.neighbors.is_empty() {
+            return Ok(Some(message));
+        }
+        if self.pending_broadcasts.len() >= MAX_PENDING_BROADCASTS {
+            return Err(TransportError::Network(
+                "iroh pending broadcast queue is full".to_owned(),
+            ));
+        }
+        self.pending_broadcasts.push_back(message);
+        Ok(None)
+    }
 }
 
 #[derive(Debug)]
@@ -168,6 +210,15 @@ impl IrohTransport {
         endpoint_addr_to_config(&self.inner.endpoint.addr())
     }
 
+    /// Resolves once the endpoint has completed at least one relay handshake.
+    /// After this returns, [`endpoint_addr`] is populated with the home relay
+    /// URL and the node is reachable through that relay.
+    ///
+    /// [`endpoint_addr`]: Self::endpoint_addr
+    pub async fn online(&self) {
+        self.inner.endpoint.online().await;
+    }
+
     #[must_use]
     pub fn peers(&self) -> Vec<IrohEndpointAddr> {
         self.inner
@@ -228,18 +279,42 @@ impl IrohTransport {
             self.inner.memory_lookup.add_endpoint_info(addr);
         }
 
-        let mut peers = self
-            .inner
-            .peers
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = peers
-            .iter_mut()
-            .find(|existing| existing.endpoint_id == peer.endpoint_id)
         {
-            *existing = peer;
-        } else {
-            peers.push(peer);
+            let mut peers = self
+                .inner
+                .peers
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(existing) = peers
+                .iter_mut()
+                .find(|existing| existing.endpoint_id == peer.endpoint_id)
+            {
+                *existing = peer.clone();
+            } else {
+                peers.push(peer.clone());
+            }
+        }
+
+        // Topics that subscribed before this peer existed were spawned with an
+        // empty bootstrap, so the gossip mesh has nothing to dial. Push the
+        // new endpoint into every live topic sender so swarm formation kicks
+        // in for messages that are already buffered.
+        let Ok(endpoint) = EndpointId::from_bytes(&peer.endpoint_id) else {
+            return;
+        };
+        let topics: Vec<Arc<TopicState>> = self
+            .inner
+            .topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for topic in topics {
+            let sender = topic.sender.clone();
+            crate::runtime::spawn(async move {
+                let _ = sender.join_peers(vec![endpoint]).await;
+            });
         }
     }
 
@@ -251,53 +326,53 @@ impl IrohTransport {
             .clear();
     }
 
-    async fn ensure_topic(
-        &self,
-        id: &[u8],
-        wait_for_join: bool,
-    ) -> Result<Arc<TopicState>, TransportError> {
-        if let Some(topic) = self
-            .inner
-            .topics
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(id)
-            .cloned()
-        {
+    async fn ensure_topic(&self, id: &[u8]) -> Result<Arc<TopicState>, TransportError> {
+        // Hold the topics mutex only across the synchronous lookup; awaiting
+        // gossip while the lock is held would deadlock the single-threaded
+        // wasm runtime if another task tried to subscribe concurrently.
+        let cached = {
+            let topics = self
+                .inner
+                .topics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            topics.get(id).cloned()
+        };
+        if let Some(topic) = cached {
             return Ok(topic);
         }
 
         let topic_id = topic_id(id)?;
         let bootstrap = self.bootstrap_peers();
-        let has_bootstrap = !bootstrap.is_empty();
-        let mut topic = self
+        let topic = self
             .inner
             .gossip
             .subscribe(topic_id, bootstrap)
             .await
             .map_err(map_gossip_error)?;
-        if wait_for_join && has_bootstrap {
-            timeout(JOIN_TIMEOUT, topic.joined())
-                .await
-                .map_err(|_| TransportError::Timeout)?
-                .map_err(map_gossip_error)?;
-        }
         let (sender, mut receiver) = topic.split();
+        let initial_neighbors: HashSet<_> = receiver.neighbors().collect();
         let (slot_updates, _) = broadcast::channel(WATCH_BUFFER);
         let state = Arc::new_cyclic(|weak: &std::sync::Weak<TopicState>| {
             let weak = weak.clone();
-            let task = tokio::spawn(async move {
+            let task = crate::runtime::spawn(async move {
                 while let Some(event) = receiver.next().await {
-                    let Ok(Event::Received(message)) = event else {
+                    let Ok(event) = event else {
                         continue;
                     };
-                    if let Some(state) = weak.upgrade() {
-                        state.record_mailbox(message.content.to_vec());
-                        if let Some((version, sealed)) = decode_slot_frame(&message.content) {
-                            state.record_slot(version, sealed);
-                        }
-                    } else {
+                    let Some(state) = weak.upgrade() else {
                         break;
+                    };
+                    match event {
+                        Event::NeighborUp(peer) => state.mark_neighbor_up(peer),
+                        Event::NeighborDown(peer) => state.mark_neighbor_down(peer),
+                        Event::Received(message) => {
+                            state.record_mailbox(message.content.to_vec());
+                            if let Some((version, sealed)) = decode_slot_frame(&message.content) {
+                                state.record_slot(version, sealed);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             });
@@ -308,15 +383,31 @@ impl IrohTransport {
                 slot: RwLock::new(None),
                 slot_updates,
                 task,
+                neighbor_state: Mutex::new(NeighborState::new(initial_neighbors)),
             }
         });
 
-        let mut topics = self
-            .inner
-            .topics
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(topics.entry(id.to_vec()).or_insert(state).clone())
+        let topic = {
+            let mut topics = self
+                .inner
+                .topics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            topics.entry(id.to_vec()).or_insert(state).clone()
+        };
+        // Bootstrap may have grown between the cache check and the subscribe
+        // call, or this topic was first subscribed with no peers. Push every
+        // currently-known peer into the live sender so the mesh forms even if
+        // the initial subscribe saw an empty list.
+        let peers = self.bootstrap_peers();
+        if !peers.is_empty() {
+            topic
+                .sender
+                .join_peers(peers)
+                .await
+                .map_err(map_gossip_error)?;
+        }
+        Ok(topic)
     }
 
     fn bootstrap_peers(&self) -> Vec<EndpointId> {
@@ -375,6 +466,55 @@ impl TopicState {
         self.mailbox_notify.notify_waiters();
     }
 
+    fn mark_neighbor_up(self: &Arc<Self>, peer: EndpointId) {
+        let pending: Vec<Vec<u8>> = {
+            let mut state = self
+                .neighbor_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.mark_up(peer)
+        };
+        if pending.is_empty() {
+            return;
+        }
+        // First neighbor — drain anything that was queued before the mesh
+        // formed and broadcast it now. iroh-gossip silently drops broadcasts
+        // when the swarm is empty, so we hold them until there's at least
+        // one peer to receive them.
+        let sender = self.sender.clone();
+        crate::runtime::spawn(async move {
+            for msg in pending {
+                let _ = sender.broadcast(msg.into()).await;
+            }
+        });
+    }
+
+    fn mark_neighbor_down(&self, peer: EndpointId) {
+        let mut state = self
+            .neighbor_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.mark_down(peer);
+    }
+
+    async fn broadcast_or_buffer(&self, message: Vec<u8>) -> Result<(), TransportError> {
+        let send_now = {
+            let mut state = self
+                .neighbor_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.queue_or_send(message)?
+        };
+        if let Some(message) = send_now {
+            return self
+                .sender
+                .broadcast(message.into())
+                .await
+                .map_err(map_gossip_error);
+        }
+        Ok(())
+    }
+
     fn record_slot(&self, version: u64, sealed: Vec<u8>) {
         let mut slot = self
             .slot
@@ -401,38 +541,36 @@ impl TopicState {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl MailboxTransport for IrohTransport {
+    async fn subscribe(&self, id: &[u8]) -> Result<(), TransportError> {
+        self.ensure_topic(id).await.map(|_| ())
+    }
+
     async fn send(&self, id: &[u8], sealed: &[u8]) -> Result<(), TransportError> {
-        let topic = self.ensure_topic(id, true).await?;
-        topic
-            .sender
-            .broadcast(sealed.to_vec().into())
-            .await
-            .map_err(map_gossip_error)
+        let topic = self.ensure_topic(id).await?;
+        topic.broadcast_or_buffer(sealed.to_vec()).await
     }
 
     async fn recv(&self, id: &[u8], wait: Duration) -> Result<Option<Vec<u8>>, TransportError> {
-        let topic = self.ensure_topic(id, false).await?;
+        let topic = self.ensure_topic(id).await?;
         topic.recv_mailbox(wait).await
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl SlotTransport for IrohTransport {
     async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError> {
-        let topic = self.ensure_topic(id, true).await?;
+        let topic = self.ensure_topic(id).await?;
         let frame = encode_slot_frame(version, sealed);
         topic.record_slot(version, sealed.to_vec());
-        topic
-            .sender
-            .broadcast(frame.into())
-            .await
-            .map_err(map_gossip_error)
+        topic.broadcast_or_buffer(frame).await
     }
 
     async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError> {
-        let topic = self.ensure_topic(id, false).await?;
+        let topic = self.ensure_topic(id).await?;
         Ok(topic.current_slot())
     }
 
@@ -441,8 +579,8 @@ impl SlotTransport for IrohTransport {
         let id = id.to_vec();
         let (tx, rx) = mpsc::channel(WATCH_BUFFER);
 
-        tokio::spawn(async move {
-            let topic = match transport.ensure_topic(&id, false).await {
+        crate::runtime::spawn(async move {
+            let topic = match transport.ensure_topic(&id).await {
                 Ok(topic) => topic,
                 Err(err) => {
                     let _ = tx.send(Err(err)).await;
@@ -495,6 +633,7 @@ async fn bind_endpoint(
         allowed_endpoints,
         active: Arc::new(Mutex::new(HashMap::new())),
     };
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret_key)
         .address_lookup(memory_lookup)
@@ -502,6 +641,10 @@ async fn bind_endpoint(
         .transport_config(transport_config)
         .hooks(conn_limit);
 
+    // IP socket binding is unavailable in the browser; iroh's wasm builder
+    // omits both `bind_addr` and `clear_ip_transports`, leaving only the
+    // relay transport. Honour `bind_addrs` only on native targets.
+    #[cfg(not(target_arch = "wasm32"))]
     if !config.bind_addrs.is_empty() {
         builder = builder.clear_ip_transports();
         for addr in &config.bind_addrs {
@@ -548,7 +691,7 @@ impl EndpointHooks for ConnLimitHook {
 
         let active = Arc::clone(&self.active);
         let conn = conn.clone();
-        tokio::spawn(async move {
+        crate::runtime::spawn(async move {
             let _ = conn.closed().await;
             let mut active = active
                 .lock()
@@ -634,6 +777,43 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use crate::state::InMemoryStateStore;
+
+    fn endpoint_id(seed: u8) -> EndpointId {
+        let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
+        EndpointId::from_bytes(secret.public().as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn neighbor_state_buffers_until_first_neighbor() {
+        let mut state = NeighborState::new(HashSet::new());
+
+        assert_eq!(state.queue_or_send(b"first".to_vec()).unwrap(), None);
+        assert_eq!(state.queue_or_send(b"second".to_vec()).unwrap(), None);
+
+        let pending = state.mark_up(endpoint_id(1));
+        assert_eq!(pending, vec![b"first".to_vec(), b"second".to_vec()]);
+        assert_eq!(
+            state.queue_or_send(b"third".to_vec()).unwrap(),
+            Some(b"third".to_vec())
+        );
+    }
+
+    #[test]
+    fn neighbor_state_rejects_full_pending_queue() {
+        let mut state = NeighborState::new(HashSet::new());
+        for i in 0..MAX_PENDING_BROADCASTS {
+            assert_eq!(
+                state.queue_or_send(vec![u8::try_from(i).unwrap()]).unwrap(),
+                None
+            );
+        }
+
+        let err = state.queue_or_send(b"overflow".to_vec()).unwrap_err();
+        assert!(matches!(err, TransportError::Network(_)));
+        let pending = state.mark_up(endpoint_id(2));
+        assert_eq!(pending.len(), MAX_PENDING_BROADCASTS);
+        assert_eq!(pending[0], vec![0]);
+    }
 
     #[tokio::test]
     async fn endpoint_id_comes_from_persisted_keypair() {
@@ -807,7 +987,7 @@ mod tests {
             relay_urls: Vec::new(),
             direct_addrs: Vec::new(),
         });
-        transport.ensure_topic(&topic, false).await.unwrap();
+        transport.ensure_topic(&topic).await.unwrap();
         assert_eq!(
             transport
                 .inner

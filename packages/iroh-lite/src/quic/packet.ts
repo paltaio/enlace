@@ -1,0 +1,339 @@
+import { copyBytes, readU8, readU32BE } from '../bytes'
+import { decodeVarIntNumber } from '../varint'
+
+export const QUIC_VERSION_1 = 0x00000001
+export const QUIC_MAX_PACKET_NUMBER = 0x3fffffffffffffffn
+export const QUIC_MAX_CONNECTION_ID_LENGTH = 20
+
+export const QuicLongHeaderPacketType = {
+  Initial: 'initial',
+  ZeroRtt: '0-rtt',
+  Handshake: 'handshake',
+  Retry: 'retry',
+} as const
+
+export type QuicLongHeaderPacketTypeValue =
+  (typeof QuicLongHeaderPacketType)[keyof typeof QuicLongHeaderPacketType]
+
+export interface QuicLongHeader {
+  readonly firstByte: number
+  readonly version: number
+  readonly packetType: QuicLongHeaderPacketTypeValue
+  readonly destinationConnectionId: Uint8Array
+  readonly sourceConnectionId: Uint8Array
+  readonly offset: number
+}
+
+export interface QuicInitialPacketHeader extends QuicLongHeader {
+  readonly packetType: typeof QuicLongHeaderPacketType.Initial
+  readonly token: Uint8Array
+  readonly length: number
+  readonly packetNumberOffset: number
+  readonly packetNumberLength: number
+  readonly packetNumber: number
+  readonly payloadOffset: number
+}
+
+export interface QuicInitialPacketHeaderPrefix extends QuicLongHeader {
+  readonly packetType: typeof QuicLongHeaderPacketType.Initial
+  readonly token: Uint8Array
+  readonly length: number
+  readonly packetNumberOffset: number
+}
+
+export interface QuicHandshakePacketHeader extends QuicLongHeader {
+  readonly packetType: typeof QuicLongHeaderPacketType.Handshake
+  readonly length: number
+  readonly packetNumberOffset: number
+  readonly packetNumberLength: number
+  readonly packetNumber: number
+  readonly payloadOffset: number
+}
+
+export interface QuicHandshakePacketHeaderPrefix extends QuicLongHeader {
+  readonly packetType: typeof QuicLongHeaderPacketType.Handshake
+  readonly length: number
+  readonly packetNumberOffset: number
+}
+
+export function parseQuicLongHeader(bytes: Uint8Array, offset = 0): QuicLongHeader {
+  const firstByte = readU8(bytes, offset)
+  if ((firstByte & 0x80) === 0) {
+    throw new RangeError('QUIC packet is not long header')
+  }
+  if ((firstByte & 0x40) === 0) {
+    throw new RangeError('QUIC fixed bit is not set')
+  }
+
+  const version = readU32BE(bytes, offset + 1)
+  let pos = offset + 5
+  const destinationConnectionIdLength = readU8(bytes, pos)
+  pos += 1
+  const destinationConnectionId = readBytes(
+    bytes,
+    pos,
+    destinationConnectionIdLength,
+    'destination connection id',
+  )
+  pos += destinationConnectionIdLength
+
+  const sourceConnectionIdLength = readU8(bytes, pos)
+  pos += 1
+  const sourceConnectionId = readBytes(bytes, pos, sourceConnectionIdLength, 'source connection id')
+  pos += sourceConnectionIdLength
+
+  return {
+    firstByte,
+    version,
+    packetType: longHeaderPacketType(firstByte),
+    destinationConnectionId,
+    sourceConnectionId,
+    offset: pos,
+  }
+}
+
+export function parseQuicInitialPacketHeader(
+  bytes: Uint8Array,
+  offset = 0,
+): QuicInitialPacketHeader {
+  const header = parseQuicInitialPacketHeaderPrefix(bytes, offset)
+  let pos = header.packetNumberOffset
+
+  const packetNumberLength = (header.firstByte & 0x03) + 1
+  const packetNumber = readQuicPacketNumber(bytes, pos, packetNumberLength)
+  pos += packetNumberLength
+
+  if (header.length < packetNumberLength) {
+    throw new RangeError('QUIC Initial length smaller than packet number')
+  }
+  if (bytes.length - pos < header.length - packetNumberLength) {
+    throw new RangeError('not enough bytes for QUIC Initial payload')
+  }
+
+  return {
+    ...header,
+    packetType: QuicLongHeaderPacketType.Initial,
+    token: header.token,
+    length: header.length,
+    packetNumberOffset: header.packetNumberOffset,
+    packetNumberLength,
+    packetNumber,
+    payloadOffset: pos,
+  }
+}
+
+export function parseQuicInitialPacketHeaderPrefix(
+  bytes: Uint8Array,
+  offset = 0,
+): QuicInitialPacketHeaderPrefix {
+  const header = parseQuicLongHeader(bytes, offset)
+  if (header.packetType !== QuicLongHeaderPacketType.Initial) {
+    throw new RangeError('QUIC packet is not Initial')
+  }
+
+  let pos = header.offset
+  const tokenLength = decodeVarIntNumber(bytes, pos)
+  pos += tokenLength.bytesRead
+  const token = readBytes(bytes, pos, tokenLength.value, 'initial token')
+  pos += tokenLength.value
+
+  const encodedLength = decodeVarIntNumber(bytes, pos)
+  pos += encodedLength.bytesRead
+
+  return {
+    ...header,
+    packetType: QuicLongHeaderPacketType.Initial,
+    token,
+    length: encodedLength.value,
+    packetNumberOffset: pos,
+  }
+}
+
+export function parseQuicHandshakePacketHeader(
+  bytes: Uint8Array,
+  offset = 0,
+): QuicHandshakePacketHeader {
+  const header = parseQuicHandshakePacketHeaderPrefix(bytes, offset)
+  let pos = header.packetNumberOffset
+
+  const packetNumberLength = (header.firstByte & 0x03) + 1
+  const packetNumber = readQuicPacketNumber(bytes, pos, packetNumberLength)
+  pos += packetNumberLength
+
+  if (header.length < packetNumberLength) {
+    throw new RangeError('QUIC Handshake length smaller than packet number')
+  }
+  if (bytes.length - pos < header.length - packetNumberLength) {
+    throw new RangeError('not enough bytes for QUIC Handshake payload')
+  }
+
+  return {
+    ...header,
+    packetType: QuicLongHeaderPacketType.Handshake,
+    length: header.length,
+    packetNumberOffset: header.packetNumberOffset,
+    packetNumberLength,
+    packetNumber,
+    payloadOffset: pos,
+  }
+}
+
+export function parseQuicHandshakePacketHeaderPrefix(
+  bytes: Uint8Array,
+  offset = 0,
+): QuicHandshakePacketHeaderPrefix {
+  const header = parseQuicLongHeader(bytes, offset)
+  if (header.packetType !== QuicLongHeaderPacketType.Handshake) {
+    throw new RangeError('QUIC packet is not Handshake')
+  }
+
+  let pos = header.offset
+  const encodedLength = decodeVarIntNumber(bytes, pos)
+  pos += encodedLength.bytesRead
+
+  return {
+    ...header,
+    packetType: QuicLongHeaderPacketType.Handshake,
+    length: encodedLength.value,
+    packetNumberOffset: pos,
+  }
+}
+
+export function readQuicPacketNumber(bytes: Uint8Array, offset: number, length: number): number {
+  if (length < 1 || length > 4) {
+    throw new RangeError('QUIC packet number length out of range')
+  }
+  if (bytes.length - offset < length) {
+    throw new RangeError('not enough bytes for QUIC packet number')
+  }
+
+  let packetNumber = 0
+  for (let index = 0; index < length; index += 1) {
+    packetNumber = packetNumber * 0x100 + readU8(bytes, offset + index)
+  }
+  return packetNumber
+}
+
+export function validateQuicConnectionIdLength(bytes: Uint8Array, name: string): void {
+  if (bytes.length > QUIC_MAX_CONNECTION_ID_LENGTH) {
+    throw new RangeError(`QUIC ${name} length out of range`)
+  }
+}
+
+export function encodeQuicTruncatedPacketNumber(
+  packetNumber: number | bigint,
+  length: number,
+): Uint8Array {
+  validatePacketNumberLength(length)
+  let remaining = quicPacketNumberToBigInt(packetNumber)
+  const bytes = new Uint8Array(length)
+  for (let index = length - 1; index >= 0; index -= 1) {
+    bytes[index] = Number(remaining & 0xffn)
+    remaining >>= 8n
+  }
+  return bytes
+}
+
+export function recoverQuicPacketNumber(
+  truncatedPacketNumber: number,
+  packetNumberLength: number,
+  expectedPacketNumber: number | bigint,
+): bigint {
+  validatePacketNumberLength(packetNumberLength)
+  validateTruncatedPacketNumber(truncatedPacketNumber, packetNumberLength)
+  const expected = quicPacketNumberToBigInt(expectedPacketNumber)
+  const packetNumberWindow = 1n << BigInt(packetNumberLength * 8)
+  const halfWindow = packetNumberWindow / 2n
+  const packetNumberMask = packetNumberWindow - 1n
+  let candidate = (expected & ~packetNumberMask) | BigInt(truncatedPacketNumber)
+
+  if (
+    candidate <= expected - halfWindow &&
+    candidate < QUIC_MAX_PACKET_NUMBER + 1n - packetNumberWindow
+  ) {
+    candidate += packetNumberWindow
+  } else if (candidate > expected + halfWindow && candidate >= packetNumberWindow) {
+    candidate -= packetNumberWindow
+  }
+
+  if (candidate > QUIC_MAX_PACKET_NUMBER) {
+    throw new RangeError('recovered QUIC packet number out of range')
+  }
+  return candidate
+}
+
+export function nextExpectedQuicPacketNumber(
+  largestReceivedPacketNumber: number | bigint | null,
+): bigint {
+  if (largestReceivedPacketNumber === null) {
+    return 0n
+  }
+  const largestReceived = quicPacketNumberToBigInt(largestReceivedPacketNumber)
+  if (largestReceived === QUIC_MAX_PACKET_NUMBER) {
+    throw new RangeError('QUIC expected packet number out of range')
+  }
+  return largestReceived + 1n
+}
+
+export function updateLargestReceivedQuicPacketNumber(
+  largestReceivedPacketNumber: number | bigint | null,
+  receivedPacketNumber: number | bigint,
+): bigint {
+  const received = quicPacketNumberToBigInt(receivedPacketNumber)
+  if (largestReceivedPacketNumber === null) {
+    return received
+  }
+  const largestReceived = quicPacketNumberToBigInt(largestReceivedPacketNumber)
+  return received > largestReceived ? received : largestReceived
+}
+
+function validatePacketNumberLength(length: number): void {
+  if (!Number.isSafeInteger(length) || length < 1 || length > 4) {
+    throw new RangeError('QUIC packet number length out of range')
+  }
+}
+
+function validateTruncatedPacketNumber(packetNumber: number, length: number): void {
+  if (!Number.isSafeInteger(packetNumber) || packetNumber < 0) {
+    throw new RangeError('QUIC truncated packet number out of range')
+  }
+  if (packetNumber >= 2 ** (8 * length)) {
+    throw new RangeError('QUIC truncated packet number out of range')
+  }
+}
+
+export function quicPacketNumberToBigInt(packetNumber: number | bigint): bigint {
+  if (typeof packetNumber === 'number') {
+    if (!Number.isSafeInteger(packetNumber) || packetNumber < 0) {
+      throw new RangeError('QUIC packet number out of range')
+    }
+    return BigInt(packetNumber)
+  }
+  if (packetNumber < 0n || packetNumber > QUIC_MAX_PACKET_NUMBER) {
+    throw new RangeError('QUIC packet number out of range')
+  }
+  return packetNumber
+}
+
+function longHeaderPacketType(firstByte: number): QuicLongHeaderPacketTypeValue {
+  const packetType = (firstByte & 0x30) >> 4
+  switch (packetType) {
+    case 0:
+      return QuicLongHeaderPacketType.Initial
+    case 1:
+      return QuicLongHeaderPacketType.ZeroRtt
+    case 2:
+      return QuicLongHeaderPacketType.Handshake
+    case 3:
+      return QuicLongHeaderPacketType.Retry
+    default:
+      throw new RangeError('QUIC long header packet type out of range')
+  }
+}
+
+function readBytes(bytes: Uint8Array, offset: number, length: number, name: string): Uint8Array {
+  if (bytes.length - offset < length) {
+    throw new RangeError(`not enough bytes for ${name}`)
+  }
+  return copyBytes(bytes.subarray(offset, offset + length))
+}

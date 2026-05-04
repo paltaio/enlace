@@ -1,7 +1,6 @@
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::Duration;
-use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
 use futures_core::Stream;
@@ -11,6 +10,7 @@ use crate::config::Config;
 use crate::config::IrohRelayMode;
 use crate::error::TransportError;
 use crate::kdf::TransportKind;
+use crate::runtime::{Instant, SystemTime};
 
 #[cfg(feature = "dht")]
 mod dht;
@@ -36,17 +36,43 @@ pub use iroh::IrohTransport;
 #[cfg(feature = "pkarr")]
 pub use pkarr::PkarrTransport;
 
+/// Threading marker that resolves to `Send + Sync` on native and is empty on
+/// wasm32. Lets transport traits and trait objects compile under both targets
+/// without duplicating bounds.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait Threading: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync + ?Sized> Threading for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait Threading {}
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> Threading for T {}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub type SlotWatchStream =
     Pin<Box<dyn Stream<Item = Result<(u64, Vec<u8>), TransportError>> + Send>>;
+#[cfg(target_arch = "wasm32")]
+pub type SlotWatchStream = Pin<Box<dyn Stream<Item = Result<(u64, Vec<u8>), TransportError>>>>;
 
-#[async_trait]
-pub trait MailboxTransport: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait MailboxTransport: Threading {
+    /// Pre-establishes any session state the transport needs to deliver
+    /// messages on this channel without blocking the first send. The default
+    /// implementation reports the operation as unsupported, which the
+    /// coordinator treats as best-effort.
+    async fn subscribe(&self, _id: &[u8]) -> Result<(), TransportError> {
+        Err(TransportError::Unsupported)
+    }
+
     async fn send(&self, id: &[u8], sealed: &[u8]) -> Result<(), TransportError>;
     async fn recv(&self, id: &[u8], wait: Duration) -> Result<Option<Vec<u8>>, TransportError>;
 }
 
-#[async_trait]
-pub trait SlotTransport: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait SlotTransport: Threading {
     async fn put(&self, id: &[u8], version: u64, sealed: &[u8]) -> Result<(), TransportError>;
     async fn get(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, TransportError>;
     fn watch(&self, id: &[u8], since: u64) -> SlotWatchStream;

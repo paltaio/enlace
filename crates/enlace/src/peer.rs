@@ -15,11 +15,11 @@ use chacha20poly1305::{
     aead::{Aead, OsRng, Payload, rand_core::RngCore},
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use futures_util::StreamExt as _;
+use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinSet;
-use tokio_stream::StreamExt;
 use url::Url;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -1170,7 +1170,13 @@ impl PeerMailbox<'_> {
 
     pub async fn recv_timeout(&self, wait: Duration) -> Result<PeerMailboxMessage, RecvError> {
         loop {
-            let mut tasks = JoinSet::new();
+            let mut tasks: FuturesUnordered<
+                crate::runtime::BoxedFuture<(
+                    TransportKind,
+                    PeerAddress,
+                    Result<Option<Vec<u8>>, TransportError>,
+                )>,
+            > = FuturesUnordered::new();
             let addresses = self.recv_addresses();
             for endpoint in &self.namespace.transports {
                 for address in &addresses {
@@ -1183,15 +1189,14 @@ impl PeerMailbox<'_> {
                     );
                     let kind = endpoint.kind;
                     let address = *address;
-                    tasks.spawn(async move { (kind, address, transport.recv(&id, wait).await) });
+                    tasks.push(Box::pin(async move {
+                        (kind, address, transport.recv(&id, wait).await)
+                    }));
                 }
             }
 
             let mut received_transport_response = false;
-            while let Some(result) = tasks.join_next().await {
-                let Ok((kind, address, recv_result)) = result else {
-                    continue;
-                };
+            while let Some((kind, address, recv_result)) = tasks.next().await {
                 match recv_result {
                     Ok(Some(bytes)) => {
                         received_transport_response = true;
@@ -1218,7 +1223,7 @@ impl PeerMailbox<'_> {
                 return Err(RecvError::Closed);
             }
             if !received_transport_response {
-                tokio::time::sleep(wait).await;
+                crate::runtime::sleep(wait).await;
             }
         }
     }
@@ -1228,7 +1233,9 @@ impl PeerMailbox<'_> {
         addresses: &[PeerAddress],
         bytes: Vec<u8>,
     ) -> Result<PeerSendReport, PeerSendError> {
-        let mut tasks = JoinSet::new();
+        let mut tasks: FuturesUnordered<
+            crate::runtime::BoxedFuture<(TransportKind, Result<(), TransportError>)>,
+        > = FuturesUnordered::new();
         for endpoint in &self.namespace.transports {
             for address in addresses {
                 let transport = Arc::clone(&endpoint.transport);
@@ -1236,18 +1243,18 @@ impl PeerMailbox<'_> {
                     peer_transport_id(endpoint.kind, *address, ChannelKind::Mailbox, &self.name);
                 let bytes = bytes.clone();
                 let kind = endpoint.kind;
-                tasks.spawn(async move { (kind, transport.send(&id, &bytes).await) });
+                tasks.push(Box::pin(async move {
+                    (kind, transport.send(&id, &bytes).await)
+                }));
             }
         }
 
         let mut delivered = Vec::new();
         let mut failed = Vec::new();
-        while let Some(result) = tasks.join_next().await {
-            if let Ok((kind, send_result)) = result {
-                match send_result {
-                    Ok(()) => delivered.push(kind),
-                    Err(err) => failed.push((kind, err)),
-                }
+        while let Some((kind, send_result)) = tasks.next().await {
+            match send_result {
+                Ok(()) => delivered.push(kind),
+                Err(err) => failed.push((kind, err)),
             }
         }
 
@@ -1441,25 +1448,27 @@ impl PeerSlot<'_> {
         version: u64,
         bytes: Vec<u8>,
     ) -> Result<PeerSlotPutReport, PeerSlotError> {
-        let mut tasks = JoinSet::new();
+        let mut tasks: FuturesUnordered<
+            crate::runtime::BoxedFuture<(TransportKind, Result<(), TransportError>)>,
+        > = FuturesUnordered::new();
         for endpoint in &self.namespace.transports {
             for address in addresses {
                 let transport = Arc::clone(&endpoint.transport);
                 let id = peer_transport_id(endpoint.kind, *address, ChannelKind::Slot, &self.name);
                 let bytes = bytes.clone();
                 let kind = endpoint.kind;
-                tasks.spawn(async move { (kind, transport.put(&id, version, &bytes).await) });
+                tasks.push(Box::pin(async move {
+                    (kind, transport.put(&id, version, &bytes).await)
+                }));
             }
         }
 
         let mut stored = Vec::new();
         let mut failed = Vec::new();
-        while let Some(result) = tasks.join_next().await {
-            if let Ok((kind, put_result)) = result {
-                match put_result {
-                    Ok(()) => stored.push(kind),
-                    Err(err) => failed.push((kind, err)),
-                }
+        while let Some((kind, put_result)) = tasks.next().await {
+            match put_result {
+                Ok(()) => stored.push(kind),
+                Err(err) => failed.push((kind, err)),
             }
         }
 
@@ -1478,21 +1487,23 @@ impl PeerSlot<'_> {
         address: PeerAddress,
         scope: PeerSlotScope,
     ) -> Result<Option<PeerSlotValue>, PeerSlotError> {
-        let mut tasks = JoinSet::new();
+        let mut tasks: FuturesUnordered<
+            crate::runtime::BoxedFuture<(
+                TransportKind,
+                Result<Option<(u64, Vec<u8>)>, TransportError>,
+            )>,
+        > = FuturesUnordered::new();
         for endpoint in &self.namespace.transports {
             let transport = Arc::clone(&endpoint.transport);
             let id = peer_transport_id(endpoint.kind, address, ChannelKind::Slot, &self.name);
             let kind = endpoint.kind;
-            tasks.spawn(async move { (kind, transport.get(&id).await) });
+            tasks.push(Box::pin(async move { (kind, transport.get(&id).await) }));
         }
 
         let mut ok_count = 0usize;
         let mut failures = Vec::new();
         let mut best: Option<(u64, Vec<u8>, PeerSlotValue)> = None;
-        while let Some(result) = tasks.join_next().await {
-            let Ok((kind, get_result)) = result else {
-                continue;
-            };
+        while let Some((kind, get_result)) = tasks.next().await {
             match get_result {
                 Ok(None) => ok_count += 1,
                 Ok(Some((_server_version, bytes))) => {
@@ -1542,7 +1553,7 @@ impl PeerSlot<'_> {
             let namespace = self.namespace.clone_for_task();
             let kind = endpoint.kind;
 
-            tokio::spawn(async move {
+            crate::runtime::spawn(async move {
                 while let Some(item) = stream.next().await {
                     let Ok((_server_version, bytes)) = item else {
                         continue;

@@ -1,0 +1,42 @@
+{
+  "name": "@paltaio/iroh-lite",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./endpoint": "./src/endpoint.ts",
+    "./gossip": "./src/gossip.ts",
+    "./varint": "./src/varint.ts",
+    "./relay/client": "./src/relay/client.ts",
+    "./relay/defaults": "./src/relay/defaults.ts",
+    "./relay/frames": "./src/relay/frames.ts",
+    "./relay/handshake": "./src/relay/handshake.ts",
+    "./relay/url": "./src/relay/url.ts",
+    "./relay/varint": "./src/relay/varint.ts"
+  },
+  "scripts": {
+    "fmt": "oxfmt .",
+    "fmt:check": "oxfmt --check .",
+    "lint": "oxlint .",
+    "lint:type-aware": "oxlint --type-aware .",
+    "lint:fix": "oxlint --fix .",
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:browser": "tsc -p tsconfig.browser.json --noEmit",
+    "test:relay-interop": "IROH_RELAY_INTEROP=1 bun test --timeout=180000 src/relay/iroh-relay.interop.test.ts",
+    "test:native-interop": "IROH_NATIVE_INTEROP=1 bun test --timeout=240000 src/quic/native-iroh.interop.test.ts"
+  },
+  "dependencies": {
+    "@noble/ciphers": "2.2.0",
+    "@noble/ed25519": "3.1.0",
+    "@noble/hashes": "2.2.0"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.1",
+    "oxfmt": "0.47.0",
+    "oxlint": "1.62.0",
+    "oxlint-tsgolint": "0.22.1",
+    "typescript": "5.9.3"
+  }
+}

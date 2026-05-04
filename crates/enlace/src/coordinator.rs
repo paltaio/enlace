@@ -2,10 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use futures_util::StreamExt as _;
+use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinSet;
-use tokio_stream::StreamExt;
 use zeroize::Zeroizing;
 
 use crate::config::Config;
@@ -87,7 +87,9 @@ impl Coordinator {
         payload: &[u8],
     ) -> Result<SendReport, SendError> {
         let sealed = self.seal(ChannelKind::Mailbox, name, payload, None)?;
-        let mut tasks = JoinSet::new();
+        let mut tasks: FuturesUnordered<
+            crate::runtime::BoxedFuture<(TransportKind, Result<(), TransportError>)>,
+        > = FuturesUnordered::new();
 
         for endpoint in &self.transports {
             let transport = Arc::clone(&endpoint.transport);
@@ -95,18 +97,18 @@ impl Coordinator {
                 .map_err(|_| SealError::MsgpackFailed)?;
             let sealed = sealed.clone();
             let kind = endpoint.kind;
-            tasks.spawn(async move { (kind, transport.send(&id, &sealed).await) });
+            tasks.push(Box::pin(async move {
+                (kind, transport.send(&id, &sealed).await)
+            }));
         }
 
         let mut delivered = Vec::new();
         let mut failed = Vec::new();
-        while let Some(result) = tasks.join_next().await {
-            if let Ok((kind, send_result)) = result {
-                self.record_transport_result(kind, &send_result);
-                match send_result {
-                    Ok(()) => delivered.push(kind),
-                    Err(err) => failed.push((kind, err)),
-                }
+        while let Some((kind, send_result)) = tasks.next().await {
+            self.record_transport_result(kind, &send_result);
+            match send_result {
+                Ok(()) => delivered.push(kind),
+                Err(err) => failed.push((kind, err)),
             }
         }
 
@@ -123,21 +125,25 @@ impl Coordinator {
         dedup: &std::sync::Mutex<Dedup>,
     ) -> Result<RecvMessage, RecvError> {
         loop {
-            let mut tasks = JoinSet::new();
+            let mut tasks: FuturesUnordered<
+                crate::runtime::BoxedFuture<(
+                    TransportKind,
+                    Result<Option<Vec<u8>>, TransportError>,
+                )>,
+            > = FuturesUnordered::new();
             for endpoint in &self.transports {
                 let transport = Arc::clone(&endpoint.transport);
                 let id =
                     transport_channel_id(&self.seed, endpoint.kind, ChannelKind::Mailbox, name)
                         .map_err(|_| RecvError::Closed)?;
                 let kind = endpoint.kind;
-                tasks.spawn(async move { (kind, transport.recv(&id, wait).await) });
+                tasks.push(Box::pin(
+                    async move { (kind, transport.recv(&id, wait).await) },
+                ));
             }
 
             let mut received_transport_response = false;
-            while let Some(result) = tasks.join_next().await {
-                let Ok(recv_result) = result else {
-                    continue;
-                };
+            while let Some(recv_result) = tasks.next().await {
                 self.record_transport_result(recv_result.0, &recv_result.1);
                 match recv_result {
                     (kind, Ok(Some(sealed))) => {
@@ -172,8 +178,40 @@ impl Coordinator {
                 return Err(RecvError::Closed);
             }
             if !received_transport_response {
-                tokio::time::sleep(wait).await;
+                crate::runtime::sleep(wait).await;
             }
+        }
+    }
+
+    pub(crate) async fn mailbox_subscribe(&self, name: &str) -> Result<(), RecvError> {
+        let mut tasks: FuturesUnordered<
+            crate::runtime::BoxedFuture<(TransportKind, Result<(), TransportError>)>,
+        > = FuturesUnordered::new();
+        for endpoint in &self.transports {
+            let transport = Arc::clone(&endpoint.transport);
+            let id = transport_channel_id(&self.seed, endpoint.kind, ChannelKind::Mailbox, name)
+                .map_err(|_| RecvError::Closed)?;
+            let kind = endpoint.kind;
+            tasks.push(Box::pin(
+                async move { (kind, transport.subscribe(&id).await) },
+            ));
+        }
+
+        let mut any_ok = false;
+        let mut any_hard_failure = false;
+        while let Some((kind, result)) = tasks.next().await {
+            self.record_transport_result(kind, &result);
+            match result {
+                Ok(()) => any_ok = true,
+                Err(TransportError::Unsupported) => {}
+                Err(_) => any_hard_failure = true,
+            }
+        }
+
+        if any_ok || !any_hard_failure {
+            Ok(())
+        } else {
+            Err(RecvError::Closed)
         }
     }
 
@@ -184,7 +222,9 @@ impl Coordinator {
     ) -> Result<PutReport, SlotError> {
         let version = self.state.next_local_slot_version(name)?;
         let sealed = self.seal(ChannelKind::Slot, name, payload, Some(version))?;
-        let mut tasks = JoinSet::new();
+        let mut tasks: FuturesUnordered<
+            crate::runtime::BoxedFuture<(TransportKind, Result<(), TransportError>)>,
+        > = FuturesUnordered::new();
 
         for endpoint in &self.transports {
             let transport = Arc::clone(&endpoint.transport);
@@ -192,18 +232,18 @@ impl Coordinator {
                 .map_err(|_| SealError::MsgpackFailed)?;
             let sealed = sealed.clone();
             let kind = endpoint.kind;
-            tasks.spawn(async move { (kind, transport.put(&id, version, &sealed).await) });
+            tasks.push(Box::pin(async move {
+                (kind, transport.put(&id, version, &sealed).await)
+            }));
         }
 
         let mut stored = Vec::new();
         let mut failed = Vec::new();
-        while let Some(result) = tasks.join_next().await {
-            if let Ok((kind, put_result)) = result {
-                self.record_transport_result(kind, &put_result);
-                match put_result {
-                    Ok(()) => stored.push(kind),
-                    Err(err) => failed.push((kind, err)),
-                }
+        while let Some((kind, put_result)) = tasks.next().await {
+            self.record_transport_result(kind, &put_result);
+            match put_result {
+                Ok(()) => stored.push(kind),
+                Err(err) => failed.push((kind, err)),
             }
         }
 
@@ -218,23 +258,25 @@ impl Coordinator {
     }
 
     pub(crate) async fn slot_get(&self, name: &str) -> Result<Option<SlotValue>, SlotError> {
-        let mut tasks = JoinSet::new();
+        let mut tasks: FuturesUnordered<
+            crate::runtime::BoxedFuture<(
+                TransportKind,
+                Result<Option<(u64, Vec<u8>)>, TransportError>,
+            )>,
+        > = FuturesUnordered::new();
         for endpoint in &self.transports {
             let transport = Arc::clone(&endpoint.transport);
             let id = transport_channel_id(&self.seed, endpoint.kind, ChannelKind::Slot, name)
                 .map_err(|_| SealError::MsgpackFailed)?;
             let kind = endpoint.kind;
-            tasks.spawn(async move { (kind, transport.get(&id).await) });
+            tasks.push(Box::pin(async move { (kind, transport.get(&id).await) }));
         }
 
         let mut ok_count = 0usize;
         let mut failures = Vec::new();
         let mut best: Option<(u64, Vec<u8>, SlotValue)> = None;
 
-        while let Some(result) = tasks.join_next().await {
-            let Ok(get_result) = result else {
-                continue;
-            };
+        while let Some(get_result) = tasks.next().await {
             self.record_transport_result(get_result.0, &get_result.1);
             match get_result {
                 (_, Ok(None)) => ok_count += 1,
@@ -265,6 +307,11 @@ impl Coordinator {
         if ok_count == 0 && !failures.is_empty() {
             return Err(SlotError::AllTransportsFailed(failures));
         }
+        // Record the highest observed remote version so a subsequent local put
+        // is forced past it instead of wrapping back to v=1.
+        if let Some((version, _, _)) = best.as_ref() {
+            let _ = self.state.record_seen_slot_version(name, *version);
+        }
         Ok(best.map(|(_, _, value)| value))
     }
 
@@ -286,7 +333,7 @@ impl Coordinator {
             let name = name.clone();
             let kind = endpoint.kind;
 
-            tokio::spawn(async move {
+            crate::runtime::spawn(async move {
                 while let Some(item) = stream.next().await {
                     coordinator.record_transport_result(kind, &item);
                     let Ok((_server_version, sealed)) = item else {

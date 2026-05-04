@@ -1,0 +1,20 @@
+{
+  "name": "enlace-chat-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "bun run build.ts",
+    "build:vite": "vite build --outDir dist-vite",
+    "typecheck": "../../packages/iroh-lite/node_modules/.bin/tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "preact": "10.29.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.2.4",
+    "bun-plugin-tailwind": "0.1.2",
+    "tailwindcss": "4.2.4",
+    "vite": "8.0.10"
+  }
+}

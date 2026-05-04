@@ -45,6 +45,14 @@ impl Mailbox {
             .await
     }
 
+    /// Pre-warms underlying transports for this mailbox so the first message
+    /// can be delivered without paying the per-transport setup cost. Reports
+    /// success when at least one transport supports it; transports without
+    /// session state report `Unsupported`.
+    pub async fn subscribe(&self) -> Result<(), RecvError> {
+        self.inner.coordinator.mailbox_subscribe(&self.name).await
+    }
+
     pub fn try_recv(&self) -> Result<Option<RecvMessage>, RecvError> {
         Ok(None)
     }
