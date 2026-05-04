@@ -34,6 +34,7 @@ impl PkarrTransport {
     pub fn new(seed: &[u8; 32], config: &PkarrConfig) -> Result<Self, TransportError> {
         let mut builder = Client::builder();
         builder.no_default_network();
+        builder.cache_size(0);
         match config.network {
             PkarrNetworkMode::Relays => apply_relays(&mut builder, config)?,
             PkarrNetworkMode::Dht => apply_dht(&mut builder, config)?,
