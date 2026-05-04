@@ -585,7 +585,11 @@ mod tests {
     #[cfg(all(feature = "pkarr-dht", not(target_arch = "wasm32")))]
     mod dht_real {
         use super::*;
+        use futures_util::StreamExt as _;
         use pkarr::mainline::Testnet;
+        use std::io::ErrorKind;
+        use std::net::TcpListener;
+        use tokio::time::timeout;
 
         async fn build_testnet(size: usize) -> Testnet {
             tokio::task::spawn_blocking(move || Testnet::builder(size).build())
@@ -604,6 +608,23 @@ mod tests {
                 request_timeout: Duration::from_secs(15),
                 republish_interval: Duration::from_millis(100),
                 ..PkarrConfig::default()
+            }
+        }
+
+        fn local_relay_probe() -> (TcpListener, String) {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("relay probe binds");
+            listener
+                .set_nonblocking(true)
+                .expect("relay probe is nonblocking");
+            let url = format!("http://{}", listener.local_addr().expect("probe has addr"));
+            (listener, url)
+        }
+
+        fn assert_no_relay_probe_connection(listener: &TcpListener) {
+            match listener.accept() {
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                Ok((_, addr)) => panic!("DHT-only pkarr transport contacted relay probe at {addr}"),
+                Err(err) => panic!("relay probe accept failed: {err}"),
             }
         }
 
@@ -629,6 +650,60 @@ mod tests {
             alice.put(&[3; 16], 5, b"v5").await.unwrap();
             let err = bob.put(&[3; 16], 4, b"earlier").await.unwrap_err();
             assert!(matches!(err, TransportError::Stale), "got {err:?}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn dht_watch_sees_later_value_after_subscribe() {
+            let testnet = build_testnet(10).await;
+            let config = dht_config(&testnet.bootstrap);
+            let writer = PkarrTransport::new(&[0xef; 32], &config).unwrap();
+            let watcher = PkarrTransport::new(&[0xef; 32], &config).unwrap();
+            let mut updates = watcher.watch(&[4; 16], 0);
+
+            writer.put(&[4; 16], 1, b"watched").await.unwrap();
+
+            let got = timeout(Duration::from_secs(45), updates.next())
+                .await
+                .expect("watch receives an update")
+                .expect("watch stream remains open")
+                .expect("watch update succeeds");
+            assert_eq!(got, (1, b"watched".to_vec()));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn dht_mode_does_not_contact_configured_relays() {
+            let testnet = build_testnet(10).await;
+            let (relay_probe, relay_url) = local_relay_probe();
+            let mut config = dht_config(&testnet.bootstrap);
+            config.resolvers = vec![relay_url];
+            let writer = PkarrTransport::new(&[0x41; 32], &config).unwrap();
+            let reader = PkarrTransport::new(&[0x41; 32], &config).unwrap();
+
+            writer.put(&[5; 16], 1, b"dht-only").await.unwrap();
+            assert_eq!(
+                reader.get(&[5; 16]).await.unwrap(),
+                Some((1, b"dht-only".to_vec()))
+            );
+            assert_no_relay_probe_connection(&relay_probe);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn both_mode_resolves_packet_available_from_dht() {
+            let testnet = build_testnet(10).await;
+            let (_relay_probe, relay_url) = local_relay_probe();
+            let writer_config = dht_config(&testnet.bootstrap);
+            let mut both_config = dht_config(&testnet.bootstrap);
+            both_config.network = PkarrNetworkMode::Both;
+            both_config.resolvers = vec![relay_url];
+
+            let writer = PkarrTransport::new(&[0x42; 32], &writer_config).unwrap();
+            let reader = PkarrTransport::new(&[0x42; 32], &both_config).unwrap();
+
+            writer.put(&[6; 16], 1, b"from-dht").await.unwrap();
+            assert_eq!(
+                reader.get(&[6; 16]).await.unwrap(),
+                Some((1, b"from-dht".to_vec()))
+            );
         }
     }
 }
