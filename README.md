@@ -3,8 +3,9 @@
 Encrypted mailbox and latest-value slot fan-out for Rust applications.
 
 `enlace` can send the same encrypted payload over multiple transports and accept
-the first valid delivery. It currently includes HTTP relay, DHT, pkarr, and iroh
-transports.
+the first valid delivery. It currently includes HTTP relay, pkarr, and iroh
+transports. pkarr publishes signed DNS records over public HTTP relays and,
+optionally on native targets, the Mainline DHT.
 
 ## Crates
 
@@ -16,16 +17,20 @@ transports.
 ## Features
 
 Default features enable `http`, `pkarr`, `iroh`, and `sled` (file-backed state).
-The `dht` transport is opt-in. Each transport is independent; pick any subset:
+pkarr ships with HTTP relay support; native Mainline DHT support is gated behind
+the `pkarr-dht` feature. Each transport is independent; pick any subset:
 
 ```toml
 enlace = { version = "0.1", default-features = false, features = ["http"] }
-enlace = { version = "0.1", default-features = false, features = ["dht"] }
 enlace = { version = "0.1", default-features = false, features = ["pkarr"] }
+enlace = { version = "0.1", default-features = false, features = ["pkarr", "pkarr-dht"] }
 enlace = { version = "0.1", default-features = false, features = ["iroh"] }
 enlace = { version = "0.1", default-features = false, features = ["http", "iroh"] }
 enlace = { version = "0.1", default-features = false, features = ["all-transports"] }
 ```
+
+Browser/wasm builds keep pkarr relay-only; the `pkarr-dht` feature compiles only
+on non-wasm targets.
 
 `sled` is a separate feature for file-backed `State::file(path)`. Builds without
 `sled` keep `State::memory()` and any custom `StateStore` implementation.
@@ -39,8 +44,10 @@ enlace = { version = "0.1", default-features = false, features = ["all-transport
   pair by exchanging public `PeerCard` values and need per-peer trust, revocation,
   pairwise messages, or caller-managed group keys.
 
-HTTP and iroh support mailboxes. HTTP, DHT, pkarr, and iroh support slots. DHT and
-pkarr are latest-record slot transports; they do not support mailbox delivery.
+HTTP and iroh support mailboxes. HTTP, pkarr, and iroh support slots. pkarr is
+the latest-record slot transport and does not support mailbox delivery; on
+native targets it can be configured for HTTP relays only, the Mainline DHT
+only, or both networks together.
 
 ## Shared-Seed Example
 

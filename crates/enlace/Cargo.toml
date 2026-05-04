@@ -10,11 +10,11 @@ readme = "README.md"
 
 [features]
 default = ["http", "pkarr", "iroh", "sled"]
-all-transports = ["http", "dht", "pkarr", "iroh"]
+all-transports = ["http", "pkarr", "pkarr-dht", "iroh"]
 fuzzing = ["http"]
 http = ["dep:reqwest"]
-dht = ["dep:mainline"]
-pkarr = ["dep:pkarr"]
+pkarr = ["dep:pkarr", "pkarr/relays"]
+pkarr-dht = ["pkarr", "pkarr/dht"]
 iroh = ["dep:iroh", "dep:iroh-gossip"]
 sled = ["dep:sled"]
 
@@ -29,7 +29,6 @@ hkdf = { workspace = true }
 iroh = { workspace = true, optional = true }
 iroh-gossip = { workspace = true, optional = true }
 lru = { workspace = true }
-mainline = { workspace = true, optional = true }
 pkarr = { workspace = true, optional = true }
 rmp-serde = { workspace = true }
 reqwest = { workspace = true, optional = true }

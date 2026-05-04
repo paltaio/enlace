@@ -14,7 +14,6 @@ path = "src/main.rs"
 [features]
 default = ["http", "pkarr"]
 http = ["enlace/http"]
-dht = ["enlace/dht"]
 pkarr = ["enlace/pkarr"]
 iroh = ["enlace/iroh"]
 unix-socket = []

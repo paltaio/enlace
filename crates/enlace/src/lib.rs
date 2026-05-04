@@ -22,8 +22,10 @@
 //!   exchange, authorization policy, group membership, and group-key rotation.
 //!
 //! HTTP and iroh transports can carry mailbox messages in both modes. HTTP,
-//! DHT, pkarr, and iroh can carry slots; DHT and pkarr are latest-record slot
-//! transports and do not provide mailbox delivery.
+//! pkarr, and iroh can carry slots; pkarr is the latest-record slot transport
+//! and does not provide mailbox delivery. pkarr supports HTTP relays on every
+//! target and the native Mainline DHT on non-wasm targets when the
+//! `pkarr-dht` feature is enabled.
 
 pub mod config;
 pub mod coordinator;
@@ -42,15 +44,13 @@ pub mod slot;
 pub mod state;
 pub mod transports;
 
-#[cfg(feature = "pkarr")]
-pub use config::PkarrConfig;
 #[cfg(feature = "http")]
 pub use config::{BasicAuth, HttpConfig};
 pub use config::{Config, ConfiguredTransport, IrohEndpointAddr};
-#[cfg(feature = "dht")]
-pub use config::{DhtBootstrapCacheConfig, DhtConfig};
 #[cfg(feature = "iroh")]
 pub use config::{IrohConfig, IrohRelayMode};
+#[cfg(feature = "pkarr")]
+pub use config::{PkarrConfig, PkarrNetworkMode};
 pub use error::{OpenError, RecvError, SealError, SendError, SlotError, TransportError};
 pub use kdf::{ChannelKind, NameError, TransportKind};
 pub use mailbox::{Mailbox, RecvMessage, SendReport};
@@ -65,8 +65,6 @@ pub use peer::{
 };
 pub use slot::{PutReport, Slot, SlotValue, SlotWatch};
 pub use state::{InMemoryStateStore, State, StateError, StateStore};
-#[cfg(feature = "dht")]
-pub use transports::DhtTransport;
 #[cfg(feature = "http")]
 pub use transports::HttpTransport;
 #[cfg(feature = "iroh")]

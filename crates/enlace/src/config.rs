@@ -1,6 +1,4 @@
 use std::net::SocketAddr;
-#[cfg(feature = "dht")]
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,14 +13,12 @@ use crate::transports::Transport;
 pub const DEFAULT_MAX_PLAINTEXT_BYTES: usize = 65_536;
 pub const DEFAULT_LONG_POLL_SECS: u32 = 25;
 pub const DEFAULT_REPUBLISH_INTERVAL: Duration = Duration::from_mins(30);
-pub const DEFAULT_DHT_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(10);
-pub const DEFAULT_DHT_BOOTSTRAP_CACHE_TTL: Duration = Duration::from_hours(24);
-pub const DEFAULT_DHT_BOOTSTRAP_CACHE_MAX_PEERS: usize = 64;
 pub const DEFAULT_PKARR_RELAYS: &[&str] = &[
     "https://relay.pkarr.org",
     "https://pkarr.pubky.org",
     "https://pkarr.pubky.app",
 ];
+pub const DEFAULT_PKARR_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_IROH_MAX_MESSAGE_BYTES: usize = DEFAULT_MAX_PLAINTEXT_BYTES + 4096;
 pub const DEFAULT_IROH_MAX_STREAMS_PER_PEER: u32 = 32;
 pub const DEFAULT_IROH_MAX_CONNS_PER_PEER: u32 = 4;
@@ -32,8 +28,6 @@ pub struct Config {
     pub http: Option<HttpConfig>,
     #[cfg(feature = "pkarr")]
     pub pkarr: Option<PkarrConfig>,
-    #[cfg(feature = "dht")]
-    pub dht: Option<DhtConfig>,
     #[cfg(feature = "iroh")]
     pub iroh: Option<IrohConfig>,
     pub signing: Option<SigningKey>,
@@ -51,8 +45,6 @@ impl Default for Config {
             http: None,
             #[cfg(feature = "pkarr")]
             pkarr: None,
-            #[cfg(feature = "dht")]
-            dht: None,
             #[cfg(feature = "iroh")]
             iroh: None,
             signing: None,
@@ -72,8 +64,6 @@ impl Config {
         let count = count + usize::from(self.http.is_some());
         #[cfg(feature = "pkarr")]
         let count = count + usize::from(self.pkarr.is_some());
-        #[cfg(feature = "dht")]
-        let count = count + usize::from(self.dht.is_some());
         #[cfg(feature = "iroh")]
         let count = count + usize::from(self.iroh.is_some());
         count
@@ -122,10 +112,25 @@ impl HttpConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg(feature = "pkarr")]
+pub enum PkarrNetworkMode {
+    /// Publish and resolve through pkarr HTTP relays only.
+    #[default]
+    Relays,
+    /// Publish and resolve through the native Mainline DHT only.
+    Dht,
+    /// Use relays and DHT in parallel.
+    Both,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(feature = "pkarr")]
 pub struct PkarrConfig {
+    pub network: PkarrNetworkMode,
     pub resolvers: Vec<String>,
+    pub bootstrap: Vec<SocketAddr>,
+    pub request_timeout: Duration,
     pub republish_interval: Duration,
 }
 
@@ -133,10 +138,13 @@ pub struct PkarrConfig {
 impl Default for PkarrConfig {
     fn default() -> Self {
         Self {
+            network: PkarrNetworkMode::Relays,
             resolvers: DEFAULT_PKARR_RELAYS
                 .iter()
                 .map(|url| (*url).to_owned())
                 .collect(),
+            bootstrap: Vec::new(),
+            request_timeout: DEFAULT_PKARR_REQUEST_TIMEOUT,
             republish_interval: DEFAULT_REPUBLISH_INTERVAL,
         }
     }
@@ -155,9 +163,14 @@ impl PkarrConfig {
             self.resolvers.clone()
         }
     }
+
+    #[must_use]
+    pub fn effective_bootstrap(&self) -> Vec<SocketAddr> {
+        self.bootstrap.clone()
+    }
 }
 
-#[cfg(all(test, any(feature = "pkarr", feature = "dht", feature = "iroh")))]
+#[cfg(all(test, any(feature = "pkarr", feature = "iroh")))]
 mod tests {
     use super::*;
 
@@ -202,15 +215,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "dht")]
-    fn dht_bootstrap_cache_defaults_are_bounded() {
-        let config = DhtBootstrapCacheConfig::new("bootstrap.txt".into());
-
-        assert_eq!(config.ttl, DEFAULT_DHT_BOOTSTRAP_CACHE_TTL);
-        assert_eq!(config.max_peers, DEFAULT_DHT_BOOTSTRAP_CACHE_MAX_PEERS);
-    }
-
-    #[test]
     #[cfg(feature = "iroh")]
     fn iroh_defaults_match_realtime_transport_shape() {
         let config = IrohConfig::default();
@@ -224,45 +228,6 @@ mod tests {
             DEFAULT_IROH_MAX_STREAMS_PER_PEER
         );
         assert_eq!(config.max_conns_per_peer, DEFAULT_IROH_MAX_CONNS_PER_PEER);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(feature = "dht")]
-pub struct DhtConfig {
-    pub bootstrap: Vec<SocketAddr>,
-    pub watch_poll_interval: Duration,
-    pub bootstrap_cache: Option<DhtBootstrapCacheConfig>,
-}
-
-#[cfg(feature = "dht")]
-impl Default for DhtConfig {
-    fn default() -> Self {
-        Self {
-            bootstrap: Vec::new(),
-            watch_poll_interval: DEFAULT_DHT_WATCH_POLL_INTERVAL,
-            bootstrap_cache: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(feature = "dht")]
-pub struct DhtBootstrapCacheConfig {
-    pub path: PathBuf,
-    pub ttl: Duration,
-    pub max_peers: usize,
-}
-
-#[cfg(feature = "dht")]
-impl DhtBootstrapCacheConfig {
-    #[must_use]
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            ttl: DEFAULT_DHT_BOOTSTRAP_CACHE_TTL,
-            max_peers: DEFAULT_DHT_BOOTSTRAP_CACHE_MAX_PEERS,
-        }
     }
 }
 

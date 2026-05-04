@@ -7,11 +7,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use pkarr::dns::ResourceRecord;
 use pkarr::dns::rdata::{RData, TXT};
-use pkarr::{Client, Keypair, PublicKey, SignedPacket, SignedPacketBuilder};
+use pkarr::{Client, ClientBuilder, Keypair, PublicKey, SignedPacket, SignedPacketBuilder};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::config::PkarrConfig;
+use crate::config::{PkarrConfig, PkarrNetworkMode};
 use crate::crypto::derive_key32;
 use crate::error::TransportError;
 use crate::transports::{MailboxTransport, SlotTransport, SlotWatchStream};
@@ -33,9 +33,18 @@ pub struct PkarrTransport {
 impl PkarrTransport {
     pub fn new(seed: &[u8; 32], config: &PkarrConfig) -> Result<Self, TransportError> {
         let mut builder = Client::builder();
-        let relays = config.effective_resolvers();
         builder.no_default_network();
-        builder.relays(&relays).map_err(map_other_error)?;
+        match config.network {
+            PkarrNetworkMode::Relays => apply_relays(&mut builder, config)?,
+            PkarrNetworkMode::Dht => apply_dht(&mut builder, config)?,
+            PkarrNetworkMode::Both => {
+                apply_relays(&mut builder, config)?;
+                apply_dht(&mut builder, config)?;
+            }
+        }
+        if !config.request_timeout.is_zero() {
+            builder.request_timeout(config.request_timeout);
+        }
         let client = builder.build().map_err(map_other_error)?;
         let keypair = pkarr_keypair(seed);
         let public_key = keypair.public_key();
@@ -335,6 +344,33 @@ fn poll_interval(interval: Duration) -> Duration {
     }
 }
 
+fn apply_relays(builder: &mut ClientBuilder, config: &PkarrConfig) -> Result<(), TransportError> {
+    let relays = config.effective_resolvers();
+    builder.relays(&relays).map_err(map_other_error)?;
+    Ok(())
+}
+
+#[cfg(all(feature = "pkarr-dht", not(target_arch = "wasm32")))]
+#[allow(clippy::unnecessary_wraps)]
+fn apply_dht(builder: &mut ClientBuilder, config: &PkarrConfig) -> Result<(), TransportError> {
+    // `no_default_network()` clears both relays and the inner DhtBuilder.
+    // Re-instantiate the DhtBuilder so pkarr's mainline defaults apply when
+    // no explicit bootstrap is configured; if bootstrap is set, override.
+    builder.dht(|b| b);
+    let bootstrap = config.effective_bootstrap();
+    if !bootstrap.is_empty() {
+        builder.bootstrap(&bootstrap);
+    }
+    Ok(())
+}
+
+#[cfg(not(all(feature = "pkarr-dht", not(target_arch = "wasm32"))))]
+fn apply_dht(_: &mut ClientBuilder, _: &PkarrConfig) -> Result<(), TransportError> {
+    Err(TransportError::Network(
+        "pkarr DHT mode requires the 'pkarr-dht' feature on a non-wasm target".to_owned(),
+    ))
+}
+
 fn pkarr_keypair(seed: &[u8; 32]) -> Keypair {
     let key = derive_key32(seed, b"enlace/v1/key/pkarr-id");
     Keypair::from_secret_key(&key)
@@ -470,5 +506,129 @@ mod tests {
             !matches!(mapped, TransportError::Stale),
             "unexpected-response errors must abort the retry loop, not retry: got {mapped:?}",
         );
+    }
+
+    #[test]
+    fn relay_mode_rejects_invalid_relay_url() {
+        let config = PkarrConfig {
+            resolvers: vec!["not a url".to_owned()],
+            ..PkarrConfig::default()
+        };
+        let err = PkarrTransport::new(&[1; 32], &config).unwrap_err();
+        assert!(matches!(err, TransportError::Other(_)), "got {err:?}");
+    }
+
+    #[cfg(not(feature = "pkarr-dht"))]
+    #[test]
+    fn dht_mode_requires_pkarr_dht_feature() {
+        let config = PkarrConfig {
+            network: PkarrNetworkMode::Dht,
+            ..PkarrConfig::default()
+        };
+        let err = PkarrTransport::new(&[1; 32], &config).unwrap_err();
+        assert!(matches!(err, TransportError::Network(_)), "got {err:?}");
+    }
+
+    #[cfg(not(feature = "pkarr-dht"))]
+    #[test]
+    fn both_mode_requires_pkarr_dht_feature() {
+        let config = PkarrConfig {
+            network: PkarrNetworkMode::Both,
+            ..PkarrConfig::default()
+        };
+        let err = PkarrTransport::new(&[1; 32], &config).unwrap_err();
+        assert!(matches!(err, TransportError::Network(_)), "got {err:?}");
+    }
+
+    #[cfg(feature = "pkarr-dht")]
+    #[test]
+    fn dht_mode_accepts_explicit_bootstrap() {
+        let config = PkarrConfig {
+            network: PkarrNetworkMode::Dht,
+            bootstrap: vec!["127.0.0.1:6881".parse().unwrap()],
+            ..PkarrConfig::default()
+        };
+        PkarrTransport::new(&[1; 32], &config).unwrap();
+    }
+
+    #[cfg(feature = "pkarr-dht")]
+    #[test]
+    fn dht_mode_with_default_bootstrap_uses_mainline_defaults() {
+        let config = PkarrConfig {
+            network: PkarrNetworkMode::Dht,
+            ..PkarrConfig::default()
+        };
+        PkarrTransport::new(&[1; 32], &config).unwrap();
+    }
+
+    #[cfg(feature = "pkarr-dht")]
+    #[test]
+    fn both_mode_accepts_relays_and_bootstrap() {
+        let config = PkarrConfig {
+            network: PkarrNetworkMode::Both,
+            bootstrap: vec!["127.0.0.1:6881".parse().unwrap()],
+            ..PkarrConfig::default()
+        };
+        PkarrTransport::new(&[1; 32], &config).unwrap();
+    }
+
+    #[cfg(feature = "pkarr-dht")]
+    #[test]
+    fn both_mode_with_default_bootstrap_uses_mainline_defaults() {
+        let config = PkarrConfig {
+            network: PkarrNetworkMode::Both,
+            ..PkarrConfig::default()
+        };
+        PkarrTransport::new(&[1; 32], &config).unwrap();
+    }
+
+    #[cfg(all(feature = "pkarr-dht", not(target_arch = "wasm32")))]
+    mod dht_real {
+        use super::*;
+        use pkarr::mainline::Testnet;
+
+        async fn build_testnet(size: usize) -> Testnet {
+            tokio::task::spawn_blocking(move || Testnet::builder(size).build())
+                .await
+                .expect("testnet build task joins")
+                .expect("testnet builds")
+        }
+
+        fn dht_config(bootstrap: &[String]) -> PkarrConfig {
+            PkarrConfig {
+                network: PkarrNetworkMode::Dht,
+                bootstrap: bootstrap
+                    .iter()
+                    .map(|addr| addr.parse().expect("testnet bootstrap addr parses"))
+                    .collect(),
+                request_timeout: Duration::from_secs(15),
+                republish_interval: Duration::from_millis(100),
+                ..PkarrConfig::default()
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn dht_mode_round_trips_slot_through_testnet() {
+            let testnet = build_testnet(10).await;
+            let config = dht_config(&testnet.bootstrap);
+            let writer = PkarrTransport::new(&[0xab; 32], &config).unwrap();
+            let reader = PkarrTransport::new(&[0xab; 32], &config).unwrap();
+
+            writer.put(&[2; 16], 1, b"v1-payload").await.unwrap();
+            let got = reader.get(&[2; 16]).await.unwrap();
+            assert_eq!(got, Some((1, b"v1-payload".to_vec())));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn dht_mode_rejects_stale_writes() {
+            let testnet = build_testnet(10).await;
+            let config = dht_config(&testnet.bootstrap);
+            let alice = PkarrTransport::new(&[0xcd; 32], &config).unwrap();
+            let bob = PkarrTransport::new(&[0xcd; 32], &config).unwrap();
+
+            alice.put(&[3; 16], 5, b"v5").await.unwrap();
+            let err = bob.put(&[3; 16], 4, b"earlier").await.unwrap_err();
+            assert!(matches!(err, TransportError::Stale), "got {err:?}");
+        }
     }
 }

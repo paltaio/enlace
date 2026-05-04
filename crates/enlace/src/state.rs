@@ -904,7 +904,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
+    use url::Url;
+
     use super::*;
+    use crate::config::IrohEndpointAddr;
 
     static TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -1046,6 +1049,7 @@ mod tests {
         assert_eq!(store.next_local_slot_version("x").unwrap(), 2);
     }
 
+    #[cfg(feature = "sled")]
     #[test]
     fn state_file_persists_shared_seed_state() {
         let path = temp_state_path("shared-seed");
@@ -1117,6 +1121,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "sled")]
     #[test]
     fn state_file_persists_public_key_material() {
         let path = temp_state_path("public-key");

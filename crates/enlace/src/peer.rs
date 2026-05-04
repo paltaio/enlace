@@ -24,8 +24,6 @@ use url::Url;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-#[cfg(feature = "dht")]
-use crate::config::DhtConfig;
 #[cfg(feature = "http")]
 use crate::config::HttpConfig;
 #[cfg(feature = "iroh")]
@@ -38,8 +36,6 @@ use crate::dedup::Dedup;
 use crate::error::{OpenError, RecvError, TransportError};
 use crate::kdf::{ChannelKind, NameError, TransportKind, validate_name};
 use crate::state::{State, StateError};
-#[cfg(feature = "dht")]
-use crate::transports::DhtTransport;
 #[cfg(feature = "http")]
 use crate::transports::HttpTransport;
 #[cfg(feature = "iroh")]
@@ -701,8 +697,6 @@ pub struct PeerConfig {
     pub http: Option<HttpConfig>,
     #[cfg(feature = "pkarr")]
     pub pkarr: Option<PkarrConfig>,
-    #[cfg(feature = "dht")]
-    pub dht: Option<DhtConfig>,
     #[cfg(feature = "iroh")]
     pub iroh: Option<IrohConfig>,
     pub transports: Vec<ConfiguredTransport>,
@@ -753,7 +747,7 @@ impl PeerNamespace {
             });
         }
 
-        #[cfg(any(feature = "dht", feature = "pkarr"))]
+        #[cfg(feature = "pkarr")]
         let transport_seed = identity.peer_id().to_bytes();
         #[cfg(feature = "pkarr")]
         if let Some(pkarr_config) = &config.pkarr {
@@ -764,19 +758,6 @@ impl PeerNamespace {
             let transport: Arc<dyn Transport> = pkarr;
             transports.push(PeerTransportEndpoint {
                 kind: TransportKind::Pkarr,
-                transport,
-            });
-        }
-
-        #[cfg(feature = "dht")]
-        if let Some(dht_config) = &config.dht {
-            let dht = Arc::new(
-                DhtTransport::new(&transport_seed, dht_config)
-                    .map_err(|err| OpenError::TransportInit(TransportKind::Dht, Box::new(err)))?,
-            );
-            let transport: Arc<dyn Transport> = dht;
-            transports.push(PeerTransportEndpoint {
-                kind: TransportKind::Dht,
                 transport,
             });
         }

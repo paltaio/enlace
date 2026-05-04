@@ -9,10 +9,10 @@ description = "Test transports for enlace."
 
 [features]
 default = ["all-transports"]
-all-transports = ["http", "dht", "pkarr", "iroh"]
+all-transports = ["http", "pkarr", "pkarr-dht", "iroh"]
 http = ["enlace/http"]
-dht = ["enlace/dht"]
 pkarr = ["enlace/pkarr"]
+pkarr-dht = ["pkarr", "enlace/pkarr-dht", "pkarr/dht"]
 iroh = ["enlace/iroh"]
 
 [dependencies]
@@ -27,7 +27,6 @@ axum = { workspace = true }
 axum-server = { workspace = true }
 ed25519-dalek = { workspace = true }
 enlace-relay = { path = "../enlace-relay" }
-mainline = { workspace = true }
 pkarr = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

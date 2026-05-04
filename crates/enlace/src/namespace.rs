@@ -6,8 +6,6 @@ use crate::error::OpenError;
 use crate::kdf::NameError;
 use crate::mailbox::Mailbox;
 use crate::slot::Slot;
-#[cfg(feature = "dht")]
-use crate::transports::DhtTransport;
 #[cfg(feature = "http")]
 use crate::transports::HttpTransport;
 #[cfg(feature = "iroh")]
@@ -27,8 +25,6 @@ pub(crate) struct NamespaceInner {
     pub(crate) http: Option<Arc<HttpTransport>>,
     #[cfg(feature = "pkarr")]
     pub(crate) pkarr: Option<Arc<PkarrTransport>>,
-    #[cfg(feature = "dht")]
-    pub(crate) dht: Option<Arc<DhtTransport>>,
     #[cfg(feature = "iroh")]
     pub(crate) iroh: Option<Arc<IrohTransport>>,
 }
@@ -75,20 +71,6 @@ impl Namespace {
         } else {
             None
         };
-        #[cfg(feature = "dht")]
-        let dht = if let Some(dht_config) = &config.dht {
-            let dht = Arc::new(DhtTransport::new(seed, dht_config).map_err(|err| {
-                OpenError::TransportInit(crate::TransportKind::Dht, Box::new(err))
-            })?);
-            let transport: Arc<dyn crate::transports::Transport> = dht.clone();
-            transports.push(TransportEndpoint {
-                kind: crate::TransportKind::Dht,
-                transport,
-            });
-            Some(dht)
-        } else {
-            None
-        };
         #[cfg(feature = "iroh")]
         let iroh = open_iroh_transport(&config, state.as_ref(), &mut transports).await?;
         for configured in &config.transports {
@@ -107,8 +89,6 @@ impl Namespace {
                 http,
                 #[cfg(feature = "pkarr")]
                 pkarr,
-                #[cfg(feature = "dht")]
-                dht,
                 #[cfg(feature = "iroh")]
                 iroh,
             }),
@@ -133,12 +113,6 @@ impl Namespace {
     #[cfg(feature = "pkarr")]
     pub fn pkarr(&self) -> Option<&PkarrTransport> {
         self.inner.pkarr.as_deref()
-    }
-
-    #[must_use]
-    #[cfg(feature = "dht")]
-    pub fn dht(&self) -> Option<&DhtTransport> {
-        self.inner.dht.as_deref()
     }
 
     #[must_use]

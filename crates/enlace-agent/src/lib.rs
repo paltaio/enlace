@@ -159,7 +159,6 @@ impl std::str::FromStr for SecretArg {
 #[serde(rename_all = "snake_case")]
 enum TransportFlag {
     Http,
-    Dht,
     Pkarr,
     Iroh,
 }
@@ -168,7 +167,6 @@ impl TransportFlag {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Http => "http",
-            Self::Dht => "dht",
             Self::Pkarr => "pkarr",
             Self::Iroh => "iroh",
         }
@@ -177,7 +175,6 @@ impl TransportFlag {
     const fn enabled(self) -> bool {
         match self {
             Self::Http => cfg!(feature = "http"),
-            Self::Dht => cfg!(feature = "dht"),
             Self::Pkarr => cfg!(feature = "pkarr"),
             Self::Iroh => cfg!(feature = "iroh"),
         }
@@ -726,7 +723,7 @@ async fn open_namespace(config: &AgentConfig) -> anyhow::Result<PeerNamespace> {
 }
 
 fn configure_transports(config: &AgentConfig, peer_config: &mut PeerConfig) -> anyhow::Result<()> {
-    #[cfg(not(any(feature = "http", feature = "dht", feature = "pkarr", feature = "iroh")))]
+    #[cfg(not(any(feature = "http", feature = "pkarr", feature = "iroh")))]
     {
         let _ = config;
         let _ = peer_config;
@@ -739,11 +736,6 @@ fn configure_transports(config: &AgentConfig, peer_config: &mut PeerConfig) -> a
         peer_config.http = Some(enlace::HttpConfig::new(
             relay.parse().context("relay URL is invalid")?,
         ));
-    }
-
-    #[cfg(feature = "dht")]
-    if config.transports.contains(&"dht") {
-        peer_config.dht = Some(enlace::DhtConfig::default());
     }
 
     #[cfg(feature = "pkarr")]
@@ -937,8 +929,6 @@ fn enabled_transports(flags: &[TransportFlag]) -> Vec<&'static str> {
         return [
             #[cfg(feature = "http")]
             "http",
-            #[cfg(feature = "dht")]
-            "dht",
             #[cfg(feature = "pkarr")]
             "pkarr",
             #[cfg(feature = "iroh")]
@@ -948,13 +938,13 @@ fn enabled_transports(flags: &[TransportFlag]) -> Vec<&'static str> {
         .collect();
     }
 
-    #[cfg(not(any(feature = "http", feature = "dht", feature = "pkarr", feature = "iroh")))]
+    #[cfg(not(any(feature = "http", feature = "pkarr", feature = "iroh")))]
     {
         let _ = flags;
         Vec::new()
     }
 
-    #[cfg(any(feature = "http", feature = "dht", feature = "pkarr", feature = "iroh"))]
+    #[cfg(any(feature = "http", feature = "pkarr", feature = "iroh"))]
     {
         let mut transports = Vec::new();
         for flag in flags {
@@ -962,10 +952,6 @@ fn enabled_transports(flags: &[TransportFlag]) -> Vec<&'static str> {
                 TransportFlag::Http => {
                     #[cfg(feature = "http")]
                     transports.push("http");
-                }
-                TransportFlag::Dht => {
-                    #[cfg(feature = "dht")]
-                    transports.push("dht");
                 }
                 TransportFlag::Pkarr => {
                     #[cfg(feature = "pkarr")]
@@ -1682,7 +1668,6 @@ log = "debug"
     fn explicit_unavailable_transport_is_rejected() {
         let Some(flag) = [
             TransportFlag::Http,
-            TransportFlag::Dht,
             TransportFlag::Pkarr,
             TransportFlag::Iroh,
         ]

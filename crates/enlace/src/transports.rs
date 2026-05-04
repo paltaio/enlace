@@ -12,8 +12,6 @@ use crate::error::TransportError;
 use crate::kdf::TransportKind;
 use crate::runtime::{Instant, SystemTime};
 
-#[cfg(feature = "dht")]
-mod dht;
 #[cfg(feature = "http")]
 mod http;
 #[cfg(feature = "iroh")]
@@ -21,8 +19,6 @@ mod iroh;
 #[cfg(feature = "pkarr")]
 mod pkarr;
 
-#[cfg(feature = "dht")]
-pub use dht::DhtTransport;
 #[cfg(feature = "http")]
 pub use http::HttpTransport;
 #[cfg(all(feature = "fuzzing", feature = "http"))]
@@ -120,14 +116,6 @@ impl HealthTracker {
                     .into_iter()
                     .map(EndpointHealth::configured)
                     .collect(),
-            ));
-        }
-        #[cfg(feature = "dht")]
-        if let Some(dht) = &config.dht {
-            transports.push(TrackedTransport::new(
-                TransportKind::Dht,
-                Some(dht.watch_poll_interval),
-                Vec::new(),
             ));
         }
         #[cfg(feature = "iroh")]
