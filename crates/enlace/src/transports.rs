@@ -8,6 +8,8 @@ use futures_core::Stream;
 use crate::config::Config;
 #[cfg(feature = "iroh")]
 use crate::config::IrohRelayMode;
+#[cfg(feature = "pkarr")]
+use crate::config::{PkarrConfig, PkarrNetworkMode};
 use crate::error::TransportError;
 use crate::kdf::TransportKind;
 use crate::runtime::{Instant, SystemTime};
@@ -111,11 +113,7 @@ impl HealthTracker {
             transports.push(TrackedTransport::new(
                 TransportKind::Pkarr,
                 Some(pkarr.republish_interval),
-                pkarr
-                    .effective_resolvers()
-                    .into_iter()
-                    .map(EndpointHealth::configured)
-                    .collect(),
+                pkarr_health_endpoints(pkarr),
             ));
         }
         #[cfg(feature = "iroh")]
@@ -202,6 +200,39 @@ impl HealthTracker {
             f(tracked);
         }
     }
+}
+
+#[cfg(feature = "pkarr")]
+fn pkarr_health_endpoints(config: &PkarrConfig) -> Vec<EndpointHealth> {
+    let mut endpoints = Vec::new();
+    if matches!(
+        config.network,
+        PkarrNetworkMode::Relays | PkarrNetworkMode::Both
+    ) {
+        endpoints.extend(
+            config
+                .effective_resolvers()
+                .into_iter()
+                .map(EndpointHealth::configured),
+        );
+    }
+    if matches!(
+        config.network,
+        PkarrNetworkMode::Dht | PkarrNetworkMode::Both
+    ) {
+        if config.bootstrap.is_empty() {
+            endpoints.push(EndpointHealth::configured("mainline-dht".to_owned()));
+        } else {
+            endpoints.extend(
+                config
+                    .bootstrap
+                    .iter()
+                    .map(ToString::to_string)
+                    .map(EndpointHealth::configured),
+            );
+        }
+    }
+    endpoints
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,5 +457,43 @@ mod health_tests {
                 .iter()
                 .all(|endpoint| endpoint.state == HealthState::Healthy)
         );
+    }
+
+    #[test]
+    #[cfg(feature = "pkarr")]
+    fn pkarr_dht_health_reports_dht_endpoint() {
+        let config = Config {
+            pkarr: Some(crate::config::PkarrConfig {
+                network: crate::config::PkarrNetworkMode::Dht,
+                ..crate::config::PkarrConfig::default()
+            }),
+            ..Config::default()
+        };
+        let report = HealthTracker::from_config(&config).snapshot();
+
+        assert_eq!(report.transports[0].kind, TransportKind::Pkarr);
+        assert_eq!(report.transports[0].endpoints[0].endpoint, "mainline-dht");
+    }
+
+    #[test]
+    #[cfg(feature = "pkarr")]
+    fn pkarr_both_health_reports_relays_and_bootstrap() {
+        let bootstrap = "203.0.113.7:6881".parse().unwrap();
+        let config = Config {
+            pkarr: Some(crate::config::PkarrConfig {
+                network: crate::config::PkarrNetworkMode::Both,
+                resolvers: vec!["https://relay.example".to_owned()],
+                bootstrap: vec![bootstrap],
+                ..crate::config::PkarrConfig::default()
+            }),
+            ..Config::default()
+        };
+        let endpoints = HealthTracker::from_config(&config).snapshot().transports[0]
+            .endpoints
+            .clone();
+
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0].endpoint, "https://relay.example");
+        assert_eq!(endpoints[1].endpoint, bootstrap.to_string());
     }
 }

@@ -29,8 +29,7 @@ enlace = { version = "0.1", default-features = false, features = ["http", "iroh"
 enlace = { version = "0.1", default-features = false, features = ["all-transports"] }
 ```
 
-Browser/wasm builds keep pkarr relay-only; the `pkarr-dht` feature compiles only
-on non-wasm targets.
+Browser/wasm builds keep pkarr relay-only; DHT mode is unavailable on wasm.
 
 `sled` is a separate feature for file-backed `State::file(path)`. Builds without
 `sled` keep `State::memory()` and any custom `StateStore` implementation.

@@ -76,7 +76,7 @@ async fn scenarios() -> Result<Vec<Scenario>, Box<dyn Error>> {
             vec![
                 transport(TransportKind::Http, fast.clone()),
                 transport(
-                    TransportKind::Dht,
+                    TransportKind::Pkarr,
                     DelayingTransport::with_inner(fanout_delayed.clone())
                         .with_max_delay(Duration::from_millis(10)),
                 ),
@@ -84,7 +84,7 @@ async fn scenarios() -> Result<Vec<Scenario>, Box<dyn Error>> {
             vec![
                 transport(TransportKind::Http, fast),
                 transport(
-                    TransportKind::Dht,
+                    TransportKind::Pkarr,
                     DelayingTransport::with_inner(fanout_delayed)
                         .with_max_delay(Duration::from_millis(10)),
                 ),
@@ -99,11 +99,11 @@ async fn scenarios() -> Result<Vec<Scenario>, Box<dyn Error>> {
                     LossyTransport::with_inner(dropped.clone()).with_drop_percent(100),
                 ),
                 transport(
-                    TransportKind::Dht,
+                    TransportKind::Pkarr,
                     DelayingTransport::with_inner(backup.clone())
                         .with_max_delay(Duration::from_millis(5)),
                 ),
-                transport(TransportKind::Pkarr, duplicate.clone()),
+                transport(TransportKind::Iroh, duplicate.clone()),
             ],
             vec![
                 transport(
@@ -111,10 +111,10 @@ async fn scenarios() -> Result<Vec<Scenario>, Box<dyn Error>> {
                     LossyTransport::with_inner(dropped).with_drop_percent(100),
                 ),
                 transport(
-                    TransportKind::Dht,
+                    TransportKind::Pkarr,
                     DelayingTransport::with_inner(backup).with_max_delay(Duration::from_millis(5)),
                 ),
-                transport(TransportKind::Pkarr, duplicate),
+                transport(TransportKind::Iroh, duplicate),
             ],
         )
         .await?,

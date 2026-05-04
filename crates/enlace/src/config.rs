@@ -18,7 +18,7 @@ pub const DEFAULT_PKARR_RELAYS: &[&str] = &[
     "https://pkarr.pubky.org",
     "https://pkarr.pubky.app",
 ];
-pub const DEFAULT_PKARR_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_PKARR_REQUEST_TIMEOUT: Duration = Duration::ZERO;
 pub const DEFAULT_IROH_MAX_MESSAGE_BYTES: usize = DEFAULT_MAX_PLAINTEXT_BYTES + 4096;
 pub const DEFAULT_IROH_MAX_STREAMS_PER_PEER: u32 = 32;
 pub const DEFAULT_IROH_MAX_CONNS_PER_PEER: u32 = 4;
@@ -130,6 +130,7 @@ pub struct PkarrConfig {
     pub network: PkarrNetworkMode,
     pub resolvers: Vec<String>,
     pub bootstrap: Vec<SocketAddr>,
+    /// Zero preserves pkarr's upstream client default.
     pub request_timeout: Duration,
     pub republish_interval: Duration,
 }
@@ -212,6 +213,14 @@ mod tests {
         };
 
         assert_eq!(config.effective_resolvers(), config.resolvers);
+    }
+
+    #[test]
+    #[cfg(feature = "pkarr")]
+    fn pkarr_default_request_timeout_uses_upstream_default() {
+        let config = PkarrConfig::default();
+
+        assert_eq!(config.request_timeout, Duration::ZERO);
     }
 
     #[test]

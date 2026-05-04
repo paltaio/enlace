@@ -44,7 +44,7 @@ impl ChannelKind {
     }
 }
 
-/// One of the four transport adapters.
+/// Runtime label for a transport path.
 ///
 /// Used both as the discriminator in the channel-id HKDF context (so the same
 /// channel name on the same seed yields a distinct 16-byte id per transport)

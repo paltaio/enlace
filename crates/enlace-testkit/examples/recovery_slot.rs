@@ -36,12 +36,12 @@ impl AppliedConfig {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dht = InMemoryTransport::new();
+    let http = InMemoryTransport::new();
     let pkarr = InMemoryTransport::new();
     let seed = [42; 32];
 
-    let publisher = Namespace::open(&seed, recovery_config(dht.clone(), pkarr.clone())).await?;
-    let subscriber = Namespace::open(&seed, recovery_config(dht, pkarr)).await?;
+    let publisher = Namespace::open(&seed, recovery_config(http.clone(), pkarr.clone())).await?;
+    let subscriber = Namespace::open(&seed, recovery_config(http, pkarr)).await?;
 
     let next = RelayConfig {
         version: 12,
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let report = publisher.slot(RECOVERY_SLOT)?.put(&payload).await?;
     assert_eq!(report.version, 1);
     assert_eq!(report.stored.len(), 2);
-    assert!(report.stored.contains(&TransportKind::Dht));
+    assert!(report.stored.contains(&TransportKind::Http));
     assert!(report.stored.contains(&TransportKind::Pkarr));
 
     let value = subscriber
@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or_else(|| std::io::Error::other("recovery slot should contain relay config"))?;
     assert!(matches!(
         value.via,
-        TransportKind::Dht | TransportKind::Pkarr
+        TransportKind::Http | TransportKind::Pkarr
     ));
 
     let received: RelayConfig = serde_json::from_slice(&value.payload)?;
@@ -88,10 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn recovery_config(dht: InMemoryTransport, pkarr: InMemoryTransport) -> Config {
+fn recovery_config(http: InMemoryTransport, pkarr: InMemoryTransport) -> Config {
     Config {
         transports: vec![
-            ConfiguredTransport::new(TransportKind::Dht, Arc::new(dht)),
+            ConfiguredTransport::new(TransportKind::Http, Arc::new(http)),
             ConfiguredTransport::new(TransportKind::Pkarr, Arc::new(pkarr)),
         ],
         ..Config::default()
