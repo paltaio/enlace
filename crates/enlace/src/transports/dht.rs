@@ -20,6 +20,7 @@ use crate::transports::{MailboxTransport, SlotTransport, SlotWatchStream};
 const MAX_MUTABLE_VALUE_BYTES: usize = 1000;
 const WATCH_BUFFER: usize = 64;
 const BOOTSTRAP_CACHE_WRITE_INTERVAL: Duration = Duration::from_mins(5);
+const DHT_PUT_BOOTSTRAP_ATTEMPTS: usize = 4;
 
 #[derive(Clone)]
 pub struct DhtTransport {
@@ -188,7 +189,7 @@ impl SlotTransport for DhtTransport {
             }
             let cas = current.as_ref().map(MutableItem::seq);
             let item = MutableItem::new(id.signing_key, &sealed, seq, Some(&id.salt));
-            put_mutable_with_bootstrap_retry(&transport.dht, item, cas)?;
+            put_mutable_with_bootstrap_retry(&transport.dht, &item, cas)?;
             transport.maybe_persist_bootstrap_cache();
             Ok(())
         })
@@ -310,17 +311,23 @@ fn mutable_item_is_newer(candidate: &MutableItem, current: &MutableItem) -> bool
 
 fn put_mutable_with_bootstrap_retry(
     dht: &Dht,
-    item: MutableItem,
+    item: &MutableItem,
     cas: Option<i64>,
 ) -> Result<(), TransportError> {
-    match dht.put_mutable(item.clone(), cas) {
-        Ok(_) => Ok(()),
-        Err(PutMutableError::Query(PutQueryError::NoClosestNodes)) => {
-            let _ = dht.bootstrapped();
-            dht.put_mutable(item, cas).map(drop).map_err(map_put_error)
+    for attempt in 0..DHT_PUT_BOOTSTRAP_ATTEMPTS {
+        match dht.put_mutable(item.clone(), cas) {
+            Ok(_) => return Ok(()),
+            Err(PutMutableError::Query(PutQueryError::NoClosestNodes))
+                if attempt + 1 < DHT_PUT_BOOTSTRAP_ATTEMPTS =>
+            {
+                let _ = dht.bootstrapped();
+            }
+            Err(err) => return Err(map_put_error(err)),
         }
-        Err(err) => Err(map_put_error(err)),
     }
+    Err(map_put_error(PutMutableError::Query(
+        PutQueryError::NoClosestNodes,
+    )))
 }
 
 fn combined_bootstrap(configured: &[SocketAddr], cached: Option<&[SocketAddr]>) -> Vec<SocketAddr> {
