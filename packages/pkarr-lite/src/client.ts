@@ -1,3 +1,4 @@
+import { compareBytes } from './bytes'
 import {
   DEFAULT_CACHE_SIZE,
   DEFAULT_MAXIMUM_TTL,
@@ -33,6 +34,24 @@ type RelayResolveResult =
       packet?: never
       notModified: true
     }
+
+type RelayPublishResult =
+  | {
+      ok: true
+    }
+  | {
+      ok: false
+      error: PublishError
+    }
+
+interface InflightPublishRequest {
+  publicKey: PublicKey
+  signedPacket: SignedPacket
+  cas: bigint | undefined
+  promise: Promise<void> | undefined
+  successCount: number
+  errors: Map<string, { error: PublishError; count: number }>
+}
 
 export class BuildError extends Error {}
 
@@ -172,6 +191,7 @@ export class Client {
   readonly #cache: Cache | null
   readonly #relays: readonly string[]
   readonly #requestTimeout: number
+  readonly #inflightPublishes = new Map<string, InflightPublishRequest[]>()
 
   private constructor(config: ClientConfig) {
     if (!Number.isInteger(config.cacheSize) || config.cacheSize < 0) {
@@ -262,10 +282,153 @@ export class Client {
       }
     }
 
-    await Promise.all(
-      this.#relays.map((relay) => this.#publishToRelay(relay, signedPacket, casTimestamp)),
+    const request = this.#startPublish(publicKey, signedPacket, casTimestamp)
+    if (request.promise === undefined) {
+      request.promise = this.#publishToRelays(request)
+    }
+    await request.promise
+    const current = this.#cache?.getReadOnly(key)
+    if (current === undefined || !current.moreRecentThan(signedPacket)) {
+      this.#cache?.put(key, signedPacket)
+    }
+  }
+
+  #startPublish(
+    publicKey: PublicKey,
+    signedPacket: SignedPacket,
+    cas: bigint | undefined,
+  ): InflightPublishRequest {
+    const key = publicKey.toZ32()
+    const inflight = this.#inflightPublishes.get(key) ?? []
+    const latest = inflight.at(-1)
+
+    for (const request of inflight) {
+      if (compareBytes(signedPacket.signature(), request.signedPacket.signature()) === 0) {
+        return request
+      }
+    }
+
+    if (latest !== undefined) {
+      if (!signedPacket.moreRecentThan(latest.signedPacket)) {
+        throw new ConcurrencyError('NotMostRecent')
+      }
+      if (cas === undefined) {
+        throw new ConcurrencyError('ConflictRisk')
+      }
+      if (cas !== latest.signedPacket.timestamp()) {
+        throw new ConcurrencyError('CasFailed')
+      }
+    }
+
+    const request = {
+      publicKey,
+      signedPacket,
+      cas,
+      promise: undefined,
+      successCount: 0,
+      errors: new Map(),
+    }
+    inflight.push(request)
+    this.#inflightPublishes.set(key, inflight)
+
+    return request
+  }
+
+  async #publishToRelays(request: InflightPublishRequest): Promise<void> {
+    const pending = this.#relays.map((relay) =>
+      this.#publishToRelay(relay, request.signedPacket, request.cas).then<
+        RelayPublishResult,
+        RelayPublishResult
+      >(
+        () => ({ ok: true }),
+        (error: unknown) => ({
+          ok: false,
+          error: error instanceof PublishError ? error : new UnexpectedResponsesError(),
+        }),
+      ),
     )
-    this.#cache?.put(key, signedPacket)
+
+    while (pending.length > 0) {
+      const indexed = pending.map(async (promise, index) => ({
+        index,
+        result: await promise,
+      }))
+      const { index, result } = await Promise.race(indexed)
+      void pending.splice(index, 1)
+
+      if (result.ok) {
+        if (this.#addPublishSuccess(request)) {
+          return
+        }
+      } else if (this.#addPublishError(request, result.error)) {
+        return
+      }
+    }
+
+    throw new UnexpectedResponsesError()
+  }
+
+  #addPublishSuccess(request: InflightPublishRequest): boolean {
+    request.successCount += 1
+    if (request.successCount >= relayMajority(this.#relays.length)) {
+      this.#clearInflight(request)
+      return true
+    }
+    if (this.#publishDone(request)) {
+      this.#clearInflight(request)
+      throw mostCommonPublishError(request)
+    }
+
+    return false
+  }
+
+  #addPublishError(request: InflightPublishRequest, error: PublishError): boolean {
+    const errorKey = publishErrorKey(error)
+    const counted = request.errors.get(errorKey)
+    const count = (counted?.count ?? 0) + 1
+    request.errors.set(errorKey, { error, count })
+
+    if (
+      count >= relayMajority(this.#relays.length) &&
+      error instanceof ConcurrencyError &&
+      (error.code === 'NotMostRecent' || error.code === 'CasFailed')
+    ) {
+      this.#clearInflight(request)
+      throw error
+    }
+
+    if (!this.#publishDone(request)) {
+      return false
+    }
+
+    this.#clearInflight(request)
+    if (request.successCount >= relayMajority(this.#relays.length)) {
+      return true
+    }
+    throw mostCommonPublishError(request)
+  }
+
+  #publishDone(request: InflightPublishRequest): boolean {
+    let errorCount = 0
+    for (const { count } of request.errors.values()) {
+      errorCount += count
+    }
+    return errorCount + request.successCount >= this.#relays.length
+  }
+
+  #clearInflight(request: InflightPublishRequest): void {
+    const key = request.publicKey.toZ32()
+    const inflight = this.#inflightPublishes.get(key)
+    if (inflight === undefined) {
+      return
+    }
+    const index = inflight.indexOf(request)
+    if (index !== -1) {
+      void inflight.splice(index, 1)
+    }
+    if (inflight.length === 0) {
+      this.#inflightPublishes.delete(key)
+    }
   }
 
   async #resolveFirst(
@@ -529,6 +692,33 @@ function publishErrorForStatus(status: number): PublishError {
     return new ConcurrencyError('ConflictRisk')
   }
   return new UnexpectedResponsesError()
+}
+
+function relayMajority(relaysCount: number): number {
+  return Math.floor(relaysCount / 2) + (relaysCount % 2)
+}
+
+function publishErrorKey(error: PublishError): string {
+  if (error instanceof QueryError) {
+    return `query:${error.code}`
+  }
+  if (error instanceof ConcurrencyError) {
+    return `concurrency:${error.code}`
+  }
+  if (error instanceof UnexpectedResponsesError) {
+    return 'unexpected'
+  }
+  return error.name
+}
+
+function mostCommonPublishError(request: InflightPublishRequest): PublishError {
+  let mostCommon: { error: PublishError; count: number } | undefined
+  for (const counted of request.errors.values()) {
+    if (mostCommon === undefined || counted.count > mostCommon.count) {
+      mostCommon = counted
+    }
+  }
+  return mostCommon?.error ?? new UnexpectedResponsesError()
 }
 
 function queryErrorMessage(code: QueryErrorCode): string {

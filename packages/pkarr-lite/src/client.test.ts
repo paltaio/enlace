@@ -10,6 +10,7 @@ import {
   InvalidRelayUrlError,
   Keypair,
   NoNetworkError,
+  PublishError,
   QueryError,
   SignedPacket,
   UnexpectedResponsesError,
@@ -464,6 +465,303 @@ describe('Client publish', () => {
         UnexpectedResponsesError,
       )
       expect(cache.getReadOnly(key)?.isSameAs(oldPacket)).toBe(true)
+    } finally {
+      relay.stop()
+    }
+  })
+
+  test('publishes to all relays and succeeds after two-relay majority', async () => {
+    const packet = await signedPacket()
+    const slowFailure = relayServer(async () => {
+      await delay(50)
+      return new Response(null, { status: 500 })
+    })
+    const fastSuccess = relayServer(() => new Response(null, { status: 204 }))
+
+    try {
+      const client = Client.builder()
+        .relays([slowFailure.url, fastSuccess.url])
+        .requestTimeout(1_000)
+        .build()
+
+      await client.publish(packet)
+
+      await waitFor(() => slowFailure.requests.length === 1)
+      expect(fastSuccess.requests).toHaveLength(1)
+    } finally {
+      slowFailure.stop()
+      fastSuccess.stop()
+    }
+  })
+
+  test('uses three-relay majority for publish success and bad request errors', async () => {
+    const packet = await signedPacket()
+    const fail = relayServer(() => new Response(null, { status: 500 }))
+    const successA = relayServer(() => new Response(null, { status: 204 }))
+    const successB = relayServer(() => new Response(null, { status: 204 }))
+
+    try {
+      const client = Client.builder()
+        .relays([fail.url, successA.url, successB.url])
+        .requestTimeout(1_000)
+        .build()
+
+      await client.publish(packet)
+    } finally {
+      fail.stop()
+      successA.stop()
+      successB.stop()
+    }
+
+    const badA = relayServer(() => new Response(null, { status: 400 }))
+    const badB = relayServer(() => new Response(null, { status: 400 }))
+    const other = relayServer(() => new Response(null, { status: 500 }))
+
+    try {
+      const client = Client.builder()
+        .relays([badA.url, other.url, badB.url])
+        .requestTimeout(1_000)
+        .build()
+
+      const error = await rejected(client.publish(packet))
+      expectQueryError(error, 'BadRequest')
+    } finally {
+      badA.stop()
+      badB.stop()
+      other.stop()
+    }
+  })
+
+  test('rejects mixed relay failures when final success does not reach majority', async () => {
+    const packet = await signedPacket()
+    let releaseSuccess: (() => void) | undefined
+    let requestCount = 0
+
+    await withMockFetch(
+      async (input) => {
+        requestCount += 1
+        const host = new URL(requestUrl(input)).host
+        if (host === 'a.example') {
+          return new Response(null, { status: 400 })
+        }
+        if (host === 'b.example') {
+          return new Response(null, { status: 500 })
+        }
+        return new Promise<Response>((resolve) => {
+          releaseSuccess = () => resolve(new Response(null, { status: 204 }))
+        })
+      },
+      async () => {
+        const cache = new InMemoryCache(1)
+        const client = Client.builder()
+          .relays(['https://a.example', 'https://b.example', 'https://c.example'])
+          .cache(cache)
+          .requestTimeout(0)
+          .build()
+
+        const publish = client.publish(packet)
+        await waitFor(() => requestCount === 3)
+
+        releaseSuccess?.()
+        const error = await rejected(publish)
+
+        expect(error).toBeInstanceOf(PublishError)
+        expect(cache.getReadOnly(cacheKey(packet.publicKey()))).toBeUndefined()
+      },
+    )
+  })
+
+  test('returns majority stale and CAS publish errors', async () => {
+    const packet = await signedPacket()
+
+    for (const [status, checkError] of [
+      [409, (error: unknown) => expectConcurrencyError(error, 'NotMostRecent')],
+      [412, (error: unknown) => expectConcurrencyError(error, 'CasFailed')],
+    ] as const) {
+      const stale = relayServer(() => new Response(null, { status }))
+      const slow = relayServer(async () => {
+        await delay(50)
+        return new Response(null, { status: 204 })
+      })
+
+      try {
+        const client = Client.builder().relays([stale.url, slow.url]).requestTimeout(1_000).build()
+
+        checkError(await rejected(client.publish(packet)))
+      } finally {
+        stale.stop()
+        slow.stop()
+      }
+    }
+  })
+
+  test('rejects conflicting inflight publishes inside one client', async () => {
+    const oldPacket = await signedPacket(1, 'old')
+    const newPacket = await signedPacket(2, 'new')
+    let releaseFirst: (() => void) | undefined
+    const relay = relayServer(
+      () =>
+        new Promise<Response>((resolve) => {
+          releaseFirst = () => resolve(new Response(null, { status: 204 }))
+        }),
+    )
+
+    try {
+      const client = Client.builder().relays([relay.url]).requestTimeout(1_000).build()
+      const firstPublish = client.publish(oldPacket)
+
+      await waitFor(() => relay.requests.length === 1)
+
+      expectConcurrencyError(await rejected(client.publish(newPacket)), 'ConflictRisk')
+      expectConcurrencyError(await rejected(client.publish(newPacket, 0)), 'CasFailed')
+
+      releaseFirst?.()
+      await firstPublish
+    } finally {
+      relay.stop()
+    }
+  })
+
+  test('keeps newer cache entry when older inflight publish finishes later', async () => {
+    const oldPacket = await signedPacket(1, 'old')
+    const newPacket = await signedPacket(2, 'new')
+    const key = cacheKey(oldPacket.publicKey())
+    const cache = new InMemoryCache(1)
+    let releaseOld: (() => void) | undefined
+    let requestCount = 0
+    const relay = relayServer((request) => {
+      requestCount += 1
+      if (requestCount === 1) {
+        return new Promise<Response>((resolve) => {
+          releaseOld = () => resolve(new Response(null, { status: 204 }))
+        })
+      }
+      expect(request.headers.get('If-Match')).toBe(oldPacket.timestamp().toString())
+      return new Response(null, { status: 204 })
+    })
+
+    try {
+      const client = Client.builder().relays([relay.url]).cache(cache).requestTimeout(1_000).build()
+      const oldPublish = client.publish(oldPacket)
+
+      await waitFor(() => relay.requests.length === 1)
+      await client.publish(newPacket, oldPacket.timestamp())
+
+      expect(cache.getReadOnly(key)?.isSameAs(newPacket)).toBe(true)
+
+      releaseOld?.()
+      await oldPublish
+
+      expect(cache.getReadOnly(key)?.isSameAs(newPacket)).toBe(true)
+    } finally {
+      relay.stop()
+    }
+  })
+
+  test('rejects newer CAS publish when its own relay request fails after older success', async () => {
+    const oldPacket = await signedPacket(1, 'old')
+    const newPacket = await signedPacket(2, 'new')
+    const key = cacheKey(oldPacket.publicKey())
+    const cache = new InMemoryCache(1)
+    let releaseOld: (() => void) | undefined
+    let releaseNew: (() => void) | undefined
+    let requestCount = 0
+    const relay = relayServer(() => {
+      requestCount += 1
+      if (requestCount === 1) {
+        return new Promise<Response>((resolve) => {
+          releaseOld = () => resolve(new Response(null, { status: 204 }))
+        })
+      }
+      return new Promise<Response>((resolve) => {
+        releaseNew = () => resolve(new Response(null, { status: 500 }))
+      })
+    })
+
+    try {
+      const client = Client.builder().relays([relay.url]).cache(cache).requestTimeout(1_000).build()
+      const oldPublish = client.publish(oldPacket)
+
+      await waitFor(() => relay.requests.length === 1)
+      const newPublish = client.publish(newPacket, oldPacket.timestamp())
+      await waitFor(() => relay.requests.length === 2)
+
+      releaseOld?.()
+      await oldPublish
+
+      releaseNew?.()
+      expect(await rejected(newPublish)).toBeInstanceOf(UnexpectedResponsesError)
+      expect(cache.getReadOnly(key)?.isSameAs(oldPacket)).toBe(true)
+    } finally {
+      relay.stop()
+    }
+  })
+
+  test('shares identical inflight publish instead of double-counting relay responses', async () => {
+    const packet = await signedPacket()
+    let requestCount = 0
+
+    await withMockFetch(
+      async (input) => {
+        requestCount += 1
+        const host = new URL(requestUrl(input)).host
+        if (host === 'a.example') {
+          return new Response(null, { status: 204 })
+        }
+        return new Response(null, { status: 500 })
+      },
+      async () => {
+        const client = Client.builder()
+          .relays(['https://a.example', 'https://b.example', 'https://c.example'])
+          .requestTimeout(0)
+          .build()
+
+        const results = await Promise.allSettled([client.publish(packet), client.publish(packet)])
+
+        expect(results.every((result) => result.status === 'rejected')).toBe(true)
+        expect(requestCount).toBe(3)
+      },
+    )
+  })
+
+  test('blocks no-CAS publish while an older packet remains inflight after newer CAS failure', async () => {
+    const oldPacket = await signedPacket(1, 'old')
+    const newPacket = await signedPacket(2, 'new')
+    const newestPacket = await signedPacket(3, 'newest')
+    let releaseOld: (() => void) | undefined
+    let releaseNew: (() => void) | undefined
+    let requestCount = 0
+    const relay = relayServer(() => {
+      requestCount += 1
+      if (requestCount === 1) {
+        return new Promise<Response>((resolve) => {
+          releaseOld = () => resolve(new Response(null, { status: 204 }))
+        })
+      }
+      if (requestCount === 2) {
+        return new Promise<Response>((resolve) => {
+          releaseNew = () => resolve(new Response(null, { status: 500 }))
+        })
+      }
+      return new Response(null, { status: 204 })
+    })
+
+    try {
+      const client = Client.builder().relays([relay.url]).requestTimeout(1_000).build()
+      const oldPublish = client.publish(oldPacket)
+
+      await waitFor(() => relay.requests.length === 1)
+      const newPublish = client.publish(newPacket, oldPacket.timestamp())
+      await waitFor(() => relay.requests.length === 2)
+
+      releaseNew?.()
+      expect(await rejected(newPublish)).toBeInstanceOf(UnexpectedResponsesError)
+
+      expectConcurrencyError(await rejected(client.publish(newestPacket)), 'ConflictRisk')
+      expect(relay.requests).toHaveLength(2)
+
+      releaseOld?.()
+      await oldPublish
     } finally {
       relay.stop()
     }
