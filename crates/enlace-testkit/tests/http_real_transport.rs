@@ -1,5 +1,7 @@
 #![cfg(all(feature = "http", feature = "iroh"))]
 
+mod support;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -40,7 +42,7 @@ impl RelayProcess {
     }
 
     async fn wait_ready(&self) {
-        let client = reqwest::Client::new();
+        let client = support::reqwest_client();
         for _ in 0..20 {
             if client
                 .get(format!(

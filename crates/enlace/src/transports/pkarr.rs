@@ -774,6 +774,8 @@ mod tests {
 
             let writer = PkarrTransport::new(&[0x42; 32], &writer_config).unwrap();
             let reader = PkarrTransport::new(&[0x42; 32], &both_config).unwrap();
+            writer.wait_for_bootstrap().await;
+            reader.wait_for_bootstrap().await;
 
             writer.put(&[6; 16], 1, b"from-dht").await.unwrap();
             assert_eq!(

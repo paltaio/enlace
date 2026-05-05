@@ -1,8 +1,10 @@
+mod support;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use enlace_relay::{RelayConfig, build_router};
-use reqwest::{Client, StatusCode, header};
+use reqwest::{StatusCode, header};
 use tokio::task::JoinHandle;
 
 const ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -36,7 +38,7 @@ impl RelayProcess {
     }
 
     async fn wait_ready(&self) {
-        let client = Client::new();
+        let client = support::reqwest_client();
         for _ in 0..20 {
             if client
                 .get(format!("{}/m/{ID}", self.base_url))
@@ -81,7 +83,7 @@ async fn assert_text_error(response: reqwest::Response, status: StatusCode) {
 #[tokio::test]
 async fn mailbox_status_paths() {
     let relay = RelayProcess::spawn(config()).await;
-    let client = Client::new();
+    let client = support::reqwest_client();
 
     let response = client
         .post(format!("{}/m/{ID}", relay.base_url))
@@ -140,7 +142,7 @@ async fn mailbox_status_paths() {
 #[tokio::test]
 async fn slot_status_paths() {
     let relay = RelayProcess::spawn(config()).await;
-    let client = Client::new();
+    let client = support::reqwest_client();
 
     let response = client
         .put(format!("{}/s/{ID}", relay.base_url))
@@ -232,7 +234,7 @@ async fn auth_status_paths() {
             .expect("auth config accepts user pass"),
     )
     .await;
-    let client = Client::new();
+    let client = support::reqwest_client();
 
     let response = client
         .get(format!("{}/m/{ID}", relay.base_url))
@@ -261,7 +263,7 @@ async fn auth_status_paths() {
 #[tokio::test]
 async fn cors_preflight_path() {
     let relay = RelayProcess::spawn(config()).await;
-    let client = Client::new();
+    let client = support::reqwest_client();
 
     let response = client
         .request(
@@ -287,7 +289,7 @@ async fn cors_preflight_path() {
 #[tokio::test]
 async fn documented_smoke_flow() {
     let relay = RelayProcess::spawn(default_config()).await;
-    let client = Client::new();
+    let client = support::reqwest_client();
 
     let response = client
         .put(format!("{}/s/{ID}", relay.base_url))
