@@ -1,0 +1,43 @@
+# Size-optimized release build for enlace-agent.
+#
+# Plain `cargo build --release` works on stable as usual. To produce the
+# size-minimized binary (~6.0 MB at time of writing) run:
+#
+#     cargo +nightly build-min
+#
+# Output: target/x86_64-unknown-linux-gnu/release/enlace-agent
+#
+# Requires the rust-src component on the active nightly toolchain:
+#
+#     rustup +nightly component add rust-src
+#
+# What this turns on:
+#   * `build-std` recompiles std/panic_abort with our profile (opt-level=z,
+#     LTO, codegen-units=1) instead of using the precompiled std shipped
+#     with the toolchain.
+#   * `-Cpanic=immediate-abort` strips all panic message machinery —
+#     formatting, hooks, unwinder hooks. Tradeoff: panics print no message.
+#   * `-Zfmt-debug=none` removes the bodies of generated `Debug` impls
+#     (kept as no-ops). Tradeoff: `{:?}` formatting is empty for derived
+#     types.
+#   * `-Zlocation-detail=none` drops the file/line metadata from panic
+#     locations. Tradeoff: panics print only the panic kind.
+#   * `--gc-sections` and `--icf=safe` are linker-side: discard unused
+#     sections and fold byte-identical functions, no functional change.
+#
+# The size flags live inside the alias's `--config` rather than at file
+# scope so they only fire when `build-min` is invoked. Plain stable
+# workflows (`cargo build`, `cargo test`, …) are unaffected; the
+# `[unstable]` block below is silently ignored on stable.
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[alias]
+build-min = [
+    "build",
+    "--release",
+    "-p", "enlace-agent",
+    "--target", "x86_64-unknown-linux-gnu",
+    "--config", "target.x86_64-unknown-linux-gnu.rustflags=['-Zunstable-options','-Cpanic=immediate-abort','-Zlocation-detail=none','-Zfmt-debug=none','-Clink-arg=-Wl,--gc-sections','-Clink-arg=-Wl,--icf=safe']",
+]
