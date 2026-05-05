@@ -1,3 +1,13 @@
+export { CACHE_KEY_BYTES, cacheKey, type Cache, type CacheKey, InMemoryCache } from './cache'
+export {
+  BuildError,
+  Client,
+  ClientBuilder,
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  EmptyListOfRelaysError,
+  InvalidRelayUrlError,
+  NoNetworkError,
+} from './client'
 export {
   DEFAULT_CACHE_SIZE,
   DEFAULT_MAXIMUM_TTL,

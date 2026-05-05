@@ -8,6 +8,7 @@ import {
   SIGNED_PACKET_MAX_BYTES,
   TIMESTAMP_BYTES,
 } from './constants'
+import { compareBytes } from './bytes'
 import {
   type DnsRecord,
   type ServiceBinding,
@@ -380,17 +381,6 @@ function concatBytes(...chunks: readonly Uint8Array[]): Uint8Array {
     offset += chunk.length
   }
   return out
-}
-
-function compareBytes(left: Uint8Array, right: Uint8Array): number {
-  const length = Math.min(left.length, right.length)
-  for (let i = 0; i < length; i += 1) {
-    const diff = (left[i] ?? 0) - (right[i] ?? 0)
-    if (diff !== 0) {
-      return diff
-    }
-  }
-  return left.length - right.length
 }
 
 function cloneRecord(record: DnsRecord): DnsRecord {
