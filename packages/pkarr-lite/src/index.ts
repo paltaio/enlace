@@ -3,10 +3,14 @@ export {
   BuildError,
   Client,
   ClientBuilder,
+  ConcurrencyError,
   DEFAULT_REQUEST_TIMEOUT_MS,
   EmptyListOfRelaysError,
   InvalidRelayUrlError,
   NoNetworkError,
+  PublishError,
+  QueryError,
+  UnexpectedResponsesError,
 } from './client'
 export {
   DEFAULT_CACHE_SIZE,

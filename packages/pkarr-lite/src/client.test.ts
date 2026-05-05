@@ -3,13 +3,16 @@ import { describe, expect, test } from 'bun:test'
 import {
   cacheKey,
   Client,
+  ConcurrencyError,
   DEFAULT_CACHE_SIZE,
   EmptyListOfRelaysError,
   InMemoryCache,
   InvalidRelayUrlError,
   Keypair,
   NoNetworkError,
+  QueryError,
   SignedPacket,
+  UnexpectedResponsesError,
 } from '@paltaio/pkarr-lite'
 
 type FetchMock = (
@@ -125,6 +128,92 @@ describe('Client cache reads', () => {
       throw new Error('relay request not recorded')
     }
     expect(new URL(requestedUrl).pathname).toBe(`/pkarr/${packet.publicKey().toZ32()}`)
+  })
+
+  test('resolve ignores relay failures', async () => {
+    const packet = await signedPacket()
+
+    for (const response of [
+      new Response(null, { status: 404 }),
+      new Response(null, { status: 500 }),
+      new Response(new Uint8Array(RELAY_OVERSIZED_BYTES)),
+    ]) {
+      await withMockFetch(
+        async () => response,
+        async () => {
+          const client = Client.builder()
+            .relays(['https://relay.example'])
+            .cache(new InMemoryCache(1))
+            .requestTimeout(0)
+            .build()
+
+          expect(await client.resolve(packet.publicKey())).toBeUndefined()
+        },
+      )
+    }
+
+    await withMockFetch(
+      async () => {
+        throw new TypeError('network failed')
+      },
+      async () => {
+        const client = Client.builder()
+          .relays(['https://relay.example'])
+          .cache(new InMemoryCache(1))
+          .requestTimeout(0)
+          .build()
+
+        expect(await client.resolve(packet.publicKey())).toBeUndefined()
+      },
+    )
+  })
+
+  test('resolve retries unexpected not-modified and empty success responses without relay cache', async () => {
+    const packet = await signedPacket()
+    const notModifiedHeaders: string[] = []
+
+    await withMockFetch(
+      async (_input, init) => {
+        notModifiedHeaders.push(new Headers(init?.headers).get('Cache-Control') ?? '')
+        if (notModifiedHeaders.length === 1) {
+          return new Response(null, { status: 304 })
+        }
+        return packetResponse(packet)
+      },
+      async () => {
+        const client = Client.builder()
+          .relays(['https://relay.example'])
+          .cache(new InMemoryCache(1))
+          .requestTimeout(0)
+          .build()
+
+        expect((await client.resolve(packet.publicKey()))?.isSameAs(packet)).toBe(true)
+      },
+    )
+
+    const emptySuccessHeaders: string[] = []
+
+    await withMockFetch(
+      async (_input, init) => {
+        emptySuccessHeaders.push(new Headers(init?.headers).get('Cache-Control') ?? '')
+        if (emptySuccessHeaders.length === 1) {
+          return new Response(null, { status: 200, headers: { 'Content-Length': '0' } })
+        }
+        return packetResponse(packet)
+      },
+      async () => {
+        const client = Client.builder()
+          .relays(['https://relay.example'])
+          .cache(new InMemoryCache(1))
+          .requestTimeout(0)
+          .build()
+
+        expect((await client.resolve(packet.publicKey()))?.isSameAs(packet)).toBe(true)
+      },
+    )
+
+    expect(notModifiedHeaders).toEqual(['', 'no-cache, no-store, must-revalidate'])
+    expect(emptySuccessHeaders).toEqual(['', 'no-cache, no-store, must-revalidate'])
   })
 
   test('resolve returns cached packet even when expired', async () => {
@@ -254,9 +343,138 @@ describe('Client cache reads', () => {
   })
 })
 
+describe('Client publish', () => {
+  test('sends relay payload with public-key URL and CAS header', async () => {
+    const packet = await signedPacket()
+    const relay = relayServer(() => new Response(null, { status: 204 }))
+    try {
+      const client = Client.builder().relays([relay.url]).requestTimeout(1_000).build()
+
+      await client.publish(packet, packet.timestamp())
+
+      expect(relay.requests).toHaveLength(1)
+      expect(relay.requests[0]?.method).toBe('PUT')
+      expect(new URL(relay.requests[0]?.url ?? '').pathname).toBe(`/${packet.publicKey().toZ32()}`)
+      expect(relay.requests[0]?.headers.get('If-Match')).toBe(packet.timestamp().toString())
+      expect(relay.requests[0]?.body).toEqual(packet.toRelayPayload())
+    } finally {
+      relay.stop()
+    }
+  })
+
+  test('omits CAS header when publish has no CAS timestamp', async () => {
+    const packet = await signedPacket()
+    const relay = relayServer(() => new Response(null, { status: 204 }))
+    try {
+      const client = Client.builder().relays([relay.url]).requestTimeout(1_000).build()
+
+      await client.publish(packet)
+
+      expect(relay.requests[0]?.headers.has('If-Match')).toBe(false)
+    } finally {
+      relay.stop()
+    }
+  })
+
+  test('maps relay publish status codes', async () => {
+    const packet = await signedPacket()
+    const cases = [
+      [400, (error: unknown) => expectQueryError(error, 'BadRequest')],
+      [409, (error: unknown) => expectConcurrencyError(error, 'NotMostRecent')],
+      [412, (error: unknown) => expectConcurrencyError(error, 'CasFailed')],
+      [428, (error: unknown) => expectConcurrencyError(error, 'ConflictRisk')],
+      [500, (error: unknown) => expect(error).toBeInstanceOf(UnexpectedResponsesError)],
+    ] as const
+
+    for (const [status, checkError] of cases) {
+      const relay = relayServer(() => new Response(null, { status }))
+      try {
+        const client = Client.builder().relays([relay.url]).requestTimeout(1_000).build()
+
+        const error = await rejected(client.publish(packet))
+
+        checkError(error)
+      } finally {
+        relay.stop()
+      }
+    }
+  })
+
+  test('maps publish timeout and network failures', async () => {
+    const packet = await signedPacket()
+
+    await withMockFetch(
+      (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(new DOMException('aborted', 'AbortError')),
+          )
+        }),
+      async () => {
+        const client = Client.builder().relays(['https://relay.example']).requestTimeout(1).build()
+
+        const error = await rejected(client.publish(packet))
+        expectQueryError(error, 'Timeout')
+      },
+    )
+
+    await withMockFetch(
+      async () => {
+        throw new TypeError('network failed')
+      },
+      async () => {
+        const client = Client.builder().relays(['https://relay.example']).requestTimeout(0).build()
+
+        expect(await rejected(client.publish(packet))).toBeInstanceOf(UnexpectedResponsesError)
+      },
+    )
+  })
+
+  test('checks cache conflicts before publishing', async () => {
+    const oldPacket = await signedPacket(1, 'old')
+    const newPacket = await signedPacket(2, 'new')
+    const cache = new InMemoryCache(1)
+    cache.put(cacheKey(oldPacket.publicKey()), newPacket)
+
+    const client = Client.builder()
+      .relays(['https://relay.example'])
+      .cache(cache)
+      .requestTimeout(0)
+      .build()
+
+    const staleError = await rejected(client.publish(oldPacket))
+    expectConcurrencyError(staleError, 'NotMostRecent')
+
+    const casError = await rejected(client.publish(newPacket, oldPacket.timestamp()))
+    expectConcurrencyError(casError, 'CasFailed')
+  })
+
+  test('does not update cache when relay publish fails', async () => {
+    const oldPacket = await signedPacket(1, 'old')
+    const newPacket = await signedPacket(2, 'new')
+    const key = cacheKey(oldPacket.publicKey())
+    const cache = new InMemoryCache(1)
+    cache.put(key, oldPacket)
+
+    const relay = relayServer(() => new Response(null, { status: 500 }))
+    try {
+      const client = Client.builder().relays([relay.url]).cache(cache).requestTimeout(1_000).build()
+
+      expect(await rejected(client.publish(newPacket, oldPacket.timestamp()))).toBeInstanceOf(
+        UnexpectedResponsesError,
+      )
+      expect(cache.getReadOnly(key)?.isSameAs(oldPacket)).toBe(true)
+    } finally {
+      relay.stop()
+    }
+  })
+})
+
 async function signedPacket(timestamp = 1, text = 'value'): Promise<SignedPacket> {
   return signedPacketWithSecret(timestamp, text, 9)
 }
+
+const RELAY_OVERSIZED_BYTES = 1_073
 
 async function signedPacketWithSecret(
   timestamp: number,
@@ -271,14 +489,23 @@ async function signedPacketWithSecret(
 
 function relayServer(handler: (request: Request) => Response | Promise<Response>): {
   url: string
-  requests: { headers: Headers }[]
+  requests: { body: Uint8Array; headers: Headers; method: string; url: string }[]
   stop: () => void
 } {
-  const requests: { headers: Headers }[] = []
+  const requests: { body: Uint8Array; headers: Headers; method: string; url: string }[] = []
   const server = Bun.serve({
     port: 0,
-    fetch(request) {
-      requests.push({ headers: new Headers(request.headers) })
+    error(error) {
+      return new Response(error instanceof Error ? error.message : String(error), { status: 500 })
+    },
+    async fetch(request) {
+      const body = new Uint8Array(await request.clone().arrayBuffer())
+      requests.push({
+        body,
+        headers: new Headers(request.headers),
+        method: request.method,
+        url: request.url,
+      })
       return handler(request)
     },
   })
@@ -328,4 +555,29 @@ async function withMockFetch<T>(mock: FetchMock, run: () => Promise<T>): Promise
 
 function requestUrl(input: Parameters<typeof fetch>[0]): string {
   return input instanceof Request ? input.url : input.toString()
+}
+
+async function rejected(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise
+  } catch (error) {
+    return error
+  }
+  throw new Error('expected promise to reject')
+}
+
+function expectQueryError(error: unknown, code: QueryError['code']): void {
+  expect(error).toBeInstanceOf(QueryError)
+  if (!(error instanceof QueryError)) {
+    throw new Error('expected QueryError')
+  }
+  expect(error.code).toBe(code)
+}
+
+function expectConcurrencyError(error: unknown, code: ConcurrencyError['code']): void {
+  expect(error).toBeInstanceOf(ConcurrencyError)
+  if (!(error instanceof ConcurrencyError)) {
+    throw new Error('expected ConcurrencyError')
+  }
+  expect(error.code).toBe(code)
 }

@@ -7,7 +7,7 @@ import {
 } from './constants'
 import { type Cache, cacheKey, InMemoryCache } from './cache'
 import { PublicKey } from './keys'
-import { SignedPacket } from './signed-packet'
+import { SignedPacket, type TimestampInput } from './signed-packet'
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 2_000
 
@@ -51,6 +51,36 @@ export class EmptyListOfRelaysError extends BuildError {
 export class InvalidRelayUrlError extends BuildError {
   constructor(url: string) {
     super(`relay URL must use http or https: ${url}`)
+  }
+}
+
+export class PublishError extends Error {}
+
+export type QueryErrorCode = 'BadRequest' | 'Timeout'
+
+export class QueryError extends PublishError {
+  readonly code: QueryErrorCode
+
+  constructor(code: QueryErrorCode) {
+    super(queryErrorMessage(code))
+    this.code = code
+  }
+}
+
+export type ConcurrencyErrorCode = 'CasFailed' | 'ConflictRisk' | 'NotMostRecent'
+
+export class ConcurrencyError extends PublishError {
+  readonly code: ConcurrencyErrorCode
+
+  constructor(code: ConcurrencyErrorCode) {
+    super(concurrencyErrorMessage(code))
+    this.code = code
+  }
+}
+
+export class UnexpectedResponsesError extends PublishError {
+  constructor() {
+    super('all relays responded with unexpected responses')
   }
 }
 
@@ -217,6 +247,27 @@ export class Client {
     return cache.get(key)
   }
 
+  async publish(signedPacket: SignedPacket, cas?: TimestampInput): Promise<void> {
+    const publicKey = signedPacket.publicKey()
+    const key = cacheKey(publicKey)
+    const casTimestamp = cas === undefined ? undefined : timestampMicros(cas)
+    const cached = this.#cache?.getReadOnly(key)
+
+    if (cached !== undefined) {
+      if (cached.moreRecentThan(signedPacket)) {
+        throw new ConcurrencyError('NotMostRecent')
+      }
+      if (casTimestamp !== undefined && cached.timestamp() !== casTimestamp) {
+        throw new ConcurrencyError('CasFailed')
+      }
+    }
+
+    await Promise.all(
+      this.#relays.map((relay) => this.#publishToRelay(relay, signedPacket, casTimestamp)),
+    )
+    this.#cache?.put(key, signedPacket)
+  }
+
   async #resolveFirst(
     publicKey: PublicKey,
     cache: Cache | null,
@@ -366,6 +417,51 @@ export class Client {
       }
     }
   }
+
+  async #publishToRelay(
+    relay: string,
+    signedPacket: SignedPacket,
+    cas: bigint | undefined,
+  ): Promise<void> {
+    const controller = new AbortController()
+    const timeout =
+      this.#requestTimeout === 0
+        ? undefined
+        : setTimeout(() => controller.abort(), this.#requestTimeout * 3)
+
+    const headers = new Headers()
+    if (cas !== undefined) {
+      headers.set('If-Match', cas.toString())
+    }
+
+    let response: Response
+    try {
+      const payload = signedPacket.toRelayPayload()
+      const body = new ArrayBuffer(payload.byteLength)
+      new Uint8Array(body).set(payload)
+      response = await fetch(relayUrl(relay, signedPacket.publicKey()), {
+        method: 'PUT',
+        headers,
+        body,
+        signal: controller.signal,
+      })
+    } catch (error) {
+      if (isAbortError(error)) {
+        throw new QueryError('Timeout')
+      }
+      throw new UnexpectedResponsesError()
+    } finally {
+      if (timeout !== undefined) {
+        clearTimeout(timeout)
+      }
+    }
+
+    if (response.ok) {
+      return
+    }
+
+    throw publishErrorForStatus(response.status)
+  }
 }
 
 function normalizeRelayUrl(input: string): string {
@@ -406,4 +502,52 @@ function shouldRetryWithoutRelayCache(
   }
 
   return response.ok && response.headers.get('Content-Length') === '0'
+}
+
+function timestampMicros(value: TimestampInput): bigint {
+  if (value instanceof Date) {
+    return BigInt(value.getTime()) * 1_000n
+  }
+  const timestamp = typeof value === 'bigint' ? value : BigInt(value)
+  if (timestamp < 0n) {
+    throw new RangeError(`timestamp out of range: ${value}`)
+  }
+  return timestamp
+}
+
+function publishErrorForStatus(status: number): PublishError {
+  if (status === 400) {
+    return new QueryError('BadRequest')
+  }
+  if (status === 409) {
+    return new ConcurrencyError('NotMostRecent')
+  }
+  if (status === 412) {
+    return new ConcurrencyError('CasFailed')
+  }
+  if (status === 428) {
+    return new ConcurrencyError('ConflictRisk')
+  }
+  return new UnexpectedResponsesError()
+}
+
+function queryErrorMessage(code: QueryErrorCode): string {
+  if (code === 'BadRequest') {
+    return 'most relays responded with bad request'
+  }
+  return 'publish query timed out with no responses'
+}
+
+function concurrencyErrorMessage(code: ConcurrencyErrorCode): string {
+  if (code === 'CasFailed') {
+    return 'compare and swap failed'
+  }
+  if (code === 'ConflictRisk') {
+    return 'a different SignedPacket is being concurrently published'
+  }
+  return "found a more recent SignedPacket in the client's cache"
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError'
 }
