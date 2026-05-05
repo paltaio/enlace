@@ -108,6 +108,16 @@ struct RelayPublishInput {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
+struct RelayCasPublishInput {
+    relay_url: String,
+    cas_micros: u64,
+    timestamp_micros: u64,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 struct RelayResolveInput {
     relay_url: String,
     public_key_hex: String,
@@ -124,8 +134,14 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         Some("vectors") => print_vectors(),
         Some("verify-ts") => verify_ts(),
         Some("publish-relay") => publish_relay().await,
+        Some("publish-relay-cas") => publish_relay_cas().await,
         Some("resolve-relay") => resolve_relay().await,
-        _ => Err("usage: pkarr-lite-native <vectors|verify-ts|publish-relay|resolve-relay>".into()),
+        _ => {
+            Err(
+                "usage: pkarr-lite-native <vectors|verify-ts|publish-relay|publish-relay-cas|resolve-relay>"
+                    .into(),
+            )
+        }
     }
 }
 
@@ -216,6 +232,32 @@ async fn publish_relay() -> Result<(), Box<dyn Error>> {
     let client = relay_client(&input.relay_url)?;
 
     client.publish(&packet, None).await?;
+
+    let vectors = NativeVectors {
+        key: KeyVector {
+            secret_key_hex: hex::encode(SECRET_KEY),
+            public_key_hex: hex::encode(keypair.public_key().as_bytes()),
+            z32: keypair.to_z32(),
+            uri: keypair.to_uri_string(),
+        },
+        packet: packet_vector(packet),
+    };
+    println!("{}", serde_json::to_string_pretty(&vectors)?);
+    Ok(())
+}
+
+async fn publish_relay_cas() -> Result<(), Box<dyn Error>> {
+    let input: RelayCasPublishInput = read_stdin_json()?;
+    let keypair = vector_keypair();
+    let packet = SignedPacket::builder()
+        .txt(name("_cas")?, TXT::new().with_string(&input.text)?, 30)
+        .timestamp(Timestamp::from(input.timestamp_micros))
+        .sign(&keypair)?;
+    let client = relay_client(&input.relay_url)?;
+
+    client
+        .publish(&packet, Some(Timestamp::from(input.cas_micros)))
+        .await?;
 
     let vectors = NativeVectors {
         key: KeyVector {
