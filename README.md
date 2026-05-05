@@ -181,6 +181,22 @@ Start each host:
 enlace-agent --config /etc/enlace/agent.toml
 ```
 
+For pkarr slots, select the pkarr transport and choose its network mode:
+
+```toml
+seed_file = "/etc/enlace/seed"
+token_file = "/etc/enlace/token"
+listen_ws = "127.0.0.1:3000"
+data_dir = "/var/lib/enlace-agent"
+transports = ["pkarr"]
+pkarr_network = "relays"
+pkarr_relays = ["https://pkarr.pubky.org", "https://pkarr.pubky.app"]
+```
+
+Native builds compiled with `pkarr-dht` can set `pkarr_network = "dht"` or
+`pkarr_network = "both"`. `pkarr_bootstrap` is optional; when omitted, pkarr
+uses its upstream Mainline DHT defaults.
+
 Pair hosts by exporting each local card and adding it on the other host:
 
 ```json
