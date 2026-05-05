@@ -16,7 +16,7 @@ use pkarr::{
         rdata::{RData, SVCParam, SVCB, TXT},
         Name,
     },
-    Keypair, PublicKey, SignedPacket, Timestamp,
+    Client, Keypair, PublicKey, SignedPacket, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 
@@ -98,11 +98,34 @@ struct TsPacketVector {
     lookups: Vec<LookupVector>,
 }
 
-pub fn run() -> Result<(), Box<dyn Error>> {
-    match env::args().nth(1).as_deref() {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+struct RelayPublishInput {
+    relay_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+struct RelayResolveInput {
+    relay_url: String,
+    public_key_hex: String,
+}
+
+/// Runs the native test harness command.
+///
+/// # Errors
+///
+/// Returns an error when input parsing, packet handling, or relay I/O fails.
+pub async fn run() -> Result<(), Box<dyn Error>> {
+    let command = env::args().nth(1);
+    match command.as_deref() {
         Some("vectors") => print_vectors(),
         Some("verify-ts") => verify_ts(),
-        _ => Err("usage: pkarr-lite-native <vectors|verify-ts>".into()),
+        Some("publish-relay") => publish_relay().await,
+        Some("resolve-relay") => resolve_relay().await,
+        _ => Err("usage: pkarr-lite-native <vectors|verify-ts|publish-relay|resolve-relay>".into()),
     }
 }
 
@@ -116,7 +139,7 @@ fn print_vectors() -> Result<(), Box<dyn Error>> {
             z32: keypair.to_z32(),
             uri: keypair.to_uri_string(),
         },
-        packet: packet_vector(packet)?,
+        packet: packet_vector(packet),
     };
 
     println!("{}", serde_json::to_string_pretty(&vectors)?);
@@ -133,57 +156,104 @@ fn verify_ts() -> Result<(), Box<dyn Error>> {
     let packet = SignedPacket::from_relay_payload(&public_key, &relay_payload)?;
 
     ensure_eq(
-        hex::encode(packet.as_bytes()),
-        vector.packet.signed_packet_hex,
+        &hex::encode(packet.as_bytes()),
+        &vector.packet.signed_packet_hex,
         "signed packet bytes",
     )?;
     ensure_eq(
-        hex::encode(packet.signature().to_bytes()),
-        vector.packet.signature_hex,
+        &hex::encode(packet.signature().to_bytes()),
+        &vector.packet.signature_hex,
         "signature",
     )?;
     ensure_eq(
-        hex::encode(packet.encoded_packet()),
-        vector.packet.encoded_packet_hex,
+        &hex::encode(packet.encoded_packet()),
+        &vector.packet.encoded_packet_hex,
         "encoded DNS packet",
     )?;
     ensure_eq(
-        hex::encode(signable(
+        &hex::encode(signable(
             vector.packet.timestamp_micros,
             &packet.encoded_packet(),
         )),
-        vector.packet.signable_hex,
+        &vector.packet.signable_hex,
         "signable bytes",
     )?;
     ensure_eq(
-        packet.timestamp().as_u64(),
-        vector.packet.timestamp_micros,
+        &packet.timestamp().as_u64(),
+        &vector.packet.timestamp_micros,
         "timestamp",
     )?;
     ensure_eq(
-        packet.ttl(300, 86_400),
-        vector.packet.ttl_default,
+        &packet.ttl(300, 86_400),
+        &vector.packet.ttl_default,
         "default TTL",
     )?;
     ensure_eq(
-        packet.ttl(0, 86_400),
-        vector.packet.ttl_unclamped,
+        &packet.ttl(0, 86_400),
+        &vector.packet.ttl_unclamped,
         "unclamped TTL",
     )?;
     ensure_eq(
-        record_summaries(&packet),
-        vector.packet.records,
+        &record_summaries(&packet),
+        &vector.packet.records,
         "resource records",
     )?;
     for lookup in vector.packet.lookups {
         ensure_eq(
-            lookup_names(&packet, &lookup.name),
-            lookup.names,
+            &lookup_names(&packet, &lookup.name),
+            &lookup.names,
             &format!("lookup {}", lookup.name),
         )?;
     }
 
     Ok(())
+}
+
+async fn publish_relay() -> Result<(), Box<dyn Error>> {
+    let input: RelayPublishInput = read_stdin_json()?;
+    let keypair = vector_keypair();
+    let packet = vector_packet(&keypair)?;
+    let client = relay_client(&input.relay_url)?;
+
+    client.publish(&packet, None).await?;
+
+    let vectors = NativeVectors {
+        key: KeyVector {
+            secret_key_hex: hex::encode(SECRET_KEY),
+            public_key_hex: hex::encode(keypair.public_key().as_bytes()),
+            z32: keypair.to_z32(),
+            uri: keypair.to_uri_string(),
+        },
+        packet: packet_vector(packet),
+    };
+    println!("{}", serde_json::to_string_pretty(&vectors)?);
+    Ok(())
+}
+
+async fn resolve_relay() -> Result<(), Box<dyn Error>> {
+    let input: RelayResolveInput = read_stdin_json()?;
+    let public_key_bytes = hex::decode(input.public_key_hex)?;
+    let public_key = PublicKey::try_from(public_key_bytes.as_slice())?;
+    let client = relay_client(&input.relay_url)?;
+    let packet = client
+        .resolve(&public_key)
+        .await
+        .ok_or("native client did not resolve packet")?;
+
+    println!("{}", serde_json::to_string_pretty(&packet_vector(packet))?);
+    Ok(())
+}
+
+fn read_stdin_json<T: for<'de> Deserialize<'de>>() -> Result<T, Box<dyn Error>> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    Ok(serde_json::from_str(&input)?)
+}
+
+fn relay_client(relay_url: &str) -> Result<Client, Box<dyn Error>> {
+    let mut builder = Client::builder();
+    builder.relays(&[relay_url])?;
+    Ok(builder.build()?)
 }
 
 fn vector_keypair() -> Keypair {
@@ -202,12 +272,12 @@ fn vector_packet(keypair: &Keypair) -> Result<SignedPacket, Box<dyn Error>> {
         .sign(keypair)?)
 }
 
-fn packet_vector(mut packet: SignedPacket) -> Result<PacketVector, Box<dyn Error>> {
+fn packet_vector(mut packet: SignedPacket) -> PacketVector {
     packet.set_last_seen(&Timestamp::from(LAST_SEEN_MICROS));
     let encoded_packet = packet.encoded_packet();
     let timestamp = packet.timestamp().as_u64();
 
-    Ok(PacketVector {
+    PacketVector {
         timestamp_micros: timestamp,
         last_seen_micros: LAST_SEEN_MICROS,
         signature_hex: hex::encode(packet.signature().to_bytes()),
@@ -228,7 +298,7 @@ fn packet_vector(mut packet: SignedPacket) -> Result<PacketVector, Box<dyn Error
                 &format!("*.example.{}", packet.public_key().to_z32()),
             ),
         ],
-    })
+    }
 }
 
 fn record_summaries(packet: &SignedPacket) -> Vec<RecordSummary> {
@@ -242,7 +312,7 @@ fn record_summaries(packet: &SignedPacket) -> Vec<RecordSummary> {
         .collect()
 }
 
-fn record_type(rdata: &RData<'_>) -> &'static str {
+const fn record_type(rdata: &RData<'_>) -> &'static str {
     match rdata {
         RData::A(_) => "A",
         RData::AAAA(_) => "AAAA",
@@ -293,7 +363,7 @@ fn signable(timestamp: u64, encoded_packet: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn ensure_eq<T>(left: T, right: T, name: &str) -> Result<(), Box<dyn Error>>
+fn ensure_eq<T>(left: &T, right: &T, name: &str) -> Result<(), Box<dyn Error>>
 where
     T: std::fmt::Debug + PartialEq,
 {

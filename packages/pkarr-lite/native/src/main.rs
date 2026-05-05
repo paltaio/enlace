@@ -4,6 +4,7 @@
 
 use std::error::Error;
 
-fn main() -> Result<(), Box<dyn Error>> {
-    pkarr_lite_native::run()
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    pkarr_lite_native::run().await
 }
