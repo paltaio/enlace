@@ -12,7 +12,7 @@ name = "enlace-agent"
 path = "src/main.rs"
 
 [features]
-default = ["http", "pkarr"]
+default = ["http", "pkarr", "iroh"]
 http = ["enlace/http"]
 pkarr = ["enlace/pkarr"]
 pkarr-dht = ["pkarr", "enlace/pkarr-dht"]
