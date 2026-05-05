@@ -269,10 +269,7 @@ impl InMemoryInner {
         // joins mid-conversation in a shared-seed namespace doesn't try to
         // write at v=1 over an existing v=N.
         let observed = self.last_seen_slot_versions.get(slot).copied().unwrap_or(0);
-        let entry = self
-            .local_slot_versions
-            .entry(slot.to_owned())
-            .or_insert(0);
+        let entry = self.local_slot_versions.entry(slot.to_owned()).or_insert(0);
         let floor = (*entry).max(observed);
         let next = floor
             .checked_add(1)
@@ -311,7 +308,9 @@ impl InMemoryInner {
     }
 
     fn peer_identity(&self) -> Option<PeerIdentity> {
-        self.peer_identity.as_ref().map(StoredPeerIdentity::to_identity)
+        self.peer_identity
+            .as_ref()
+            .map(StoredPeerIdentity::to_identity)
     }
 
     fn store_peer_identity(&mut self, identity: &PeerIdentity) {
@@ -712,8 +711,10 @@ impl Snapshot {
 
         let mut trusted_peers = HashMap::with_capacity(self.trusted_peers.len());
         for snapshot_peer in self.trusted_peers {
-            let signing_key = VerifyingKey::from_bytes(&snapshot_peer.signing_key)
-                .map_err(|_| StateError::Corrupted("trusted peer signing key invalid".to_owned()))?;
+            let signing_key =
+                VerifyingKey::from_bytes(&snapshot_peer.signing_key).map_err(|_| {
+                    StateError::Corrupted("trusted peer signing key invalid".to_owned())
+                })?;
             let iroh_endpoint = snapshot_peer
                 .iroh_endpoint
                 .map(|endpoint| -> Result<IrohEndpointAddr, StateError> {
