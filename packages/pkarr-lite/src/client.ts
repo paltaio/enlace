@@ -3,6 +3,7 @@ import {
   DEFAULT_MAXIMUM_TTL,
   DEFAULT_MINIMUM_TTL,
   DEFAULT_RELAYS,
+  RELAY_PAYLOAD_MAX_BYTES,
 } from './constants'
 import { type Cache, cacheKey, InMemoryCache } from './cache'
 import { PublicKey } from './keys'
@@ -22,6 +23,16 @@ interface ClientConfig {
   relays: NetworkConfig
   requestTimeout: number
 }
+
+type RelayResolveResult =
+  | {
+      packet: SignedPacket
+      notModified?: never
+    }
+  | {
+      packet?: never
+      notModified: true
+    }
 
 export class BuildError extends Error {}
 
@@ -183,17 +194,177 @@ export class Client {
   }
 
   async resolve(publicKey: PublicKey): Promise<SignedPacket | undefined> {
-    const cached = this.#cache?.get(cacheKey(publicKey))
-    if (cached === undefined) {
-      return undefined
+    const key = cacheKey(publicKey)
+    const cached = this.#cache?.get(key)
+    if (cached !== undefined) {
+      if (cached.isExpired(this.#minimumTtl, this.#maximumTtl)) {
+        void this.#drainResolve(publicKey, this.#cache, key, cached.timestamp()).catch(() => {})
+      }
+      return this.#cache?.get(key)
     }
-    return cached.isExpired(this.#minimumTtl, this.#maximumTtl)
-      ? this.#cache?.get(cacheKey(publicKey))
-      : cached
+
+    const first = await this.#resolveFirst(publicKey, this.#cache, key, undefined)
+    return this.#cache?.get(key) ?? first
   }
 
   async resolveMostRecent(publicKey: PublicKey): Promise<SignedPacket | undefined> {
-    return this.#cache?.get(cacheKey(publicKey))
+    const key = cacheKey(publicKey)
+    const cache = this.#cache ?? new InMemoryCache(1)
+    const cached = cache.get(key)
+
+    await this.#drainResolve(publicKey, cache, key, cached?.timestamp())
+
+    return cache.get(key)
+  }
+
+  async #resolveFirst(
+    publicKey: PublicKey,
+    cache: Cache | null,
+    key: Uint8Array,
+    moreRecentThan: bigint | undefined,
+  ): Promise<SignedPacket | undefined> {
+    const pending = this.#relays.map((relay) =>
+      this.#resolveFromRelay(relay, publicKey, moreRecentThan),
+    )
+
+    while (pending.length > 0) {
+      const indexed = pending.map(async (promise, index) => ({
+        index,
+        packet: await promise,
+      }))
+      const { index, packet } = await Promise.race(indexed)
+      void pending.splice(index, 1)
+      const incoming = this.#cacheIncoming(cache, key, packet)
+      if (incoming !== undefined) {
+        return incoming
+      }
+    }
+
+    return undefined
+  }
+
+  async #drainResolve(
+    publicKey: PublicKey,
+    cache: Cache | null,
+    key: Uint8Array,
+    moreRecentThan: bigint | undefined,
+  ): Promise<void> {
+    const results = await Promise.all(
+      this.#relays.map((relay) => this.#resolveFromRelay(relay, publicKey, moreRecentThan)),
+    )
+
+    for (const packet of results) {
+      this.#cacheIncoming(cache, key, packet)
+    }
+  }
+
+  #cacheIncoming(
+    cache: Cache | null,
+    key: Uint8Array,
+    result: RelayResolveResult | undefined,
+  ): SignedPacket | undefined {
+    if (result === undefined) {
+      return undefined
+    }
+
+    const cached = cache?.getReadOnly(key)
+    if (result.notModified === true) {
+      cached?.refresh()
+      if (cached !== undefined) {
+        cache?.put(key, cached)
+      }
+      return undefined
+    }
+
+    const { packet } = result
+    if (cached !== undefined && packet.isSameAs(cached)) {
+      cache?.put(key, packet)
+      return undefined
+    }
+    if (cached !== undefined && !packet.moreRecentThan(cached)) {
+      return undefined
+    }
+
+    cache?.put(key, packet)
+    return packet
+  }
+
+  async #resolveFromRelay(
+    relay: string,
+    publicKey: PublicKey,
+    moreRecentThan: bigint | undefined,
+  ): Promise<RelayResolveResult | undefined> {
+    const url = relayUrl(relay, publicKey)
+    const headers = new Headers()
+    if (moreRecentThan !== undefined) {
+      headers.set('If-Modified-Since', httpDate(moreRecentThan))
+    }
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await this.#fetchRelay(url, headers)
+      if (response === undefined) {
+        return undefined
+      }
+      if (shouldRetryWithoutRelayCache(response, moreRecentThan, headers)) {
+        headers.set('Cache-Control', 'no-cache, no-store, must-revalidate')
+        continue
+      }
+      if (response.status === 304) {
+        return moreRecentThan === undefined ? undefined : { notModified: true }
+      }
+      if (!response.ok) {
+        return undefined
+      }
+
+      const contentLength = response.headers.get('Content-Length')
+      if (contentLength !== null && Number(contentLength) > RELAY_PAYLOAD_MAX_BYTES) {
+        return undefined
+      }
+
+      let payload: Uint8Array
+      try {
+        payload = new Uint8Array(await response.arrayBuffer())
+      } catch {
+        return undefined
+      }
+      if (payload.length === 0 && !headers.has('Cache-Control')) {
+        headers.set('Cache-Control', 'no-cache, no-store, must-revalidate')
+        continue
+      }
+      if (payload.length > RELAY_PAYLOAD_MAX_BYTES) {
+        return undefined
+      }
+
+      try {
+        return { packet: await SignedPacket.fromRelayPayload(publicKey, payload) }
+      } catch {
+        return undefined
+      }
+    }
+
+    return undefined
+  }
+
+  async #fetchRelay(url: string, headers: Headers): Promise<Response | undefined> {
+    const controller = new AbortController()
+    const timeout =
+      this.#requestTimeout === 0
+        ? undefined
+        : setTimeout(() => controller.abort(), this.#requestTimeout)
+
+    try {
+      return await fetch(url, {
+        method: 'GET',
+        headers,
+        signal: controller.signal,
+      })
+    } catch {
+      return undefined
+    } finally {
+      if (timeout !== undefined) {
+        clearTimeout(timeout)
+      }
+    }
   }
 }
 
@@ -209,4 +380,30 @@ function requireTtl(ttl: number, name: string): void {
   if (!Number.isInteger(ttl) || ttl < 0) {
     throw new RangeError(`${name} must be a non-negative integer`)
   }
+}
+
+function relayUrl(relay: string, publicKey: PublicKey): string {
+  const url = new URL(relay)
+  const path = url.pathname.replace(/\/$/u, '')
+  url.pathname = `${path}/${publicKey.toZ32()}`
+  return url.toString()
+}
+
+function httpDate(timestampMicros: bigint): string {
+  return new Date(Number(timestampMicros / 1_000n)).toUTCString()
+}
+
+function shouldRetryWithoutRelayCache(
+  response: Response,
+  moreRecentThan: bigint | undefined,
+  headers: Headers,
+): boolean {
+  if (headers.has('Cache-Control')) {
+    return false
+  }
+  if (response.status === 304 && moreRecentThan === undefined) {
+    return true
+  }
+
+  return response.ok && response.headers.get('Content-Length') === '0'
 }
