@@ -10,4 +10,13 @@ export {
   SIGNED_PACKET_MAX_BYTES,
   TIMESTAMP_BYTES,
 } from './constants'
+export {
+  type DnsRecord,
+  type ServiceBinding,
+  type ServiceParam,
+  encodeDnsResponse,
+  findResourceRecords,
+  normalizeDnsName,
+  parseDnsResponse,
+} from './dns'
 export { Keypair, PublicKey } from './keys'
