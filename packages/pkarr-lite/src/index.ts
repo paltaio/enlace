@@ -20,3 +20,9 @@ export {
   parseDnsResponse,
 } from './dns'
 export { Keypair, PublicKey } from './keys'
+export {
+  type DnsRData,
+  SignedPacket,
+  SignedPacketBuilder,
+  type TimestampInput,
+} from './signed-packet'

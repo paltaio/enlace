@@ -9,6 +9,8 @@ import {
 } from '@paltaio/pkarr-lite'
 import { DNS_PACKET_MAX_BYTES } from '@paltaio/pkarr-lite/constants'
 
+import { bytesToHex, hexToBytes } from './testing/hex'
+
 const ORIGIN = '7jfgaa9nutjyixzikb7tgmsf9gkwq7iqz498zr1nd5ig1fng4esy'
 const RUST_PACKET_HEX =
   '00008000000000060000000034376a66676161396e75746a7969787a696b623774676d736639676b77713769717a3439387a72316e6435696731666e673465737900000100010000001e00040102030403777777c00c001c00010000003c00100000000000000000000000000000000105616c696173c00c0005000100000046001406746172676574076578616d706c6503636f6d00065f70726f746fc00c0010000100000050000807666f6f3d626172c00c004100010000005a003f000103737663076578616d706c6503636f6d00000100060268320268330003000201bb00040004c00002010006001020010db8000000000000000000000001045f737663c00c00400001000000640010000000029b000968656c6c6fd2716f6f'
@@ -228,15 +230,3 @@ describe('DNS packet codec', () => {
     )
   })
 })
-
-function hexToBytes(hex: string): Uint8Array {
-  const out = new Uint8Array(hex.length / 2)
-  for (let i = 0; i < out.length; i += 1) {
-    out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16)
-  }
-  return out
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
-}

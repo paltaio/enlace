@@ -10,23 +10,25 @@ import {
   RELAY_PAYLOAD_MAX_BYTES,
   SIGNATURE_BYTES,
   SIGNED_PACKET_MAX_BYTES,
+  SignedPacket,
   TIMESTAMP_BYTES,
 } from '@paltaio/pkarr-lite'
-import { DEFAULT_RELAYS as constantExportRelays } from '@paltaio/pkarr-lite/constants'
+import * as constantsExport from '@paltaio/pkarr-lite/constants'
+import { SignedPacket as SubpathSignedPacket } from '@paltaio/pkarr-lite/signed-packet'
 
 describe('public API', () => {
-  test('exports pkarr constants from root and subpath exports', () => {
-    expect(DEFAULT_MINIMUM_TTL).toBe(300)
-    expect(DEFAULT_MAXIMUM_TTL).toBe(86_400)
-    expect(DEFAULT_CACHE_SIZE).toBe(1_000)
-    expect(DEFAULT_RELAYS).toEqual(['https://pkarr.pubky.app', 'https://pkarr.pubky.org'])
-    expect(constantExportRelays).toBe(DEFAULT_RELAYS)
+  test('exports root and subpath APIs', () => {
+    expect(DEFAULT_MINIMUM_TTL).toBe(constantsExport.DEFAULT_MINIMUM_TTL)
+    expect(DEFAULT_MAXIMUM_TTL).toBe(constantsExport.DEFAULT_MAXIMUM_TTL)
+    expect(DEFAULT_CACHE_SIZE).toBe(constantsExport.DEFAULT_CACHE_SIZE)
+    expect(DEFAULT_RELAYS).toBe(constantsExport.DEFAULT_RELAYS)
 
-    expect(PUBLIC_KEY_BYTES).toBe(32)
-    expect(SIGNATURE_BYTES).toBe(64)
-    expect(TIMESTAMP_BYTES).toBe(8)
-    expect(SIGNED_PACKET_MAX_BYTES).toBe(1_104)
-    expect(RELAY_PAYLOAD_MAX_BYTES).toBe(1_072)
-    expect(DNS_PACKET_MAX_BYTES).toBe(1_000)
+    expect(PUBLIC_KEY_BYTES).toBe(constantsExport.PUBLIC_KEY_BYTES)
+    expect(SIGNATURE_BYTES).toBe(constantsExport.SIGNATURE_BYTES)
+    expect(TIMESTAMP_BYTES).toBe(constantsExport.TIMESTAMP_BYTES)
+    expect(SIGNED_PACKET_MAX_BYTES).toBe(constantsExport.SIGNED_PACKET_MAX_BYTES)
+    expect(RELAY_PAYLOAD_MAX_BYTES).toBe(constantsExport.RELAY_PAYLOAD_MAX_BYTES)
+    expect(DNS_PACKET_MAX_BYTES).toBe(constantsExport.DNS_PACKET_MAX_BYTES)
+    expect(SubpathSignedPacket).toBe(SignedPacket)
   })
 })

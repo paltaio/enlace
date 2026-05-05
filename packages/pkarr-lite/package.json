@@ -8,7 +8,8 @@
     ".": "./src/index.ts",
     "./constants": "./src/constants.ts",
     "./dns": "./src/dns.ts",
-    "./keys": "./src/keys.ts"
+    "./keys": "./src/keys.ts",
+    "./signed-packet": "./src/signed-packet.ts"
   },
   "scripts": {
     "fmt": "oxfmt .",

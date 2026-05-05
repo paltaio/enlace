@@ -3,6 +3,8 @@ import { describe, expect, test } from 'bun:test'
 import { Keypair, PublicKey } from '@paltaio/pkarr-lite'
 import { PublicKey as SubpathPublicKey } from '@paltaio/pkarr-lite/keys'
 
+import { bytesToHex, hexToBytes } from './testing/hex'
+
 const MESSAGE = new TextEncoder().encode('pkarr-lite key vector')
 
 const PUBLIC_KEY_HEX = '01b467a3b7913ab27a04a8edf2f3fb074cfe0ecf4babe108d67be3853b0f26c5'
@@ -106,15 +108,3 @@ describe('Keypair', () => {
     expect(await keypair.verify(MESSAGE, signature)).toBe(true)
   })
 })
-
-function hexToBytes(hex: string): Uint8Array {
-  const out = new Uint8Array(hex.length / 2)
-  for (let i = 0; i < out.length; i += 1) {
-    out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16)
-  }
-  return out
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
-}
