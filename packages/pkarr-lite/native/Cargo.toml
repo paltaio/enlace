@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "pkarr-lite-native"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bytes = { version = "=1.11.1" }
+hex = { version = "=0.4.3" }
+pkarr = { version = "=5.0.4", default-features = false, features = ["signed_packet"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "=1.0.149" }
