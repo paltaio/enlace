@@ -667,6 +667,8 @@ mod tests {
         use std::net::TcpListener;
         use tokio::time::timeout;
 
+        const DHT_TESTNET_SIZE: usize = 32;
+
         async fn build_testnet(size: usize) -> Testnet {
             tokio::task::spawn_blocking(move || Testnet::builder(size).build())
                 .await
@@ -705,8 +707,9 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "uses real localhost UDP DHT nodes"]
         async fn dht_mode_round_trips_slot_through_testnet() {
-            let testnet = build_testnet(10).await;
+            let testnet = build_testnet(DHT_TESTNET_SIZE).await;
             let config = dht_config(&testnet.bootstrap);
             let writer = PkarrTransport::new(&[0xab; 32], &config).unwrap();
             let reader = PkarrTransport::new(&[0xab; 32], &config).unwrap();
@@ -717,8 +720,9 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "uses real localhost UDP DHT nodes"]
         async fn dht_mode_rejects_stale_writes() {
-            let testnet = build_testnet(10).await;
+            let testnet = build_testnet(DHT_TESTNET_SIZE).await;
             let config = dht_config(&testnet.bootstrap);
             let alice = PkarrTransport::new(&[0xcd; 32], &config).unwrap();
             let bob = PkarrTransport::new(&[0xcd; 32], &config).unwrap();
@@ -729,8 +733,9 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "uses real localhost UDP DHT nodes"]
         async fn dht_watch_sees_later_value_after_subscribe() {
-            let testnet = build_testnet(10).await;
+            let testnet = build_testnet(DHT_TESTNET_SIZE).await;
             let config = dht_config(&testnet.bootstrap);
             let writer = PkarrTransport::new(&[0xef; 32], &config).unwrap();
             let watcher = PkarrTransport::new(&[0xef; 32], &config).unwrap();
@@ -747,8 +752,9 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "uses real localhost UDP DHT nodes"]
         async fn dht_mode_does_not_contact_configured_relays() {
-            let testnet = build_testnet(10).await;
+            let testnet = build_testnet(DHT_TESTNET_SIZE).await;
             let (relay_probe, relay_url) = local_relay_probe();
             let mut config = dht_config(&testnet.bootstrap);
             config.resolvers = vec![relay_url];
@@ -764,8 +770,9 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "uses real localhost UDP DHT nodes"]
         async fn both_mode_resolves_packet_available_from_dht() {
-            let testnet = build_testnet(10).await;
+            let testnet = build_testnet(DHT_TESTNET_SIZE).await;
             let (_relay_probe, relay_url) = local_relay_probe();
             let writer_config = dht_config(&testnet.bootstrap);
             let mut both_config = dht_config(&testnet.bootstrap);
