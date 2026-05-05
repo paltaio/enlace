@@ -67,9 +67,9 @@ impl PkarrTransport {
 
     /// Block until the underlying mainline DHT has finished bootstrapping.
     /// Used to absorb the empty-routing-table window right after a fresh
-    /// client is constructed; a no-op when the DHT is disabled (relay-only
-    /// mode, or wasm builds without the DHT feature).
-    #[cfg(not(target_arch = "wasm32"))]
+    /// client is constructed; a no-op when the DHT isn't compiled in
+    /// (relay-only builds) or on wasm.
+    #[cfg(all(feature = "pkarr-dht", not(target_arch = "wasm32")))]
     async fn wait_for_bootstrap(&self) {
         let Some(dht) = self.client.dht() else {
             return;
@@ -77,7 +77,7 @@ impl PkarrTransport {
         let _ = tokio::task::spawn_blocking(move || dht.bootstrapped()).await;
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(not(all(feature = "pkarr-dht", not(target_arch = "wasm32"))))]
     async fn wait_for_bootstrap(&self) {}
 
     async fn slot_get_since(

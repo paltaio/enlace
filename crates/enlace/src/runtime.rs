@@ -73,6 +73,10 @@ where
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(
+    unused_imports,
+    reason = "AbortHandle is consumed only when transport features are enabled"
+)]
 pub use native::{AbortHandle, spawn};
 
 #[cfg(target_arch = "wasm32")]
@@ -94,9 +98,19 @@ pub type BoxedFuture<T> = Pin<Box<dyn Future<Output = T>>>;
 mod native {
     use super::Future;
 
-    pub struct AbortHandle(tokio::task::AbortHandle);
+    pub struct AbortHandle(
+        #[allow(
+            dead_code,
+            reason = "wrapped handle is held only when callers cancel spawned tasks"
+        )]
+        tokio::task::AbortHandle,
+    );
 
     impl AbortHandle {
+        #[allow(
+            dead_code,
+            reason = "consumed only when transport features cancel spawned tasks"
+        )]
         pub fn abort(&self) {
             self.0.abort();
         }
