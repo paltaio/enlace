@@ -42,6 +42,8 @@ pub mod peer;
 pub(crate) mod runtime;
 pub mod slot;
 pub mod state;
+#[cfg(any(feature = "http", feature = "pkarr"))]
+pub(crate) mod tls;
 pub mod transports;
 
 #[cfg(feature = "http")]

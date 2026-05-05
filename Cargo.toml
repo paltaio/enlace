@@ -67,7 +67,11 @@ rand = { version = "=0.10.1" }
 proptest = { version = "=1.11.0" }
 rmp-serde = { version = "=1.3.1" }
 reqwest = { version = "=0.13.3", default-features = false, features = [
-    "rustls",
+    "rustls-no-provider",
+] }
+rustls = { version = "=0.23.40", default-features = false, features = [
+    "ring",
+    "std",
 ] }
 serde = { version = "=1.0.228", default-features = false, features = [
     "derive",
@@ -100,3 +104,10 @@ web-time = { version = "=1.1.0" }
 gloo-timers = { version = "=0.3.0", default-features = false, features = [
     "futures",
 ] }
+
+# Local fork of pkarr 5.0.4 that switches its reqwest feature from "rustls"
+# (which forces the aws-lc-rs crypto provider, ~1.2 MB of C code) to
+# "rustls-no-provider", letting us install the much smaller `ring` provider
+# explicitly. Drop this patch once upstream exposes a knob.
+[patch.crates-io]
+pkarr = { path = "vendor/pkarr" }

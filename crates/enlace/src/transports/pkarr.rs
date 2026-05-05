@@ -33,6 +33,7 @@ pub struct PkarrTransport {
 
 impl PkarrTransport {
     pub fn new(seed: &[u8; 32], config: &PkarrConfig) -> Result<Self, TransportError> {
+        crate::tls::ensure_default_crypto_provider();
         let mut builder = Client::builder();
         builder.no_default_network();
         builder.cache_size(0);

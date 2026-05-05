@@ -23,6 +23,7 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub fn new(config: HttpConfig) -> Result<Self, TransportError> {
+        crate::tls::ensure_default_crypto_provider();
         let builder = Client::builder();
         // The browser controls TLS verification; reqwest's wasm backend does
         // not expose `danger_accept_invalid_certs`. Native deployments may opt
