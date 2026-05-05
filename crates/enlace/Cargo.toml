@@ -9,14 +9,13 @@ description = "Encrypted mailbox and latest-value slot fan-out."
 readme = "README.md"
 
 [features]
-default = ["http", "pkarr", "iroh", "sled"]
+default = ["http", "pkarr", "iroh"]
 all-transports = ["http", "pkarr", "pkarr-dht", "iroh"]
 fuzzing = ["http"]
 http = ["dep:reqwest", "dep:rustls"]
 pkarr = ["dep:pkarr", "pkarr/relays", "dep:rustls"]
 pkarr-dht = ["pkarr", "pkarr/dht"]
 iroh = ["dep:iroh", "dep:iroh-gossip"]
-sled = ["dep:sled"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -35,7 +34,6 @@ reqwest = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
-sled = { workspace = true, optional = true }
 subtle = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
