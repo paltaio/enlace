@@ -40,32 +40,50 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin: enlace-agent
-            artifact: enlace-agent-linux-x86_64
+            artifact_basename: enlace-agent-linux-x86_64
+            artifact_ext: ''
+            rustflags: '-Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none -Zfmt-debug=none -Clink-arg=-Wl,--gc-sections -Clink-arg=-Wl,--icf=safe'
+            upx: true
           - name: linux-arm64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             bin: enlace-agent
-            artifact: enlace-agent-linux-arm64
+            artifact_basename: enlace-agent-linux-arm64
+            artifact_ext: ''
+            rustflags: '-Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none -Zfmt-debug=none -Clink-arg=-Wl,--gc-sections -Clink-arg=-Wl,--icf=safe'
+            upx: true
           - name: macos-x86_64
             os: macos-15-intel
             target: x86_64-apple-darwin
             bin: enlace-agent
-            artifact: enlace-agent-macos-x86_64
+            artifact_basename: enlace-agent-macos-x86_64
+            artifact_ext: ''
+            rustflags: '-Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none -Zfmt-debug=none -Clink-arg=-Wl,-dead_strip'
+            upx: false
           - name: macos-arm64
             os: macos-15
             target: aarch64-apple-darwin
             bin: enlace-agent
-            artifact: enlace-agent-macos-arm64
+            artifact_basename: enlace-agent-macos-arm64
+            artifact_ext: ''
+            rustflags: '-Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none -Zfmt-debug=none -Clink-arg=-Wl,-dead_strip'
+            upx: false
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: enlace-agent.exe
-            artifact: enlace-agent-windows-x86_64.exe
+            artifact_basename: enlace-agent-windows-x86_64
+            artifact_ext: '.exe'
+            rustflags: '-Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none -Zfmt-debug=none -Clink-arg=/OPT:REF -Clink-arg=/OPT:ICF'
+            upx: true
           - name: windows-arm64
             os: windows-11-arm
             target: aarch64-pc-windows-msvc
             bin: enlace-agent.exe
-            artifact: enlace-agent-windows-arm64.exe
+            artifact_basename: enlace-agent-windows-arm64
+            artifact_ext: '.exe'
+            rustflags: '-Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none -Zfmt-debug=none -Clink-arg=/OPT:REF -Clink-arg=/OPT:ICF'
+            upx: true
 
     steps:
       - name: Checkout
@@ -73,59 +91,63 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal
+      - name: Install Rust nightly with rust-src
+        run: rustup toolchain install nightly --profile minimal --component rust-src
 
-      - name: Select Rust
-        run: rustup default stable
+      - name: Add target
+        run: rustup +nightly target add ${{ matrix.target }}
 
-      - name: Install target
-        run: rustup target add ${{ matrix.target }}
+      - name: Build agent (size-optimized)
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo +nightly build --release --locked --all-features -p enlace-agent -Z build-std=std,panic_abort --target ${{ matrix.target }}
 
-      - name: Build agent
-        run: cargo build -p enlace-agent --release --locked --all-features --target ${{ matrix.target }}
-
-      - name: Install UPX on Linux
-        if: runner.os == 'Linux'
+      - name: Stage non-compressed binary
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y upx-ucl || sudo apt-get install -y upx
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact_basename }}${{ matrix.artifact_ext }}"
 
-      - name: Compress agent on Linux
+      - name: Smoke test agent
         if: runner.os == 'Linux'
-        run: upx --best --lzma target/${{ matrix.target }}/release/${{ matrix.bin }}
-
-      - name: Smoke test compressed agent
-        if: runner.os == 'Linux'
+        shell: bash
         run: |
           set +e
-          target/${{ matrix.target }}/release/${{ matrix.bin }} 2>agent.err
+          "dist/${{ matrix.artifact_basename }}${{ matrix.artifact_ext }}" 2>agent.err
           status=$?
           set -e
           if [ "$status" -ne 1 ]; then
             cat agent.err
             exit 1
           fi
+          # anyhow's Display is unaffected by `-Zfmt-debug=none`, so the
+          # `bail!("seed is required")` path still produces this message.
           grep -q "seed is required" agent.err
 
-      - name: Package agent on Unix
-        if: runner.os != 'Windows'
+      - name: Install UPX (Linux)
+        if: matrix.upx && runner.os == 'Linux'
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.artifact }}
+          sudo apt-get update
+          sudo apt-get install -y upx-ucl || sudo apt-get install -y upx
 
-      - name: Package agent on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Install UPX (Windows)
+        if: matrix.upx && runner.os == 'Windows'
+        run: choco install upx -y --no-progress
+
+      - name: Compress with UPX
+        if: matrix.upx
+        shell: bash
         run: |
-          New-Item -ItemType Directory -Force dist
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+          cp "dist/${{ matrix.artifact_basename }}${{ matrix.artifact_ext }}" "dist/${{ matrix.artifact_basename }}-upx${{ matrix.artifact_ext }}"
+          upx --best --lzma "dist/${{ matrix.artifact_basename }}-upx${{ matrix.artifact_ext }}"
 
-      - name: Upload agent
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          name: ${{ matrix.artifact_basename }}
+          path: |
+            dist/${{ matrix.artifact_basename }}${{ matrix.artifact_ext }}
+            dist/${{ matrix.artifact_basename }}-upx${{ matrix.artifact_ext }}
           if-no-files-found: error
 
   relay:
